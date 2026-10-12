@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Contract tests for seat-usage and seat-route-hook. No network, no real credentials."""
 import contextlib
 import json
 import os
@@ -7,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -285,6 +285,200 @@ def env_overrides_redirect_cache_asks_and_renewals():
         assert ask["row"]["mode"] == "ask" and ask["row"]["reason"] == ASK_REASON, ask["row"]
         assert history_rows(home)[1]["pool"] == "claude weekly all"
         assert history_rows(home)[1]["used_pct"] == 100
+
+
+BARE_ROUTE = (
+    "route: bounded-question | claude | fable | - | - | suggest | "
+    "Fable under pace: bounded shot to Fable (Pace rule) | reading 0m\n"
+    "route: hard-bug | chatgpt | astra | low | - | suggest | "
+    "Codex under pace: hard ticket to Astra (Pace rule) | reading 0m\n"
+    "route: builder | cursor | grok | high | fast | default | "
+    "Grok on Cursor: Cursor Models under pace | reading 0m\n"
+    "route: chair | cursor | grok | high | fast | default | "
+    "Grok on Cursor: Cursor Models under pace | reading 0m\n"
+)
+CACHED_LINE = (
+    "[seat-usage] cached 0m ago; run ~/.local/bin/seat-usage for live numbers\n"
+    "  claude   | max active\n"
+)
+HOOK_ROW_KEYS = {"role", "seat", "family", "effort", "variant", "mode", "reason", "reading_age_s"}
+LAUNCH_ROWS = (
+    {"role": "bounded-question", "seat": "claude", "family": "fable", "effort": "-",
+     "variant": "-", "mode": "suggest", "reason": "Fable under pace: bounded shot to Fable (Pace rule)"},
+    {"role": "hard-bug", "seat": "chatgpt", "family": "astra", "effort": "low",
+     "variant": "-", "mode": "suggest", "reason": "Codex under pace: hard ticket to Astra (Pace rule)"},
+    {"role": "builder", "seat": "cursor", "family": "grok", "effort": "high",
+     "variant": "fast", "mode": "default", "reason": "Grok on Cursor: Cursor Models under pace"},
+    {"role": "chair", "seat": "cursor", "family": "grok", "effort": "high",
+     "variant": "fast", "mode": "default", "reason": "Grok on Cursor: Cursor Models under pace"},
+)
+
+
+def fresh_cache(now):
+    return {
+        "v": 1,
+        "ts": now,
+        "as_of": {seat: now for seat in ("claude", "chatgpt", "cursor", "grokbot", "grok")},
+        "claude_5h": 10,
+        "claude_5h_reset_ts": now + 4 * 3600,
+        "claude_week": 10,
+        "claude_week_reset_ts": now + 3 * 86400,
+        "fable": 10,
+        "fable_reset_ts": now + 3 * 86400,
+        "codex": 10,
+        "codex_reset_ts": now + 3 * 86400,
+        "codex_window_s": 7 * 86400,
+        "cursor_auto_pct": 15,
+        "cursor_api_pct": 10,
+        "cursor_pct": 15,
+        "cursor_reset_ts": now + 15 * 86400,
+        "cursor_window_s": 30 * 86400,
+        "grok_pct": 10,
+        "grok_reset_ts": now + 3 * 86400,
+        "grok_window_s": 7 * 86400,
+        "grok_exhausted": False,
+        "bot_pct": 10,
+        "bot_reset_ts": now + 3 * 86400,
+        "bot_window_s": 7 * 86400,
+        "lines": ["claude   | max active"],
+        "burn": [],
+    }
+
+
+def run_bin(args, env):
+    return subprocess.run(
+        [sys.executable, str(BIN), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=15,
+    )
+
+
+def cached_env(cache_dir, extra=None):
+    home = Path(cache_dir) / "home"
+    home.mkdir(exist_ok=True)
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(home),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "SEAT_USAGE_CACHE_DIR": str(cache_dir),
+        "SEAT_USAGE_ASKS": str(Path(cache_dir) / "asks.jsonl"),
+    }
+    if extra:
+        env.update(extra)
+    return env
+
+
+def seed_and_run(args, extra=None):
+    with tempfile.TemporaryDirectory() as cache_dir:
+        now = time.time()
+        (Path(cache_dir) / "latest.json").write_text(json.dumps(fresh_cache(now)))
+        return run_bin(args, cached_env(cache_dir, extra))
+
+
+def assert_hook_row(row, expected):
+    assert set(row) == HOOK_ROW_KEYS, set(row)
+    for key, value in expected.items():
+        assert row[key] == value, (key, row)
+    assert isinstance(row["reading_age_s"], (int, float)) and not isinstance(row["reading_age_s"], bool), row
+    assert int(row["reading_age_s"] // 60) == 0, row["reading_age_s"]
+
+
+@test
+def cached_lineup_json_names_the_xai_pair():
+    proc = seed_and_run(["--route", "lineup", "--cached", "--json"])
+    assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
+    assert proc.stderr == "", proc.stderr
+    row = json.loads(proc.stdout)[0]
+    assert row["role"] == "lineup" and row["mode"] == "default", row
+    assert row["reason"] == "xAI chairs and builds: Fable and Astra vote", row["reason"]
+    assert row["rule"] == row["reason"], row["rule"]
+    chair = row["lineup"]["chair"]
+    builder = row["lineup"]["builder"]
+    assert chair["seat"] == "cursor" and chair["family"] == "grok" and chair["effort"] == "high", chair
+    assert chair["variant"] == "fast" and chair["mode"] == "default", chair
+    assert chair["reason"] == "Grok on Cursor: Cursor Models under pace", chair["reason"]
+    assert builder["role"] == "builder" and builder["seat"] == "cursor" and builder["effort"] == "high", builder
+    assert builder["reason"] == chair["reason"], builder
+    voters = [(v["role"], v["seat"], v["family"], v["effort"], v["mode"]) for v in row["lineup"]["voters"]]
+    assert voters == [
+        ("voter", "claude", "fable", "high", "default"),
+        ("voter", "chatgpt", "astra", "high", "default"),
+    ], voters
+
+
+@test
+def cached_host_json_suggests_grokbot_and_does_not_select():
+    proc = seed_and_run(["--route", "host", "--cached", "--json"])
+    assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
+    assert proc.stderr == "", proc.stderr
+    row = json.loads(proc.stdout)[0]
+    assert row["role"] == "host" and row["suggestion"] == "grokbot" and row["selects"] is False, row
+    assert row["seat"] == "grokbot" and row["family"] == "grokbot" and row["effort"] == "-", row
+    assert row["variant"] == "-" and row["mode"] == "suggest", row
+    assert row["reason"] == "Grok Bot first, then Opus at high on Max", row["reason"]
+    hosts = [(h["id"], h["seat"], h["family"], h["effort"], h["state"], h["available"], h["used_pct"]) for h in row["hosts"]]
+    assert hosts == [
+        ("grokbot", "grokbot", "grokbot", "-", "under", True, 10),
+        ("opus", "claude", "opus", "high", "under", True, 10),
+    ], hosts
+
+
+@test
+def bare_cached_route_prints_the_four_launch_lines():
+    proc = seed_and_run(["--route", "--cached"])
+    assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
+    assert proc.stdout == BARE_ROUTE, proc.stdout
+    assert proc.stderr == "", proc.stderr
+
+
+@test
+def cached_route_json_rows_have_the_hook_keys():
+    proc = seed_and_run(["--route", "--cached", "--json"])
+    assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
+    assert proc.stderr == "", proc.stderr
+    rows = json.loads(proc.stdout)
+    assert len(rows) == len(LAUNCH_ROWS), rows
+    for row, expected in zip(rows, LAUNCH_ROWS):
+        assert_hook_row(row, expected)
+
+
+@test
+def cached_is_silent_for_council_voter_and_prints_the_seed():
+    shown = seed_and_run(["--cached"])
+    assert shown.returncode == 0, (shown.returncode, shown.stderr, shown.stdout)
+    assert shown.stdout == CACHED_LINE, shown.stdout
+    assert shown.stderr == "", shown.stderr
+    quiet = seed_and_run(["--cached"], {"COUNCIL_VOTER": "1"})
+    assert quiet.returncode == 0, (quiet.returncode, quiet.stderr, quiet.stdout)
+    assert quiet.stdout == "" and quiet.stderr == "", (quiet.stdout, quiet.stderr)
+
+
+@test
+def unknown_role_exits_2_with_the_role_list():
+    with tempfile.TemporaryDirectory() as home:
+        proc = run_bin(["--route", "nope"], {
+            "PATH": "/usr/bin:/bin",
+            "HOME": home,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+    assert proc.returncode == 2, proc.returncode
+    assert proc.stdout == "", proc.stdout
+    assert proc.stderr == "unknown role nope; roles: bounded-question, hard-bug, builder, chair, lineup, host\n", proc.stderr
+
+
+@test
+def voter_route_exits_2():
+    with tempfile.TemporaryDirectory() as home:
+        proc = run_bin(["--route", "voter"], {
+            "PATH": "/usr/bin:/bin",
+            "HOME": home,
+            "PYTHONDONTWRITEBYTECODE": "1",
+        })
+    assert proc.returncode == 2, proc.returncode
+    assert proc.stdout == "", proc.stdout
+    assert proc.stderr == "voters do not route\n", proc.stderr
 
 
 def main():
