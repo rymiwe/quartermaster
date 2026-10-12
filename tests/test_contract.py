@@ -481,6 +481,55 @@ def voter_route_exits_2():
     assert proc.stderr == "voters do not route\n", proc.stderr
 
 
+@test
+def example_renewals_schema_sets_the_term_and_a_placeholder_date_does_not():
+    example_path = HERE.parents[0] / "renewals.example.json"
+    example = json.loads(example_path.read_text())
+    assert set(example) == {"claude"}, example
+    assert example["claude"]["at"] == "YYYY-MM-DD", example["claude"]
+    assert example["claude"]["renews"] is None, example["claude"]
+    with tempfile.TemporaryDirectory() as home, loopback_anthropic() as (profile, usage):
+        write_credentials(home)
+        cache_path = Path(home) / ".cache" / "seat-usage" / "latest.json"
+        placeholder = run_bounded(claude_env(home, profile, usage, {
+            "SEAT_USAGE_RENEWALS": str(example_path),
+        }))
+        assert placeholder.returncode == 0, (placeholder.returncode, placeholder.stderr, placeholder.stdout)
+        assert placeholder.stdout == ASK_LINE, placeholder.stdout
+        placeholder_cache = json.loads(cache_path.read_text())
+        assert placeholder_cache["claude_week"] == 100, placeholder_cache.get("claude_week")
+        assert "claude_renews_ts" not in placeholder_cache, placeholder_cache.get("claude_renews_ts")
+        assert "claude_renews" not in placeholder_cache, placeholder_cache.get("claude_renews")
+        dated = json.loads(json.dumps(example))
+        dated["claude"]["at"] = "2026-10-14"
+        dated_path = Path(home) / "renewals.json"
+        dated_path.write_text(json.dumps(dated))
+        applied = run_bounded(claude_env(home, profile, usage, {
+            "SEAT_USAGE_RENEWALS": str(dated_path),
+        }))
+        assert applied.returncode == 0, (applied.returncode, applied.stderr, applied.stdout)
+        assert applied.stdout == ASK_LINE, applied.stdout
+        applied_cache = json.loads(cache_path.read_text())
+        assert applied_cache["claude_renews"] is None, applied_cache.get("claude_renews")
+        assert applied_cache["claude_renews_ts"] == CLAUDE_RENEWAL_2026_10_14, applied_cache.get("claude_renews_ts")
+        assert applied_cache["claude_week"] == 100, applied_cache.get("claude_week")
+
+
+@test
+def missing_renewals_file_still_prints_the_route():
+    with tempfile.TemporaryDirectory() as home, loopback_anthropic() as (profile, usage):
+        write_credentials(home)
+        renewals = Path(home) / ".config" / "seat-usage" / "renewals.json"
+        assert not renewals.exists()
+        proc = run_bounded(claude_env(home, profile, usage))
+        assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
+        assert proc.stdout == ASK_LINE, proc.stdout
+        assert proc.stderr == "", proc.stderr
+        cache = json.loads((Path(home) / ".cache" / "seat-usage" / "latest.json").read_text())
+        assert cache["claude_week"] == 100 and cache["fable"] == 100 and cache["claude_5h"] == 11, cache
+        assert "claude_renews_ts" not in cache and "claude_renews" not in cache, cache
+
+
 def main():
     wanted = sys.argv[1:]
     fns = TESTS
