@@ -1584,6 +1584,61 @@ def host_both_ahead_suggests_the_bot_and_names_over_pace():
     assert [h["id"] for h in r["hosts"]] == ["grokbot", "opus"], r
 
 
+UNDER_HARD_BUG = (
+    "route: hard-bug | chatgpt | astra | low | - | suggest | "
+    "Codex under pace: hard ticket to Astra (Pace rule) | reading 0m\n"
+)
+
+
+def _cached_hard_bug(now, **kw):
+    with tempfile.TemporaryDirectory() as d:
+        home = os.path.join(d, "home")
+        os.makedirs(home)
+        with open(os.path.join(d, "latest.json"), "w") as f:
+            json.dump(_shift_snap(now, **kw), f)
+        env = os.environ.copy()
+        env["HOME"] = home
+        env["SEAT_USAGE_CACHE_DIR"] = d
+        env["SEAT_USAGE_ASKS"] = os.path.join(d, "asks.jsonl")
+        env["SEAT_USAGE_RENEWALS"] = os.path.join(d, "renewals.json")
+        return subprocess.run(
+            [sys.executable, str(BIN), "--route", "hard-bug", "--cached"],
+            capture_output=True, text=True, env=env, timeout=15,
+        )
+
+
+@test
+def hard_bug_full_5h_window_asks_with_that_reset():
+    proc = _cached_hard_bug(time.time(), codex=5, codex_5h=100, codex_5h_reset_ts=NOW + 4 * 3600)
+    assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
+    assert proc.stderr == "", proc.stderr
+    assert proc.stdout != UNDER_HARD_BUG, proc.stdout
+    assert "| ask |" in proc.stdout, proc.stdout
+    assert "resets in 4.0h" in proc.stdout, proc.stdout
+    assert "ChatGPT capped: ask Ryan" in proc.stdout, proc.stdout
+
+
+@test
+def hard_bug_past_5h_reset_stays_on_the_weekly_route():
+    proc = _cached_hard_bug(time.time(), codex=5, codex_5h=100, codex_5h_reset_ts=NOW - 60)
+    assert proc.returncode == 0 and proc.stderr == "", (proc.returncode, proc.stderr, proc.stdout)
+    assert proc.stdout == UNDER_HARD_BUG, proc.stdout
+
+
+@test
+def hard_bug_open_5h_window_matches_the_weekly_route():
+    proc = _cached_hard_bug(time.time(), codex=5, codex_5h=0, codex_5h_reset_ts=NOW + 4 * 3600)
+    assert proc.returncode == 0 and proc.stderr == "", (proc.returncode, proc.stderr, proc.stdout)
+    assert proc.stdout == UNDER_HARD_BUG, proc.stdout
+
+
+@test
+def hard_bug_without_a_5h_window_matches_the_weekly_route():
+    proc = _cached_hard_bug(time.time(), codex=5)
+    assert proc.returncode == 0 and proc.stderr == "", (proc.returncode, proc.stderr, proc.stdout)
+    assert proc.stdout == UNDER_HARD_BUG, proc.stdout
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:
