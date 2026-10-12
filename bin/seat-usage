@@ -1,0 +1,1899 @@
+#!/usr/bin/env python3
+"""Print one line per subscription seat: plan, usage, pace. Report-only.
+
+Reads stored tokens to call the same endpoints the vendor TUIs call. Never
+prints a token. Every source is best-effort with a short timeout; a failure
+prints a one-line reason and never exits non-zero. A synchronous
+SessionStart hook prints the cached lines (--cached) so the numbers land in
+context when routing is decided.
+Sources are documented in the Delegation Routing section of ~/.claude/CLAUDE.md.
+"""
+import base64, fcntl, glob, json, os, re, socket, sys, time, urllib.error, urllib.parse, urllib.request
+from datetime import datetime, timezone
+
+H = os.path.expanduser("~")
+NOW = time.time()
+CACHE_DIR = os.environ.get("SEAT_USAGE_CACHE_DIR") or f"{H}/.cache/seat-usage"
+CACHE = f"{CACHE_DIR}/latest.json"
+# Local tests point these at a fake server. Unset, they are the live endpoints.
+ANTHROPIC_PROFILE_URL = os.environ.get("SEAT_USAGE_ANTHROPIC_PROFILE") or "https://api.anthropic.com/api/oauth/profile"
+ANTHROPIC_USAGE_URL = os.environ.get("SEAT_USAGE_ANTHROPIC_USAGE") or "https://api.anthropic.com/api/oauth/usage"
+HISTORY = f"{H}/.local/state/seat-usage/history.jsonl"
+# Every route that ends in "ask" or "no rule", with the pool states it saw.
+# Measures how often a person is asked, before anything answers for them.
+ASKS = os.environ.get("SEAT_USAGE_ASKS") or f"{H}/.local/state/seat-usage/asks.jsonl"
+RENEWALS_FILE = os.environ.get("SEAT_USAGE_RENEWALS") or f"{H}/.config/seat-usage/renewals.json"
+SUMMARY = {"ts": NOW, "as_of": {}, "v": 1}   # compact fields for the status line; no tokens, no PII
+STALE_HOURS = 3       # a seat reading older than this gets no burn line and is marked stale
+ROUTE_FRESH_S = 600   # a reading older than this is unknown to the router (status line refreshes at 10 min)
+
+def get(url, headers, timeout=8):
+    req = urllib.request.Request(url, headers={"User-Agent": "seat-usage", **headers})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode())
+
+class _RateLimited(Exception):
+    """Usage is inside a Retry-After window. Serve the last reading; do not keep calling."""
+
+def _rate_limit_path():
+    return f"{CACHE_DIR}/rate-limit.json"
+
+def _load_rate_limits():
+    try:
+        with open(_rate_limit_path()) as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            return d
+    except Exception:
+        pass
+    return {}
+
+def _store_rate_limits(limits):
+    """Atomic replace so a reader never sees a half-written deadline."""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = _rate_limit_path() + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(limits, f)
+        os.replace(tmp, _rate_limit_path())
+    except Exception:
+        pass
+
+def _retry_after_deadline(raw, now):
+    """Absolute timestamp from a Retry-After delay-seconds value, or None.
+
+    A later probe of the same window counts down (1705s, then 1432s) and
+    yields the same timestamp. Anything that is not a non-negative delay,
+    including a 401 "token has expired" body, is not a deadline.
+    """
+    if raw is None:
+        return None
+    try:
+        seconds = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0 or seconds != seconds or seconds == float("inf"):
+        return None
+    return now + seconds
+
+def _usage_deadline(limits):
+    raw = limits.get(ANTHROPIC_USAGE_URL)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return raw
+
+def _usage_rate_limited(now=None):
+    if now is None:
+        now = time.time()
+    deadline = _usage_deadline(_load_rate_limits())
+    return deadline is not None and now < deadline
+
+def _remember_deadline(url, deadline, limits):
+    """Keep the further absolute timestamp so a countdown cannot restart the window."""
+    prev = limits.get(url)
+    if isinstance(prev, (int, float)) and not isinstance(prev, bool) and prev > deadline:
+        deadline = prev
+    limits[url] = deadline
+    _store_rate_limits(limits)
+
+def _acquire_rate_lock(timeout=None):
+    """Exclusive lock for the usage call. Not the cache .lock: full_run holds that one."""
+    if timeout is None:
+        timeout = LOCK_TIMEOUT
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        fh = open(f"{CACHE_DIR}/rate-limit.lock", "a+")
+    except Exception:
+        return None
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if time.monotonic() >= deadline:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                return None
+            time.sleep(0.05)
+
+def _release_rate_lock(fh):
+    if fh is None:
+        return
+    try:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+def _usage_get(headers, timeout=8):
+    """GET the usage URL unless this cache dir is inside a Retry-After window.
+
+    The deadline is on disk, so a burst in this process or another one (the
+    status line's spawn, --route, a full run) shares it. The lock is held
+    across the HTTP call: the next caller waits, sees the deadline, and
+    does not send. A 401 is not recorded. No quota is invented when
+    Retry-After is absent.
+    """
+    url = ANTHROPIC_USAGE_URL
+    lock = _acquire_rate_lock()
+    try:
+        limits = _load_rate_limits()
+        deadline = _usage_deadline(limits)
+        if deadline is not None and time.time() < deadline:
+            raise _RateLimited()
+        try:
+            body = get(url, headers, timeout)
+        except urllib.error.HTTPError as e:
+            if getattr(e, "code", None) == 429:
+                deadline = _retry_after_deadline(
+                    e.headers.get("Retry-After") if e.headers is not None else None, time.time())
+                if deadline is not None and deadline > time.time():
+                    _remember_deadline(url, deadline, limits)
+                    raise _RateLimited() from e
+            raise
+        if url in limits:
+            limits.pop(url, None)
+            _store_rate_limits(limits)
+        return body
+    finally:
+        _release_rate_lock(lock)
+
+def _reuse_cached_seat(seat):
+    """Copy the last stored reading into SUMMARY, as_of included. None if this seat has none."""
+    cached = _load_cache()
+    as_of = cached.get("as_of") if isinstance(cached.get("as_of"), dict) else {}
+    stamp = as_of.get(seat)
+    if not _is_number(stamp):
+        return None
+    if not isinstance(SUMMARY.get("as_of"), dict):
+        SUMMARY["as_of"] = {}
+    SUMMARY["as_of"][seat] = stamp
+    for k in SEAT_KEYS[seat]:
+        if k in cached:
+            SUMMARY[k] = cached[k]
+        else:
+            SUMMARY.pop(k, None)
+    return [ln for ln in (cached.get("lines") or []) if line_seat(ln) == seat]
+
+def iso_to_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+def pace_code(used_pct, resets_ts, window_sec, now=None):
+    """'under' | 'on' | 'ahead' | '' comparing used% with elapsed% of the window.
+
+    now defaults to the module NOW so a caller can keep the comparison pure.
+    """
+    if now is None:
+        now = NOW
+    if used_pct is None or not resets_ts or not window_sec:
+        return ""
+    elapsed = 1 - max(0.0, resets_ts - now) / window_sec
+    elapsed_pct = round(100 * max(0.0, min(1.0, elapsed)))
+    delta = round(used_pct) - elapsed_pct
+    return "on" if abs(delta) <= 10 else ("ahead" if delta > 0 else "under")
+
+# Seat -> (term end, renews). A pool's allowance is lost at the earlier of its
+# reset and the term end, so pace and burn run to that end. Cursor has no term
+# end key (it renews at cursor_reset_ts); Grok Bot bills Cursor.
+RENEWAL_KEYS = {
+    "claude": ("claude_renews_ts", "claude_renews"),
+    "chatgpt": ("codex_renews_ts", "codex_renews"),
+    "grok": ("grok_renews_ts", "grok_renews"),
+}
+
+def effective_end(s, seat, reset):
+    """The earlier of reset and the term end, when the plan is confirmed not to renew.
+
+    renews None (Claude's hand-kept date) is not a confirmed expiry, so it leaves reset alone.
+    """
+    keys = RENEWAL_KEYS.get(seat)
+    if not keys or not isinstance(reset, (int, float)) or isinstance(reset, bool):
+        return reset
+    end, renews = s.get(keys[0]), s.get(keys[1])
+    if renews is False and isinstance(end, (int, float)) and not isinstance(end, bool) and end < reset:
+        return end
+    return reset
+
+def pace(used_pct, resets_ts, window_sec, now=None):
+    if now is None:
+        now = NOW
+    code = pace_code(used_pct, resets_ts, window_sec, now)
+    if not code:
+        return ""
+    elapsed = 1 - max(0.0, resets_ts - now) / window_sec
+    elapsed_pct = round(100 * max(0.0, min(1.0, elapsed)))
+    tag = {"on": "on pace", "ahead": "ahead of pace, conserve", "under": "under pace, spend it"}[code]
+    return f"{tag} ({elapsed_pct}% of window elapsed)"
+
+def seat_age_s(s, seat, now):
+    """Age in seconds of one seat's reading, or None when as_of has no usable stamp.
+
+    Caches written before per-seat times existed have no as_of and fall back to ts.
+    """
+    as_of = s.get("as_of")
+    if isinstance(as_of, dict):
+        stamp = as_of.get(seat)
+        if stamp:
+            return now - stamp
+        return None
+    return now - (s.get("ts") or 0)
+
+def record_pool(seat, pool, used_pct, reset_ts, window_s, source):
+    """One history line per pool. Nothing reads this file. Write failures are silent."""
+    if isinstance(used_pct, bool) or not isinstance(used_pct, (int, float)):
+        return
+    row = {"host": socket.gethostname(), "seat": seat, "pool": pool, "used_pct": used_pct,
+           "reset_ts": reset_ts, "window_s": window_s, "source": source, "read_ts": NOW}
+    try:
+        os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
+        with open(HISTORY, "a") as f:
+            f.write(json.dumps(row) + "\n")
+    except Exception:
+        pass
+
+def stale_tag(ts):
+    age = NOW - ts
+    return f" | stale (reading {age/3600:.1f}h old)" if age > STALE_HOURS * 3600 else ""
+
+def when(ts):
+    if not ts: return "?"
+    d = ts - NOW
+    if d < 0: return "reset due"
+    if d < 86400: return f"resets in {d/3600:.1f}h"
+    return f"resets in {d/86400:.1f}d"
+
+def claude():
+    # A live usage deadline is served from the last reading, as_of included.
+    # Route already treats a stamp older than 10 minutes as unknown.
+    if _usage_rate_limited():
+        reused = _reuse_cached_seat("claude")
+        if reused is not None:
+            return reused
+    try:
+        d = json.load(open(f"{H}/.claude/.credentials.json")).get("claudeAiOauth") or {}
+        tok = d["accessToken"]
+    except Exception as e:
+        return [f"claude   | no stored token ({e.__class__.__name__})"]
+    hdr = {"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"}
+    out = []
+    try:
+        p = get(ANTHROPIC_PROFILE_URL, hdr)
+        org = p.get("organization", {})
+        plan = org.get("rate_limit_tier", "?").replace("default_", "")
+        status = org.get("subscription_status", "?")
+    except Exception as e:
+        plan, status = "?", f"profile failed: {e.__class__.__name__}"
+    try:
+        u = _usage_get(hdr)
+        parts = []
+        for l in u.get("limits", []):
+            kind = l.get("kind"); pct = l.get("percent"); rs = l.get("resets_at")
+            rts = iso_to_ts(rs) if rs else None
+            if kind == "session":
+                parts.append(f"5h {pct}% ({when(rts)})"); SUMMARY["claude_5h"] = pct; SUMMARY["claude_5h_reset_ts"] = rts
+                record_pool("claude", "claude 5h", pct, rts, 5 * 3600, "live")
+            elif kind == "weekly_all":
+                parts.append(f"weekly all {pct}%: {pace(pct, rts, 7*86400)}, {when(rts)}")
+                SUMMARY["claude_week"] = pct; SUMMARY["claude_week_pace"] = pace_code(pct, rts, 7*86400); SUMMARY["claude_week_reset_ts"] = rts
+                record_pool("claude", "claude weekly all", pct, rts, 7 * 86400, "live")
+            elif kind == "weekly_scoped":
+                name = ((l.get("scope") or {}).get("model") or {}).get("display_name", "scoped")
+                parts.append(f"weekly {name} {pct}%: {pace(pct, rts, 7*86400)}")
+                SUMMARY["fable"] = pct; SUMMARY["fable_pace"] = pace_code(pct, rts, 7*86400); SUMMARY["fable_reset_ts"] = rts
+                record_pool("claude", "claude weekly Fable", pct, rts, 7 * 86400, "live")
+        SUMMARY["claude_plan"] = plan; SUMMARY["claude_status"] = status
+        claude_renewal()
+        SUMMARY["as_of"]["claude"] = NOW
+        out.append(f"claude   | {plan} {status} | " + " | ".join(parts))
+    except _RateLimited:
+        reused = _reuse_cached_seat("claude")
+        if reused is not None:
+            return reused
+        out.append(f"claude   | {plan} {status} | usage failed: HTTPError")
+    except Exception as e:
+        out.append(f"claude   | {plan} {status} | usage failed: {e.__class__.__name__}")
+    return out
+
+def claude_renewal():
+    """Neither the OAuth profile nor usage endpoint carries a billing date (checked
+    2026-10-08), so the Max term end is kept by hand in RENEWALS_FILE as
+    {"claude": {"at": "2026-10-14", "renews": null}}. renews: true, false, or null
+    for not known."""
+    try:
+        r = json.load(open(RENEWALS_FILE)).get("claude") or {}
+        at = r.get("at")
+        if at:
+            SUMMARY["claude_renews_ts"] = iso_to_ts(at if "T" in at else at + "T00:00:00-07:00")
+            SUMMARY["claude_renews"] = r.get("renews")
+    except Exception:
+        pass
+
+def codex_renewal(hdr):
+    """ChatGPT's own billing call. active_until is the paid-through time; will_renew
+    is false once the plan is cancelled."""
+    try:
+        aid = hdr.get("ChatGPT-Account-Id", "")
+        s = get(f"https://chatgpt.com/backend-api/subscriptions?account_id={urllib.parse.quote(aid)}", hdr)
+        if s.get("active_until"):
+            SUMMARY["codex_renews_ts"] = iso_to_ts(s["active_until"])
+            SUMMARY["codex_renews"] = s.get("will_renew")
+            return
+    except Exception:
+        pass
+    keep_codex_term()
+
+def keep_codex_term():
+    """Carry the last known term end forward. A lapsed plan drops to free and the
+    billing call stops returning active_until; without this, a plan that ended
+    reads as a live one again. A renewal returns a new date and replaces it."""
+    cached = _load_cache()
+    for k in ("codex_renews_ts", "codex_renews"):
+        if k in cached:
+            SUMMARY[k] = cached[k]
+
+def codex():
+    """ChatGPT's Codex bucket. Live from chatgpt.com/backend-api/wham/usage, the call
+    the Codex CLI makes (path found in its binary, 2026-10-03), with the stored login.
+    The newest local rollout's rate_limits block is only the fallback: on 2026-10-03
+    OpenAI reset the bucket early and this machine's last run was 22.6h old."""
+    try:
+        t = json.load(open(f"{H}/.codex/auth.json"))["tokens"]
+        hdr = {"Authorization": f"Bearer {t['access_token']}", "ChatGPT-Account-Id": t.get("account_id", "")}
+        u = get("https://chatgpt.com/backend-api/wham/usage", hdr)
+        rl = u["rate_limit"]
+        windows = []
+        for key in ("primary_window", "secondary_window"):
+            w = rl.get(key)
+            if w: windows.append((key, w.get("used_percent"), w.get("reset_at"), w.get("limit_window_seconds") or 0))
+        if not windows: raise KeyError("primary_window")
+        SUMMARY["as_of"]["chatgpt"] = NOW
+        codex_renewal(hdr)
+        return [codex_line(u.get("plan_type", "?"), "live", windows, 0.0)]
+    except Exception as e:
+        live_err = f"{e.__class__.__name__}" + (f" {e.code}" if hasattr(e, "code") else "")
+    files = sorted(glob.glob(f"{H}/.codex/sessions/*/*/*/*.jsonl"), key=os.path.getmtime)
+    last = None
+    dec = json.JSONDecoder()
+    for f in reversed(files[-20:]):
+        try:
+            for line in open(f, errors="ignore"):
+                i = line.find('"rate_limits":')
+                if i < 0: continue
+                try:
+                    obj, _ = dec.raw_decode(line[i + len('"rate_limits":'):])
+                    if isinstance(obj, dict) and obj.get("limit_id") == "codex": last = (f, obj)
+                except Exception:
+                    continue
+            if last: break
+        except Exception:
+            continue
+    if not last:
+        return [f"chatgpt  | live call failed ({live_err}) and no rate_limits found in ~/.codex/sessions"]
+    f, rl = last
+    mtime = os.path.getmtime(f)
+    age_h = (NOW - mtime) / 3600
+    SUMMARY["as_of"]["chatgpt"] = mtime
+    windows = [(key, w.get("used_percent"), w.get("resets_at"), (w.get("window_minutes") or 0) * 60)
+               for key in ("primary", "secondary") if (w := rl.get(key))]
+    # The billing call needs the live login too.
+    keep_codex_term()
+    line = codex_line(rl.get("plan_type", "?"), f"from last local codex run, {age_h:.1f}h ago; live call failed: {live_err}", windows, age_h)
+    return [line + stale_tag(mtime)]
+
+def codex_line(plan, source, windows, age_h):
+    """windows: (key, used %, reset ts, window seconds); the first is the primary."""
+    src = "live" if source == "live" else "rollout"
+    parts = []
+    # Pro reports one weekly window. Plus reports a 5h primary and a weekly
+    # secondary (seen 2026-10-09), so the longest window is the pool and the
+    # 5h one is kept beside it, as for Claude.
+    windows = sorted(windows, key=lambda w: -(w[3] or 0))
+    for i, (_, used, reset, secs) in enumerate(windows):
+        label = "weekly" if secs >= 7*86400 else f"{secs/3600:.0f}h"
+        end = effective_end(SUMMARY, "chatgpt", reset)
+        term = f", term ends {when(end).replace('resets ', '').replace('reset due', 'now')}" if end != reset else ""
+        parts.append(f"{label} {used}%: {pace(used, end, secs)}, {when(reset)}{term}")
+        if i == 0:
+            SUMMARY["codex"] = used; SUMMARY["codex_pace"] = pace_code(used, end, secs)
+            SUMMARY["codex_reset_ts"] = reset; SUMMARY["codex_window_s"] = secs
+            record_pool("chatgpt", "chatgpt weekly", used, reset, secs, src)
+        elif 0 < secs <= 6 * 3600:
+            SUMMARY["codex_5h"] = used; SUMMARY["codex_5h_reset_ts"] = reset
+    SUMMARY["codex_plan"] = plan; SUMMARY["codex_age_h"] = round(age_h, 1)
+    SUMMARY["codex_source"] = src
+    return f"chatgpt  | {plan} ({source}) | " + " | ".join(parts)
+
+def cursor():
+    try:
+        tok = json.load(open(f"{H}/.config/cursor/auth.json"))["accessToken"]
+        pl = tok.split(".")[1]; pl += "=" * (-len(pl) % 4)
+        uid = json.loads(base64.urlsafe_b64decode(pl))["sub"].split("|")[-1]
+    except Exception as e:
+        return [f"cursor   | no stored token ({e.__class__.__name__})"]
+    # The dashboard wants the WorkOS session cookie built as <userId>::<accessToken>.
+    hdr = {"Cookie": "WorkosCursorSessionToken=" + urllib.parse.quote(uid + "::" + tok, safe=""),
+           "Origin": "https://cursor.com", "Referer": "https://cursor.com/dashboard"}
+    try:
+        m = get("https://cursor.com/api/auth/stripe", hdr)
+        member = m.get("membershipType", "?"); status = m.get("subscriptionStatus", "?")
+        # The plan renews at the billing cycle end (cursor_reset_ts) unless a cancellation is pending.
+        SUMMARY["cursor_renews"] = not m.get("pendingCancellationDate")
+    except Exception as e:
+        member, status = "?", f"membership failed: {e.__class__.__name__}"
+    SUMMARY["cursor"] = member.replace("pro_plus", "pro+")
+    try:
+        req = urllib.request.Request("https://cursor.com/api/dashboard/get-current-period-usage", data=b"{}", method="POST",
+                                     headers={"User-Agent": "seat-usage", "Content-Type": "application/json", **hdr})
+        with urllib.request.urlopen(req, timeout=8) as r: u = json.loads(r.read().decode())
+        pu = u.get("planUsage", {})
+        spent, limit = pu.get("totalSpend"), pu.get("limit")
+        start = int(u.get("billingCycleStart", 0)) / 1000; end = int(u.get("billingCycleEnd", 0)) / 1000
+        # The dashboard bars are autoPercentUsed (Cursor Models) and apiPercentUsed (Other Models).
+        # totalSpend/limit includes provider bonus and overstates usage, so it is not a percentage of anything.
+        auto, api = pu.get("autoPercentUsed"), pu.get("apiPercentUsed")
+        pct = round(max(auto or 0, api or 0), 1) if auto is not None or api is not None else None
+        pc = pace_code(pct, end, end - start) if pct is not None and end and start else ""
+        sl = u.get("spendLimitUsage", {}); od, odl = sl.get("individualUsed") or 0, sl.get("individualLimit")
+        SUMMARY["cursor_pct"] = pct; SUMMARY["cursor_pace"] = pc; SUMMARY["cursor_reset_ts"] = end or None; SUMMARY["cursor_window_s"] = (end - start) or None
+        # Both bars, for the status line. Grok 4.7 draws Cursor Models (auto), measured 2026-10-01.
+        # cursor_pct stays the max of the two bars for the status line. Routing reads cursor_auto_pct only.
+        for key, v, pool in (("cursor_auto", auto, "cursor models"), ("cursor_api", api, "cursor other models")):
+            if v is not None:
+                SUMMARY[f"{key}_pct"] = round(v, 1); SUMMARY[f"{key}_pace"] = pace_code(v, end, end - start) if end and start else ""
+                record_pool("cursor", pool, round(v, 1), end or None, (end - start) or None, "live")
+        SUMMARY["cursor_ondemand"] = od / 100
+        SUMMARY["cursor_ondemand_limit"] = odl / 100 if odl else None
+        odtxt = f" | on-demand ${od/100:.2f} of ${odl/100:.0f}" if odl else ""
+        out = [f"cursor   | {member} {status} | cursor models {auto or 0:.0f}%, other models {api or 0:.0f}% (${spent/100:.2f} spent incl. bonus): {pace(pct, end, end - start)}, {when(end)}{odtxt}"]
+        SUMMARY["as_of"]["cursor"] = NOW
+    except Exception as e:
+        out = [f"cursor   | {member} {status} | usage failed: {e.__class__.__name__}"]
+    return out + [grok_bot(tok)]
+
+def grok_bot(tok):
+    """Grok Bot's weekly allowance. Separate from both Cursor dashboard bars; "Sand"
+    is the Bot's internal name. Same call the Bot desktop app's Settings > Usage makes."""
+    try:
+        req = urllib.request.Request("https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus", data=b"{}", method="POST",
+                                     headers={"User-Agent": "seat-usage", "Content-Type": "application/json",
+                                              "Connect-Protocol-Version": "1", "Authorization": f"Bearer {tok}"})
+        with urllib.request.urlopen(req, timeout=8) as r: b = json.loads(r.read().decode())
+        pct = b.get("usagePercent")
+        if pct is None: return "grokbot  | no usagePercent (pooled enterprise allowance?)"
+        start, end = iso_to_ts(b["currentPeriodStart"]), iso_to_ts(b["nextResetTimestampUtc"])
+        SUMMARY["bot_pct"] = round(pct, 1); SUMMARY["bot_pace"] = pace_code(pct, end, end - start); SUMMARY["bot_reset_ts"] = end; SUMMARY["bot_window_s"] = end - start
+        SUMMARY["bot_exhausted"] = b.get("hasAvailableUsage") is False
+        SUMMARY["as_of"]["grokbot"] = NOW
+        record_pool("grokbot", "grokbot week", round(pct, 1), end, end - start, "live")
+        od = (b.get("onDemandSettings") or {}).get("enabled")
+        state = "" if b.get("hasAvailableUsage", True) else " | ALLOWANCE USED" + (", on-demand" if od else ", blocked")
+        return f"grokbot  | {b.get('cursorPlanName', '?')} | week {pct:.1f}%: {pace(pct, end, end - start)}, {when(end)}{state}"
+    except Exception as e:
+        return f"grokbot  | usage failed: {e.__class__.__name__}"
+
+OP_REF = "op://claude/grok web cookie/credential"
+COOKIE_TRIED = []   # why each cookie source failed, for the grok line
+
+def grok_cookie():
+    """The grok.com browser 'sso' cookie. 1Password first (service account, claude
+    vault, item 'grok web cookie', field 'credential'), then ~/.grok/web-cookie.
+    The op binary is found by name: $SEAT_USAGE_OP if set, else op.exe (Windows
+    1Password from WSL), else op. The first one that returns a value wins.
+    Hooks and the status line's background refresh can run without the Windows
+    dirs on PATH, so op.exe falls back to its WinGet install path."""
+    import glob, shutil, subprocess
+    override = os.environ.get("SEAT_USAGE_OP")
+    winget = sorted(glob.glob("/mnt/c/Users/*/AppData/Local/Microsoft/WinGet/Packages/AgileBits.1Password.CLI_*/op.exe"))
+    for name in ([override] if override else ["op.exe", "op"]):
+        path = shutil.which(name) or (winget[-1] if name == "op.exe" and winget else None)
+        if not path:
+            COOKIE_TRIED.append(f"{name} not on PATH"); continue
+        try:
+            r = subprocess.run([path, "read", OP_REF], capture_output=True, text=True, timeout=20)
+            v = r.stdout.replace("\r", "").strip()
+            if r.returncode == 0 and v: return v
+            COOKIE_TRIED.append(f"{name} read failed")
+        except Exception as e:
+            COOKIE_TRIED.append(f"{name} {e.__class__.__name__}")
+    try:
+        v = open(f"{H}/.grok/web-cookie").read().strip()
+        if v: return v
+        COOKIE_TRIED.append("~/.grok/web-cookie empty")
+    except Exception:
+        COOKIE_TRIED.append("no ~/.grok/web-cookie")
+    return None
+
+def grok():
+    """SuperGrok. Tier from grok.com/rest/subscriptions with the CLI key. The weekly
+    usage panel (grok.com Settings > Usage) refuses the CLI's OAuth2 token, so it is
+    read only with the browser 'sso' cookie (see grok_cookie)."""
+    key = None
+    try:
+        a = json.load(open(f"{H}/.grok/auth.json")); inner = list(a.values())[0]; key = inner.get("key")
+    except Exception:
+        pass
+    tier, status, expiry, cancels = "?", "", None, False
+    sso = grok_cookie()
+    SUMMARY["grok_cookie_ok"] = bool(sso)
+    try:
+        # The CLI key got 403 here on 2026-10-08; the browser cookie still works.
+        try:
+            subs = get("https://grok.com/rest/subscriptions", {"Authorization": f"Bearer {key}"}).get("subscriptions", [])
+        except Exception:
+            if not sso: raise
+            subs = get("https://grok.com/rest/subscriptions", {"User-Agent": "Mozilla/5.0", "Cookie": f"sso={sso}; sso-rw={sso}"}).get("subscriptions", [])
+        live = [x for x in subs if x.get("status") == "SUBSCRIPTION_STATUS_ACTIVE"] or subs[:1]
+        if live:
+            x = live[0]
+            tier = x.get("tier", "?").replace("SUBSCRIPTION_TIER_GROK_PRO", "SuperGrok").replace("SUBSCRIPTION_TIER_", "")
+            status = "active" if x.get("status") == "SUBSCRIPTION_STATUS_ACTIVE" else x.get("status", "")
+            expiry = x.get("billingPeriodEnd") or (x.get("google") or {}).get("expiryTime")
+            cancels = bool(x.get("cancelAtPeriodEnd"))
+            if expiry:
+                SUMMARY["grok_renews_ts"] = iso_to_ts(expiry); SUMMARY["grok_renews"] = not cancels
+    except Exception:
+        try:   # fall back to the server-fetched settings cache
+            d = json.load(open(f"{H}/.grok/settings_cache.json"))
+            pl = d.get("payload"); pl = json.loads(pl) if isinstance(pl, str) else pl
+            tier = (pl.get("settings") or {}).get("subscription_tier_display") or "?"
+        except Exception:
+            pass
+    SUMMARY["grok"] = tier
+    # Weekly pool, only with the browser cookie. The Settings > Usage panel reads
+    # grok_api_v2.GrokBuildBilling/GetGrokCreditsConfig, served as GET /rest/grok/credits
+    # (found in the grok.com JS bundle, 2026-09-30). /rest/rate-limits is a per-model
+    # 2h query window, not this pool.
+    weekly = None
+    if sso:
+        try:
+            weekly = get("https://grok.com/rest/grok/credits", {"User-Agent": "Mozilla/5.0", "Cookie": f"sso={sso}; sso-rw={sso}"}).get("config") or {}
+            per = weekly.get("currentPeriod") or {}
+            pct = weekly.get("creditUsagePercent")
+            if pct is not None and per.get("start") and per.get("end"):
+                start, end = iso_to_ts(per["start"]), iso_to_ts(per["end"])
+                SUMMARY["grok_pct"] = pct; SUMMARY["grok_pace"] = pace_code(pct, end, end - start)
+                SUMMARY["grok_reset_ts"] = end; SUMMARY["grok_window_s"] = end - start
+                SUMMARY["as_of"]["grok"] = NOW
+                SUMMARY["grok_products"] = {u["product"].replace("PRODUCT_GROK_", "").lower(): u.get("usagePercent", 0)
+                                            for u in weekly.get("productUsage", []) if u.get("usagePercent")}
+                record_pool("grok", "grok week", pct, end, end - start, "live")
+        except Exception as e:
+            weekly = {"error": e.__class__.__name__}
+    # The empty signal: a 402 "usage balance exhausted" in the CLI log within the last day.
+    last402 = None
+    try:
+        logf = f"{H}/.grok/logs/unified.jsonl"
+        with open(logf, "rb") as f:
+            f.seek(0, 2); size = f.tell(); f.seek(max(0, size - 2_000_000)); tail = f.read().decode(errors="ignore")
+        for line in reversed(tail.splitlines()):
+            if '"status_code":402' in line:
+                m = re.search(r'"ts":"([^"]+)"', line)
+                if m: last402 = iso_to_ts(m.group(1)); break
+    except Exception:
+        pass
+    # Empty until the weekly Grok reset, not for 24h: the routing rule's horizon is
+    # the reset, and the pool refills only then. The server's period start is the
+    # last reset; without the cookie, fall back to Thursday 5:38 PM Pacific.
+    per_start = ((weekly or {}).get("currentPeriod") or {}).get("start")
+    if per_start:
+        last_reset = iso_to_ts(per_start)
+    else:
+        try:
+            from zoneinfo import ZoneInfo
+            pt = ZoneInfo("America/Los_Angeles")
+            now_pt = datetime.fromtimestamp(NOW, pt)
+            days_back = (now_pt.weekday() - 3) % 7
+            reset = (now_pt - __import__("datetime").timedelta(days=days_back)).replace(hour=17, minute=38, second=0, microsecond=0)
+            if reset > now_pt: reset -= __import__("datetime").timedelta(days=7)
+            last_reset = reset.timestamp()
+        except Exception:
+            last_reset = NOW - 7 * 86400
+    exhausted = (last402 is not None and last402 > last_reset) or (SUMMARY.get("grok_pct") or 0) >= 100
+    SUMMARY["grok_exhausted"] = exhausted
+    SUMMARY["grok_402_h"] = round((NOW - last402) / 3600, 1) if last402 else None
+    parts = [f"{tier} {status}".strip() + (f", sub {'ends' if cancels else 'renews'} {when(iso_to_ts(expiry)).replace('resets ', '')}" if expiry else "")]
+    if weekly is None:
+        parts.append("weekly pool needs the browser sso cookie (1Password item 'grok web cookie', claude vault, field credential): " + "; ".join(COOKIE_TRIED))
+    elif "error" in weekly:
+        parts.append(f"weekly pool read failed with cookie: {weekly['error']}")
+    elif "grok_pct" in SUMMARY:
+        prods = ", ".join(f"{k} {v}%" for k, v in SUMMARY.get("grok_products", {}).items())
+        parts.append(f"week {SUMMARY['grok_pct']}% ({when(SUMMARY['grok_reset_ts'])}; {pace(SUMMARY['grok_pct'], SUMMARY['grok_reset_ts'], SUMMARY['grok_reset_ts'] - last_reset)})" + (f" [{prods}]" if prods else ""))
+    else:
+        parts.append("cookie ok but /rest/grok/credits had no weekly period")
+    parts.append(f"EXHAUSTED: 402 {SUMMARY['grok_402_h']}h ago, until the weekly reset" if exhausted else "no 402 since the last weekly reset")
+    return ["grok     | " + " | ".join(parts)]
+
+# Burn nudge: a pool well under pace that resets soon loses the rest at the reset.
+BURN_HOURS = 24      # the reset is less than this many hours away
+BURN_GAP = 25        # used% is at least this many points below elapsed%
+BURN_POOLS = (       # (seat, pool, used key, reset key, window key or fixed seconds)
+    ("claude", "weekly all", "claude_week", "claude_week_reset_ts", 7 * 86400),
+    ("claude", "weekly Fable", "fable", "fable_reset_ts", 7 * 86400),
+    ("chatgpt", "weekly", "codex", "codex_reset_ts", "codex_window_s"),
+    ("cursor", "cursor models (month)", "cursor_auto_pct", "cursor_reset_ts", "cursor_window_s"),
+    ("cursor", "other models (month)", "cursor_api_pct", "cursor_reset_ts", "cursor_window_s"),
+    ("grokbot", "week", "bot_pct", "bot_reset_ts", "bot_window_s"),
+    ("grok", "week", "grok_pct", "grok_reset_ts", "grok_window_s"),
+)
+
+def burn_entries(s, now):
+    """Pools that qualify for a burn nudge, from a SUMMARY-shaped dict at time now."""
+    out = []
+    for seat, pool, uk, rk, wk in BURN_POOLS:
+        used, reset = s.get(uk), effective_end(s, seat, s.get(rk))
+        window = wk if isinstance(wk, (int, float)) else s.get(wk)
+        if not isinstance(used, (int, float)) or not reset or not window:
+            continue
+        age = seat_age_s(s, seat, now)
+        if age is None or age > STALE_HOURS * 3600:
+            continue
+        left_s = reset - now
+        if left_s <= 0 or left_s >= BURN_HOURS * 3600:
+            continue
+        elapsed_pct = 100 * max(0.0, min(1.0, 1 - left_s / window))
+        if elapsed_pct - used < BURN_GAP:
+            continue
+        out.append({"seat": seat, "pool": pool, "used_pct": round(used, 1), "elapsed_pct": round(elapsed_pct),
+                    "left_pct": round(100 - used), "reset_ts": reset, "hours": round(left_s / 3600, 1)})
+    return out
+
+def burn_line(e):
+    return (f"burn: {e['seat']} {e['pool']} {e['left_pct']}% left, expires in {e['hours']}h"
+            " - raise builder effort or add an opt-in leg (rymiwe/council#16)")
+
+# Keys each seat owns. merge_summary replaces or keeps a seat as a unit.
+# cursor_pct is the max(auto, api) bar for the status line; route() never reads it.
+SEAT_KEYS = {
+    "claude": (
+        "claude_5h", "claude_5h_reset_ts", "claude_week", "claude_week_pace", "claude_week_reset_ts",
+        "fable", "fable_pace", "fable_reset_ts", "claude_plan", "claude_status",
+        "claude_renews_ts", "claude_renews",
+    ),
+    "chatgpt": (
+        "codex", "codex_pace", "codex_reset_ts", "codex_window_s", "codex_plan", "codex_age_h", "codex_source",
+        "codex_5h", "codex_5h_reset_ts", "codex_renews_ts", "codex_renews",
+    ),
+    "cursor": (
+        "cursor", "cursor_pct", "cursor_pace", "cursor_reset_ts", "cursor_window_s",
+        "cursor_auto_pct", "cursor_auto_pace", "cursor_api_pct", "cursor_api_pace", "cursor_ondemand", "cursor_ondemand_limit",
+        "cursor_renews",
+    ),
+    "grokbot": ("bot_pct", "bot_pace", "bot_reset_ts", "bot_window_s", "bot_exhausted"),
+    "grok": (
+        "grok", "grok_cookie_ok", "grok_pct", "grok_pace", "grok_reset_ts", "grok_window_s",
+        "grok_products", "grok_exhausted", "grok_402_h", "grok_renews_ts", "grok_renews",
+    ),
+}
+LINE_SEATS = ("claude", "chatgpt", "cursor", "grokbot", "grok")
+
+# Pools the router knows. Fable and weekly-all are 7-day windows. The 5h pool
+# is session-limited: capped or not, no pace rule. cursor_models is autoPercentUsed,
+# never cursor_pct.
+# serves: families this pool can run. only: a harness no other pool offers.
+# Ordinary work spends a pool with an empty only before one that has a harness
+# to keep. A burn (the pool would expire unused) outranks that (Ryan, 2026-10-08).
+POOLS = {
+    "claude_5h": {"seat": "claude", "used": "claude_5h", "reset": "claude_5h_reset_ts", "window": 5 * 3600, "pace": False, "label": "claude 5h", "serves": ("opus", "fable"), "only": ()},
+    "claude_week": {"seat": "claude", "used": "claude_week", "reset": "claude_week_reset_ts", "window": 7 * 86400, "label": "claude weekly all", "burn": "weekly all", "serves": ("opus", "fable"), "only": ()},
+    "fable": {"seat": "claude", "used": "fable", "reset": "fable_reset_ts", "window": 7 * 86400, "label": "Fable", "burn": "weekly Fable", "serves": ("fable",), "only": ()},
+    "codex": {"seat": "chatgpt", "used": "codex", "reset": "codex_reset_ts", "window": "codex_window_s", "label": "Codex", "burn": "weekly", "serves": ("astra", "sol"), "only": ()},
+    "cursor_models": {"seat": "cursor", "used": "cursor_auto_pct", "reset": "cursor_reset_ts", "window": "cursor_window_s", "label": "Cursor Models", "burn": "cursor models (month)", "serves": ("grok",), "only": ()},
+    "cursor_other": {"seat": "cursor", "used": "cursor_api_pct", "reset": "cursor_reset_ts", "window": "cursor_window_s", "label": "Other Models", "burn": "other models (month)", "serves": ("fable",), "only": ()},
+    "grokbot": {"seat": "grokbot", "used": "bot_pct", "reset": "bot_reset_ts", "window": "bot_window_s", "label": "grokbot", "burn": "week", "exhausted": "bot_exhausted", "serves": ("grokbot",), "only": ()},
+    "grok": {"seat": "grok", "used": "grok_pct", "reset": "grok_reset_ts", "window": "grok_window_s", "label": "grok", "burn": "week", "exhausted": "grok_exhausted", "serves": ("grok",), "only": ("grok-build",)},
+}
+
+# Daily work — one bounded Fable question. No written effort.
+# Daily work — one bounded Astra run, low or medium first.
+# Chair and builder are Grok. Cursor Models, then SuperGrok, by the pace rules.
+# Opus when both of those pools are over pace.
+ROLES = {
+    "bounded-question": {"seats": ("claude", "cursor"), "primary": "fable",
+                         "default": {"seat": "claude", "family": "fable", "effort": "-", "variant": "-"}},
+    "hard-bug": {"seats": ("chatgpt",), "primary": "codex",
+                 "default": {"seat": "chatgpt", "family": "astra", "effort": "low", "variant": "-"}},
+    "builder": {"seats": ("cursor", "grok", "claude"), "primary": "cursor_models",
+                "default": {"seat": "cursor", "family": "grok", "effort": "high", "variant": "fast"}},
+    "chair": {"seats": ("cursor", "grok", "claude"), "primary": "cursor_models",
+              "default": {"seat": "cursor", "family": "grok", "effort": "high", "variant": "fast"}},
+}
+
+_ASK = "ask Ryan"
+_FIX_ASK = "fix the failed reading, then ask Ryan"
+
+# The only home of the routing rules. Each comment names the CLAUDE.md section.
+# First match wins. "not_capped" means the pool is known and not capped.
+# "room" means the pool is known, under 95% used, and not capped. Near the hard
+# cap outranks pace. "burn" matches burn_entries (thresholds stay in BURN_HOURS / BURN_GAP).
+NEAR_CAP = 95
+ROUTE_RULES = [
+    # Council (design, planning, review), item 1 — Max capped: Cursor's newest Fable at thinking-xhigh is the substitute
+    {"role": "bounded-question", "when": (("claude_week", "capped"), ("cursor_other", "not_capped")),
+     "mode": "suggest", "seat": "cursor", "family": "fable", "effort": "xhigh", "variant": "-",
+     "reason": "Max capped: Cursor Fable on Other Models"},
+    # Council (design, planning, review), item 1 — Max capped: Cursor's newest Fable at thinking-xhigh is the substitute
+    {"role": "bounded-question", "when": (("claude_5h", "capped"), ("cursor_other", "not_capped")),
+     "mode": "suggest", "seat": "cursor", "family": "fable", "effort": "xhigh", "variant": "-",
+     "reason": "Max capped: Cursor Fable on Other Models"},
+    # Ryan, 2026-10-03 — Max capped and Cursor Fable unavailable or unknown: ask
+    {"role": "bounded-question", "when": (("claude_week", "capped"),), "mode": "ask",
+     "ask_pools": ("cursor_other",)},
+    {"role": "bounded-question", "when": (("claude_5h", "capped"),), "mode": "ask",
+     "ask_pools": ("cursor_other",)},
+    # Ryan, 2026-10-03 — burn on Fable: top effort
+    {"role": "bounded-question", "when": (("fable", "burn"),), "mode": "burn", "effort": "max",
+     "reason": "Fable burn: effort max"},
+    # Near the hard cap beats pace. Opus on Max at high when that pool can take it.
+    {"role": "bounded-question", "when": (("fable", "near_cap"), ("claude_week", "room"), ("claude_5h", "room")),
+     "mode": "suggest", "seat": "claude", "family": "opus", "effort": "high", "variant": "-",
+     "reason": "Fable near hard cap: Opus on Max at high"},
+    {"role": "bounded-question", "when": (("fable", "near_cap"),), "mode": "ask",
+     "reason": "Fable near hard cap and Max cannot take Opus: " + _ASK},
+    # Pace rule — under pace: bounded shot to Fable
+    {"role": "bounded-question", "when": (("fable", "under"),), "mode": "suggest",
+     "reason": "Fable under pace: bounded shot to Fable (Pace rule)"},
+    # Pace rule — on pace: routing as written
+    {"role": "bounded-question", "when": (("fable", "on"),), "mode": "default",
+     "reason": "Fable on pace"},
+    # Pace rule — ahead of pace: judgment shot to Opus
+    {"role": "bounded-question", "when": (("fable", "ahead"),), "mode": "suggest",
+     "seat": "claude", "family": "opus", "effort": "-", "variant": "-",
+     "reason": "Fable ahead of pace: judgment shot to Opus (Pace rule)"},
+    # Overflow crosses seats — Fable slice capped, Max weekly-all and 5h still open: Opus on Max
+    {"role": "bounded-question", "when": (("fable", "capped"), ("claude_week", "not_capped"), ("claude_5h", "not_capped")),
+     "mode": "suggest", "seat": "claude", "family": "opus", "effort": "-", "variant": "-",
+     "reason": "Fable slice capped: Opus on Max (Overflow crosses seats)"},
+    # Ryan, 2026-10-03 — Fable capped and a Max reading unknown: fix the reading, ask
+    {"role": "bounded-question", "when": (("fable", "capped"), ("claude_week", "unknown")),
+     "mode": "ask", "reason": "Max weekly reading unknown: " + _FIX_ASK},
+    {"role": "bounded-question", "when": (("fable", "capped"), ("claude_5h", "unknown")),
+     "mode": "ask", "reason": "Max 5h reading unknown: " + _FIX_ASK},
+    # Pace rule — burn on the Codex bucket: low or medium effort first, so medium
+    {"role": "hard-bug", "when": (("codex", "burn"),), "mode": "burn", "effort": "medium",
+     "reason": "Codex burn: low or medium effort first"},
+    # Pace rule — under pace: hard ticket to Astra
+    {"role": "hard-bug", "when": (("codex", "under"),), "mode": "suggest",
+     "reason": "Codex under pace: hard ticket to Astra (Pace rule)"},
+    # Pace rule — on pace: routing as written
+    {"role": "hard-bug", "when": (("codex", "on"),), "mode": "default",
+     "reason": "Codex on pace"},
+    # Pace rule — ahead of pace: Sol where it can do the job
+    {"role": "hard-bug", "when": (("codex", "ahead"),), "mode": "suggest",
+     "seat": "chatgpt", "family": "sol", "effort": "-", "variant": "-",
+     "reason": "Codex ahead of pace: Sol where it can do the job (Pace rule)"},
+    # Ryan, 2026-10-03 — ChatGPT capped: ask (Cursor has no Astra; a reviewer does not review its own output)
+    {"role": "hard-bug", "when": (("codex", "capped"),), "mode": "ask",
+     "reason": "ChatGPT capped: " + _ASK + " (Cursor has no Astra; a reviewer does not review its own output)"},
+]
+# Chair and builder are selected in _route_worker. The rule table no longer
+# walls SuperGrok off from those roles (Ryan, 2026-10-08, routing principles).
+
+def _is_number(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+def _fmt_pct(v):
+    n = round(float(v), 1)
+    text = f"{n:.1f}"
+    return text[:-2] if text.endswith(".0") else text
+
+def _window(meta, s):
+    w = meta["window"]
+    return s.get(w) if isinstance(w, str) else w
+
+def pool_status(pool_id, s, now):
+    """'unknown' | 'capped' | 'near_cap' | 'open' | 'under' | 'on' | 'ahead', plus why when unknown.
+
+    The Fable slice is near_cap from 95% used until it caps. That band outranks pace.
+
+    unknown when the seat has no as_of, the reading is older than 10 minutes,
+    used% is absent or not a number (absent is never 0%), or the reset is
+    missing or already past. grok is also capped when grok_exhausted.
+    The 5h pool (pace False) is open when a fresh used% is 0 and reset is None
+    (no session started). It returns 'open' when it is known and not capped.
+    """
+    meta = POOLS[pool_id]
+    as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
+    stamp = as_of.get(meta["seat"])
+    if not stamp:
+        return "unknown", "no reading"
+    # A term that ended before the reset leaves nothing to spend. Billing fact,
+    # not a usage reading, so its age does not matter.
+    reset = s.get(meta["reset"])
+    end = effective_end(s, meta["seat"], reset)
+    if _is_number(end) and end != reset and end <= now:
+        return "capped", "term ended"
+    age = now - stamp
+    if age > ROUTE_FRESH_S:
+        return "unknown", f"reading {int(age // 60)}m old"
+    used = s.get(meta["used"])
+    if not _is_number(used):
+        return "unknown", "no used %"
+    if not meta.get("pace", True) and used == 0 and reset is None:
+        return "open", None
+    if not _is_number(reset) or reset <= now:
+        return "unknown", "reset passed"
+    reset = end
+    if (meta.get("exhausted") and s.get(meta["exhausted"])) or used >= 100:
+        return "capped", None
+    if pool_id == "fable" and used >= NEAR_CAP:
+        return "near_cap", None
+    if not meta.get("pace", True):
+        return "open", None
+    code = pace_code(used, reset, _window(meta, s), now)
+    if not code:
+        return "unknown", "no used %"
+    return code, None
+
+def _pool_burning(pool_id, s, now):
+    meta = POOLS[pool_id]
+    for e in burn_entries(s, now):
+        if e["seat"] == meta["seat"] and e["pool"] == meta.get("burn"):
+            return True
+    return False
+
+def _reading_age(pool_id, s, now):
+    seat = POOLS[pool_id]["seat"]
+    as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
+    stamp = as_of.get(seat)
+    if not stamp:
+        return None
+    return now - stamp
+
+def _row(role, s, now, mode, reason, **over):
+    base = ROLES[role]["default"]
+    out = {"role": role, "seat": base["seat"], "family": base["family"], "effort": base["effort"],
+           "variant": base["variant"], "mode": mode, "reason": reason,
+           "reading_age_s": _reading_age(ROLES[role]["primary"], s, now)}
+    for k in ("seat", "family", "effort", "variant"):
+        if k in over:
+            out[k] = over[k]
+    return out
+
+def _has_room(pool_id, states, s):
+    """Known, under the near-cap line, and not capped. Pace does not matter."""
+    if states[pool_id][0] not in ("under", "on", "ahead", "open"):
+        return False
+    used = s.get(POOLS[pool_id]["used"])
+    return _is_number(used) and used < NEAR_CAP
+
+def _rule_matches(rule, states, s, now):
+    for pool, expected in rule["when"]:
+        if expected == "burn":
+            if not _pool_burning(pool, s, now):
+                return False
+        elif expected == "not_capped":
+            if states[pool][0] not in ("under", "on", "ahead", "open"):
+                return False
+        elif expected == "room":
+            if not _has_room(pool, states, s):
+                return False
+        elif states[pool][0] != expected:
+            return False
+    return True
+
+def _apply_rule(role, rule, s, now, states):
+    over = {k: rule[k] for k in ("seat", "family", "effort", "variant") if k in rule}
+    reason = rule.get("reason")
+    if reason is None and rule.get("ask_pools"):
+        unknown = [POOLS[p]["label"] for p in rule["ask_pools"] if states[p][0] == "unknown"]
+        capped = [POOLS[p]["label"] for p in rule["ask_pools"] if states[p][0] == "capped"]
+        if unknown:
+            reason = f"{', '.join(unknown)} reading unknown: {_FIX_ASK}"
+        else:
+            reason = f"{', '.join(capped) or 'no fallback'} capped: {_ASK}"
+    if reason and "{pct}" in reason:
+        reason = reason.format(pct=_fmt_pct(s.get(POOLS[ROLES[role]["primary"]]["used"])))
+    notes = [f"{POOLS[p]['label']} reading unknown: fix the failed reading"
+             for p in rule.get("note_unknown") or () if states[p][0] == "unknown"]
+    if notes and reason is not None:
+        reason = reason + "; " + "; ".join(notes)
+    return _row(role, s, now, rule["mode"], reason or "", **over)
+
+def route(role, s, now):
+    """One role's routing row from a SUMMARY-shaped dict. Pure: does not read the network or the clock."""
+    if role in ("chair", "builder"):
+        return _route_worker(role, s, now)
+    states = {pid: pool_status(pid, s, now) for pid in POOLS}
+    primary = ROLES[role]["primary"]
+    st, why = states[primary]
+    for rule in ROUTE_RULES:
+        if rule["role"] != role:
+            continue
+        if st == "unknown" and any(pool == primary for pool, _expected in rule["when"]):
+            continue
+        if _rule_matches(rule, states, s, now):
+            return _apply_rule(role, rule, s, now, states)
+    if st == "unknown":
+        label = POOLS[primary]["label"]
+        return _row(role, s, now, "default", f"{label}: {why}")
+    return _row(role, s, now, "default", f"{st}: no rule")
+
+def format_route(row):
+    age = row.get("reading_age_s")
+    shown = "unknown" if age is None else f"{int(age // 60)}m"
+    return (f"route: {row['role']} | {row['seat']} | {row['family']} | {row['effort']} | "
+            f"{row['variant']} | {row['mode']} | {row['reason']} | reading {shown}")
+
+def line_seat(line):
+    return line.split("|", 1)[0].strip()
+
+def merge_summary(base, fresh, seats, now=None):
+    """Replace seats that succeeded in fresh; drop as_of on a failed reread and keep old numbers."""
+    if now is None:
+        now = NOW
+    out = dict(base)
+    out["as_of"] = dict(base.get("as_of") or {})
+    fresh_as_of = fresh.get("as_of") or {}
+    seat_set = list(seats)
+    kept_base = set()
+    for seat in seat_set:
+        if seat in fresh_as_of:
+            base_stamp = out["as_of"].get(seat)
+            fresh_stamp = fresh_as_of[seat]
+            if _is_number(base_stamp) and _is_number(fresh_stamp) and fresh_stamp < base_stamp:
+                kept_base.add(seat)
+                continue
+            for k in SEAT_KEYS[seat]:
+                if k in fresh:
+                    out[k] = fresh[k]
+                else:
+                    out.pop(k, None)
+            out["as_of"][seat] = fresh_as_of[seat]
+        else:
+            out["as_of"].pop(seat, None)
+            if seat == "grok":
+                out["grok_exhausted"] = bool(out.get("grok_exhausted") or fresh.get("grok_exhausted"))
+                if "grok_402_h" in fresh:
+                    out["grok_402_h"] = fresh["grok_402_h"]
+                if "grok_cookie_ok" in fresh:
+                    out["grok_cookie_ok"] = fresh["grok_cookie_ok"]
+    fresh_lines, old_lines = {}, {}
+    for ln in fresh.get("lines") or []:
+        fresh_lines.setdefault(line_seat(ln), []).append(ln)
+    for ln in base.get("lines") or []:
+        old_lines.setdefault(line_seat(ln), []).append(ln)
+    merged, seen = [], set()
+    for seat in LINE_SEATS:
+        seen.add(seat)
+        if seat in seat_set and seat in fresh_lines and seat not in kept_base:
+            merged.extend(fresh_lines[seat])
+        elif seat in old_lines:
+            merged.extend(old_lines[seat])
+    for seat, lns in old_lines.items():
+        if seat not in seen:
+            merged.extend(lns)
+    out["lines"] = merged
+    out["burn"] = burn_entries(out, now)
+    base_ts = base.get("ts")
+    out["ts"] = base_ts if _is_number(base_ts) else fresh.get("ts", now)
+    out["v"] = 1
+    return out
+
+def _load_cache():
+    try:
+        with open(CACHE) as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            d.setdefault("as_of", {})
+            d.setdefault("lines", [])
+            return d
+    except Exception:
+        pass
+    return {"ts": 0, "as_of": {}, "v": 1, "lines": []}
+
+LOCK_TIMEOUT = 30
+
+class _LockHandle:
+    """Cache lock. owned=False is an inherited descriptor and must not be unlocked."""
+
+    def __init__(self, fh, owned):
+        self.fh = fh
+        self.owned = owned
+
+def _fd_stat(fd):
+    try:
+        return os.stat(f"/proc/self/fd/{fd}")
+    except OSError:
+        return None
+
+def _snapshot_inherited_fds():
+    """Identity of every fd open at import.
+
+    The status line runs `( flock -n 9 && seat-usage ) 9>cache/.lock`, so the
+    child inherits fd 9 on the same open file description that already holds
+    LOCK_EX. Opening .lock again and flocking that new descriptor blocks against
+    the parent until the parent exits. A fd this process opens later is a
+    different description; recording the startup inode keeps a reused fd number
+    from being treated as the parent's lock.
+    """
+    found = {}
+    try:
+        names = os.listdir("/proc/self/fd")
+    except OSError:
+        return found
+    for name in names:
+        if not name.isdigit():
+            continue
+        fd = int(name)
+        st = _fd_stat(fd)
+        if st is not None:
+            found[fd] = (st.st_dev, st.st_ino)
+    return found
+
+_INHERITED_FDS = _snapshot_inherited_fds()
+
+def _targets_lock(fd, path, path_dev_ino):
+    st = _fd_stat(fd)
+    if st is not None and path_dev_ino is not None and (st.st_dev, st.st_ino) == path_dev_ino:
+        return st
+    try:
+        if os.path.realpath(os.readlink(f"/proc/self/fd/{fd}")) == os.path.realpath(path):
+            return st
+    except OSError:
+        return None
+    return None
+
+def _adopt_inherited_lock(path):
+    """Use an inherited fd on the lock file if that description already holds it."""
+    try:
+        st = os.stat(path)
+        path_dev_ino = (st.st_dev, st.st_ino)
+    except OSError:
+        path_dev_ino = None
+    try:
+        names = os.listdir("/proc/self/fd")
+    except OSError:
+        return None
+    for name in names:
+        if not name.isdigit():
+            continue
+        fd = int(name)
+        ident = _INHERITED_FDS.get(fd)
+        if ident is None:
+            continue
+        st = _targets_lock(fd, path, path_dev_ino)
+        if st is None or (st.st_dev, st.st_ino) != ident:
+            continue
+        try:
+            # Succeeds when this open file description already holds LOCK_EX.
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            continue
+        return _LockHandle(fd, owned=False)
+    return None
+
+def _acquire_lock(timeout):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+    except Exception:
+        return None
+    path = f"{CACHE_DIR}/.lock"
+    inherited = _adopt_inherited_lock(path)
+    if inherited is not None:
+        return inherited
+    try:
+        fh = open(path, "a+")
+    except Exception:
+        return None
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return _LockHandle(fh, owned=True)
+        except OSError:
+            if time.monotonic() >= deadline:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                return None
+            time.sleep(0.05)
+
+def _release_lock(held):
+    if held is None or not held.owned:
+        return
+    fh = held.fh
+    try:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+def _read_jobs(jobs):
+    lines = []
+    for fn in jobs:
+        try:
+            lines += fn() or []
+        except Exception as e:
+            lines.append(f"{fn.__name__:8} | error {e.__class__.__name__}")
+    return lines
+
+def _store_merged(base, lines, seats, now, stamp_now):
+    """Merge seat reads into base, write the cache, and stamp mtime to ts."""
+    global SUMMARY
+    fresh = dict(SUMMARY)
+    fresh["as_of"] = dict(SUMMARY.get("as_of") or {})
+    fresh["lines"] = lines
+    fresh["ts"] = now
+    merged = merge_summary(base, fresh, seats, now=now)
+    if stamp_now:
+        merged["ts"] = now
+    SUMMARY = merged
+    write_cache()
+    try:
+        os.utime(CACHE, (merged["ts"], merged["ts"]))
+    except Exception:
+        pass
+    return merged
+
+def refresh(seats):
+    """Reread the named seats under the status-line lock and merge them into the cache.
+
+    Seats are claude, chatgpt (codex), cursor (also grokbot), grok. Waits up to 30s
+    for ~/.cache/seat-usage/.lock; on timeout returns the cache unchanged.
+    """
+    global SUMMARY
+    wanted = set(seats)
+    lock = _acquire_lock(LOCK_TIMEOUT)
+    base = _load_cache()
+    if lock is None:
+        return base
+    try:
+        SUMMARY = {"ts": time.time(), "as_of": {}, "v": 1}
+        jobs, merge_seats = [], []
+        if "claude" in wanted:
+            jobs.append(claude)
+            merge_seats.append("claude")
+        if "chatgpt" in wanted or "codex" in wanted:
+            jobs.append(codex)
+            merge_seats.append("chatgpt")
+        if "cursor" in wanted or "grokbot" in wanted:
+            jobs.append(cursor)
+            merge_seats.extend(("cursor", "grokbot"))
+        if "grok" in wanted:
+            jobs.append(grok)
+            merge_seats.append("grok")
+        lines = _read_jobs(jobs)
+        return _store_merged(base, lines, merge_seats, time.time(), stamp_now=False)
+    finally:
+        _release_lock(lock)
+
+# Vendor is the model provider, not the seat that is billed (Ryan, 2026-10-08).
+FAMILY_VENDOR = {
+    "grok": "xai",
+    "opus": "anthropic",
+    "fable": "anthropic",
+    "astra": "openai",
+    "sol": "openai",
+}
+_VENDOR_NAME = {"xai": "xAI", "anthropic": "Anthropic", "openai": "OpenAI"}
+_FAMILY_NAME = {"fable": "Fable", "astra": "Astra", "grok": "Grok", "opus": "Opus"}
+
+# Voter effort follows the same burn rule as chair and builder. Grok is on the
+# roster and is excluded when its vendor chairs or builds, and is not seated
+# on a pool that is over pace.
+VOTER_ROSTER = (
+    {"family": "fable", "seat": "claude", "pools": ("fable", "claude_week", "claude_5h")},
+    {"family": "astra", "seat": "chatgpt", "pools": ("codex",)},
+    {"family": "grok", "seat": "grok", "pools": ("grok",)},
+)
+# lineup and host are not in ROLES: `--route` with no role stays the four
+# launch roles the hook already prints.
+LINEUP_SEATS = ("cursor", "claude", "chatgpt", "grok")
+HOST_SEATS = ("grokbot", "claude")
+
+
+def _with_vendor(row):
+    out = dict(row)
+    out["vendor"] = FAMILY_VENDOR.get(out.get("family"))
+    return out
+
+
+def _voter_state(spec, states):
+    seen = [states[pool][0] for pool in spec["pools"]]
+    if "unknown" in seen:
+        return "unknown"
+    if "capped" in seen:
+        return "capped"
+    return "open"
+
+
+def _join_open(a, b):
+    """unknown if either reading is unknown, capped if either is capped, else the first state."""
+    if a == "unknown" or b == "unknown":
+        return "unknown"
+    if a == "capped" or b == "capped":
+        return "capped"
+    return a
+
+
+def _usage_snapshot(states, s):
+    out = {}
+    for pid, meta in POOLS.items():
+        out[pid] = {"state": states[pid][0], "used_pct": s.get(meta["used"])}
+    return out
+
+
+def _stalest_age(pool_ids, s, now):
+    ages = [age for pid in pool_ids if (age := _reading_age(pid, s, now)) is not None]
+    if not ages:
+        return None
+    return max(ages)
+
+
+def _party(row):
+    return {"role": row.get("role"), "seat": row.get("seat"), "family": row.get("family"),
+            "vendor": row.get("vendor"), "effort": row.get("effort"), "variant": row.get("variant", "-")}
+
+
+def _rule_text(chair, builder, voters):
+    names = " and ".join(_FAMILY_NAME.get(v["family"], v["family"]) for v in voters)
+    chair_name = _VENDOR_NAME.get(chair["vendor"], chair["vendor"])
+    builder_name = _VENDOR_NAME.get(builder["vendor"], builder["vendor"])
+    if chair["vendor"] == builder["vendor"]:
+        return f"{chair_name} chairs and builds: {names} vote"
+    return f"{chair_name} chairs and {builder_name} builds: {names} vote"
+
+
+def _snapshot_age(s, now):
+    """Age of the oldest pool the usage object includes. None when none are stamped."""
+    return _stalest_age(tuple(POOLS), s, now)
+
+
+def _lineup_ask(s, now, states, reason, alternatives):
+    age = _snapshot_age(s, now)
+    return {"role": "lineup", "mode": "ask", "reason": reason, "rule": reason, "lineup": None,
+            "legal_candidates": [], "alternatives": alternatives,
+            "reading_age_s": age, "usage": _usage_snapshot(states, s), "usage_age_s": age}
+
+
+def _unknown_text(label, why):
+    """An aged reading says it is old. A missing stamp or used% is a failed reading."""
+    why = why or "unknown"
+    if why.startswith("reading ") and why.endswith(" old"):
+        return f"{label} {why}: {_ASK}"
+    return f"{label} reading unknown: {_FIX_ASK}"
+
+
+def _reopen(ts, now):
+    """When a window reopens, from the caller's clock. No new threshold."""
+    if not _is_number(ts) or ts <= now:
+        return "reset already passed"
+    d = ts - now
+    if d < 86400:
+        return f"resets in {d / 3600:.1f}h"
+    return f"resets in {d / 86400:.1f}d"
+
+
+def _serving(family):
+    return [pid for pid, meta in POOLS.items() if family in meta.get("serves", ())]
+
+
+def _effort_for(pool_id, s, now, states, default="high"):
+    """High, xhigh on an existing burn, low when the pool is ahead of pace.
+
+    near_cap still has a pace (the band only outranks pace in the bounded-question
+    rules). Builder and chair pass their own default.
+    """
+    if _pool_burning(pool_id, s, now):
+        return "xhigh", "burn"
+    state = states[pool_id][0]
+    if state == "near_cap":
+        meta = POOLS[pool_id]
+        state = pace_code(s.get(meta["used"]), s.get(meta["reset"]), _window(meta, s), now) or state
+    if state == "ahead":
+        return "low", "suggest"
+    return default, "default"
+
+
+def _spend_first(band, s, now):
+    """Burning pools first (soonest reset), then a pool with nothing unique to keep."""
+    def key(pid):
+        reset = s.get(POOLS[pid]["reset"])
+        reset = reset if _is_number(reset) else 0
+        unique = 1 if POOLS[pid].get("only") else 0
+        if _pool_burning(pid, s, now):
+            return (0, reset, unique)
+        return (1, unique, 0)
+    return sorted(band, key=key)[0]
+
+
+def _grok_pools(states):
+    """'pool' plus a pool id, 'ask' plus unknown ids, 'over', or 'capped'.
+
+    A pool that is under or on pace wins over an unknown sibling. Opus is reached
+    only when every Grok pool is known and over pace, or every one is capped.
+    One ahead pool with a capped sibling stays on that ahead pool: both are not
+    over pace, so Opus does not take over.
+    """
+    pools = _serving("grok")
+    known, unknown = [], []
+    for pid in pools:
+        state = states[pid][0]
+        if state == "unknown":
+            unknown.append(pid)
+        else:
+            known.append((pid, state))
+    under = [pid for pid, state in known if state == "under"]
+    on = [pid for pid, state in known if state == "on"]
+    ahead = [pid for pid, state in known if state == "ahead"]
+    if under:
+        return "pool", under
+    if on:
+        return "pool", on
+    if ahead and not unknown:
+        if len(known) == len(pools) and all(state == "ahead" for _, state in known):
+            return "over", None
+        return "pool", ahead
+    if unknown:
+        return "ask", unknown
+    return "capped", None
+
+
+def _ask_row(role, s, now, reason):
+    return _row(role, s, now, "ask", reason)
+
+
+def _grok_reason(pid, state, effort, mode):
+    where = "Cursor" if pid == "cursor_models" else "SuperGrok"
+    label = POOLS[pid]["label"]
+    if mode == "burn":
+        return f"Grok on {where}: {label} burn, effort {effort}"
+    if state == "ahead":
+        return f"Grok on {where}: {label} ahead of pace, effort {effort}"
+    if state == "under":
+        return f"Grok on {where}: {label} under pace"
+    if state == "on":
+        return f"Grok on {where}: {label} on pace"
+    return f"Grok on {where}: {label} {state}"
+
+
+def _grok_row(role, pid, s, now, states):
+    effort, mode = _effort_for(pid, s, now, states, default="high")
+    variant = "fast" if POOLS[pid]["seat"] == "cursor" else "-"
+    reason = _grok_reason(pid, states[pid][0], effort, mode)
+    row = _row(role, s, now, mode, reason, seat=POOLS[pid]["seat"], family="grok",
+               effort=effort, variant=variant)
+    row["reading_age_s"] = _reading_age(pid, s, now)
+    return row
+
+
+def _opus_phrase(role, effort):
+    if role == "builder" and effort == "low":
+        return "Opus at low on Max"
+    return f"Opus on Max at {effort}"
+
+
+def _max_unknown_reason(states):
+    labels = (("claude_week", "Max weekly"), ("claude_5h", "Max 5h"))
+    parts, failed = [], False
+    for pid, label in labels:
+        if states[pid][0] != "unknown":
+            continue
+        why = states[pid][1] or "unknown"
+        if why.startswith("reading ") and why.endswith(" old"):
+            parts.append(f"{label} {why}")
+        else:
+            failed = True
+            parts.append(f"{label} reading unknown")
+    body = "; ".join(parts) or "Max reading unknown"
+    return f"{body}: {_FIX_ASK if failed else _ASK}"
+
+
+def _opus_row(role, s, now, states, prefix):
+    """Opus chair at high, Opus builder at low, unless that pool is burning or ahead."""
+    state = _join_open(states["claude_week"][0], states["claude_5h"][0])
+    if state == "unknown":
+        return _ask_row(role, s, now, f"{prefix}: {_max_unknown_reason(states)}")
+    if state == "capped":
+        return _ask_row(role, s, now, f"{prefix} and Max capped: {_ASK}")
+    default = "low" if role == "builder" else "high"
+    effort, mode = _effort_for("claude_week", s, now, states, default=default)
+    if mode == "default":
+        mode = "suggest"
+    reason = f"{prefix}: {_opus_phrase(role, effort)}"
+    row = _row(role, s, now, mode, reason, seat="claude", family="opus", effort=effort, variant="-")
+    row["reading_age_s"] = _reading_age("claude_week", s, now)
+    return row
+
+
+def _xai_worker(role, s, now, states):
+    """A Grok chair or builder, an ask row, or None when xAI has no usable pool."""
+    kind, band = _grok_pools(states)
+    if kind == "pool":
+        return _grok_row(role, _spend_first(band, s, now), s, now, states)
+    if kind == "ask":
+        parts, failed = [], False
+        for pid in band:
+            why = states[pid][1] or "unknown"
+            label = POOLS[pid]["label"]
+            if why.startswith("reading ") and why.endswith(" old"):
+                parts.append(f"{label} {why}")
+            else:
+                failed = True
+                parts.append(f"{label} reading unknown")
+        return _ask_row(role, s, now, f"{'; '.join(parts)}: {_FIX_ASK if failed else _ASK}")
+    return None
+
+
+def _route_worker(role, s, now, states=None):
+    """Chair and builder. Same pools, so the two rows cannot disagree on the Grok seat."""
+    if states is None:
+        states = {pid: pool_status(pid, s, now) for pid in POOLS}
+    got = _xai_worker(role, s, now, states)
+    if got is not None:
+        return got
+    kind, _band = _grok_pools(states)
+    prefix = "both Grok pools over pace" if kind == "over" else "both Grok pools capped"
+    return _opus_row(role, s, now, states, prefix)
+
+
+def _constrained_worker(family, role, s, now, states):
+    """The caller's family, or None when that family's pool is capped.
+
+    An unknown reading is an ask. A family that is not a capable chair or builder
+    is an ask. None means the caller should use the unconstrained route.
+    """
+    if family == "grok":
+        return _xai_worker(role, s, now, states)
+    if family == "opus":
+        state = _join_open(states["claude_week"][0], states["claude_5h"][0])
+        if state == "unknown":
+            return _ask_row(role, s, now, _max_unknown_reason(states))
+        if state == "capped":
+            return None
+        return _opus_row(role, s, now, states, "builder family opus")
+    return _ask_row(role, s, now, f"builder family {family} is not a capable builder: {_ASK}")
+
+
+def _resolve_builder(family, s, now, states):
+    routed = _route_worker("builder", s, now, states)
+    if family is None:
+        return routed
+    if family not in FAMILY_VENDOR:
+        return _ask_row("builder", s, now, f"builder family {family} has no vendor: {_ASK}")
+    matched = _constrained_worker(family, "builder", s, now, states)
+    if matched is not None:
+        return matched
+    return routed
+
+
+def _voter_effort(pool_id, s, now, states):
+    effort, mode = _effort_for(pool_id, s, now, states, default="high")
+    label = POOLS[pool_id]["label"]
+    if mode == "burn":
+        return effort, mode, f"voter effort {effort} ({label} burn)"
+    if effort != "high":
+        return effort, "suggest", f"voter effort {effort} ({label} ahead of pace)"
+    return effort, "default", "voter effort high"
+
+
+def _voter(family, seat, pool_id, s, now, effort, mode, reason):
+    return {"role": "voter", "seat": seat, "family": family, "vendor": FAMILY_VENDOR[family],
+            "effort": effort, "variant": "-", "mode": mode, "reason": reason,
+            "reading_age_s": _reading_age(pool_id, s, now)}
+
+
+def _fable_substitute():
+    for pid in _serving("fable"):
+        if POOLS[pid]["seat"] != "claude":
+            return pid
+    return None
+
+
+def _fable_voter(states, s, now, required):
+    """Fable on Max, or on the pool that also serves Fable when Max cannot.
+
+    required: the strongest lineup needs this voter, so a full 5h window with
+    no other seat asks and names when that window reopens.
+    """
+    watched = ("fable", "claude_week", "claude_5h")
+    if any(states[pid][0] == "unknown" for pid in watched):
+        pid = next(pid for pid in watched if states[pid][0] == "unknown")
+        label = "Fable" if pid == "fable" else POOLS[pid]["label"]
+        return "ask", _unknown_text(label, states[pid][1])
+    if all(states[pid][0] != "capped" for pid in watched):
+        effort, mode, reason = _voter_effort("fable", s, now, states)
+        return "row", _voter("fable", "claude", "fable", s, now, effort, mode, reason)
+    sub = _fable_substitute()
+    if sub and _has_room(sub, states, s):
+        effort, mode, reason = _voter_effort(sub, s, now, states)
+        return "row", _voter("fable", POOLS[sub]["seat"], sub, s, now, effort, mode, reason)
+    if sub and states[sub][0] == "unknown":
+        return "ask", _unknown_text(POOLS[sub]["label"], states[sub][1])
+    if required:
+        if states["claude_5h"][0] == "capped":
+            when = _reopen(s.get("claude_5h_reset_ts"), now)
+            return "ask", f"claude 5h full, Other Models has no room, {when}: {_ASK}"
+        return "ask", f"Fable capped and Other Models has no room: {_ASK}"
+    return "skip", None
+
+
+def _other_voter(family, pool_id, states, s, now, skip_ahead=False):
+    state, why = states[pool_id]
+    if state == "unknown":
+        return "ask", _unknown_text(_FAMILY_NAME.get(family, family), why)
+    if state == "capped" or (skip_ahead and state == "ahead"):
+        return "skip", None
+    effort, mode, reason = _voter_effort(pool_id, s, now, states)
+    seat = POOLS[pool_id]["seat"]
+    return "row", _voter(family, seat, pool_id, s, now, effort, mode, reason)
+
+
+def _lineup_mode(chair, builder, voters, weaker):
+    modes = {chair.get("mode"), builder.get("mode")}
+    modes.update(v.get("mode") for v in voters)
+    if "burn" in modes:
+        return "burn"
+    if weaker or "suggest" in modes:
+        return "suggest"
+    return "default"
+
+
+def _collect_voters(chair, states, s, now):
+    """Voters whose vendor is not the chair's. One voter is a degraded lineup.
+
+    An unknown reading the lineup depends on asks. Fable is required while xAI
+    chairs: a full 5h window with no Other Models room asks and names the reopen.
+    """
+    excluded = {chair["vendor"]}
+    required = chair["vendor"] == "xai"
+    voters = []
+    for spec in VOTER_ROSTER:
+        if FAMILY_VENDOR[spec["family"]] in excluded:
+            continue
+        if spec["family"] == "fable":
+            status, payload = _fable_voter(states, s, now, required)
+        elif spec["family"] == "grok":
+            status, payload = _other_voter("grok", "grok", states, s, now, skip_ahead=True)
+        else:
+            status, payload = _other_voter(spec["family"], spec["pools"][0], states, s, now)
+        if status == "ask":
+            return "ask", payload
+        if status == "row":
+            voters.append(payload)
+    if not voters:
+        return "ask", f"nothing usable left: {_ASK}"
+    return "ok", voters
+
+
+def route_lineup(s, now, builder=None):
+    """One lineup, or ask.
+
+    Chair and builder come from one vendor. Grok while either Grok pool is under
+    or on pace. Opus only when both are over pace, or when both are capped.
+    A builder family the caller already used is kept when that pool can take it,
+    and dropped when the pool is capped. Voter effort follows burn. One voter
+    is a weaker lineup, not an ask.
+    """
+    states = {pid: pool_status(pid, s, now) for pid in POOLS}
+    family = None if builder is None else builder.get("family")
+    builder_row = _resolve_builder(family, s, now, states)
+    if builder_row.get("mode") == "ask":
+        return _lineup_ask(s, now, states, builder_row.get("reason") or _ASK, [])
+    builder_row = _with_vendor(builder_row)
+    if builder_row.get("family") == "opus":
+        prefix = builder_row["reason"].split(":", 1)[0]
+        chair_row = _opus_row("chair", s, now, states, prefix)
+    else:
+        chair_row = _route_worker("chair", s, now, states)
+    if chair_row.get("mode") == "ask":
+        return _lineup_ask(s, now, states, chair_row.get("reason") or _ASK, [])
+    chair_row = _with_vendor(chair_row)
+    if chair_row.get("vendor") != builder_row.get("vendor"):
+        return _lineup_ask(s, now, states, "chair and builder vendors differ: " + _ASK, [])
+
+    status, payload = _collect_voters(chair_row, states, s, now)
+    if status == "ask":
+        return _lineup_ask(s, now, states, payload, [])
+    voters = payload
+    rule = _rule_text(chair_row, builder_row, voters)
+    weaker = None
+    if len(voters) < 2:
+        names = " and ".join(_FAMILY_NAME.get(v["family"], v["family"]) for v in voters)
+        weaker = f"one voter ({names})"
+    elif chair_row.get("family") != "grok":
+        weaker = chair_row.get("reason")
+    elif any(v["family"] == "fable" and v["seat"] != "claude" for v in voters):
+        weaker = "Fable on Other Models"
+    reason = rule if not weaker else f"{rule}; weaker: {weaker}"
+    ages = [chair_row.get("reading_age_s"), builder_row.get("reading_age_s")]
+    ages.extend(v.get("reading_age_s") for v in voters)
+    known = [age for age in ages if isinstance(age, (int, float)) and not isinstance(age, bool)]
+    seated = max(known) if known else None
+    lineup = {"chair": chair_row, "builder": builder_row, "voters": voters}
+    return {"role": "lineup", "mode": _lineup_mode(chair_row, builder_row, voters, weaker),
+            "reason": reason, "rule": rule,
+            "lineup": lineup,
+            "legal_candidates": [{"chair": _party(chair_row), "builder": _party(builder_row),
+                                  "voters": [_party(v) for v in voters], "rule": rule}],
+            "alternatives": [], "reading_age_s": seated,
+            "usage": _usage_snapshot(states, s), "usage_age_s": _snapshot_age(s, now)}
+
+
+def _host_entry(id_, seat, family, effort, state, used, age):
+    return {"id": id_, "seat": seat, "family": family, "effort": effort, "state": state,
+            "available": state not in ("unknown", "capped"), "used_pct": used, "reading_age_s": age}
+
+
+def _host_unknown(label, why):
+    return _unknown_text(label, why)
+
+
+def route_host(s, now):
+    """Suggest where to start a host session. Does not select one.
+
+    Capable order is Grok Bot, then Opus at high on Max. A burning pool is spent
+    first. Both ahead: suggest the Bot and name the over-pace. An aged Bot
+    reading says the reading is old. A missing reading says the read failed.
+    """
+    states = {pid: pool_status(pid, s, now) for pid in POOLS}
+    bot_state, bot_why = states["grokbot"]
+    opus_state = _join_open(states["claude_week"][0], states["claude_5h"][0])
+    opus_effort, opus_mode = _effort_for("claude_week", s, now, states, default="high")
+    bot = _host_entry("grokbot", "grokbot", "grokbot", "-", bot_state, s.get("bot_pct"),
+                      _reading_age("grokbot", s, now))
+    opus = _host_entry("opus", "claude", "opus", opus_effort, opus_state, s.get("claude_week"),
+                       _reading_age("claude_week", s, now))
+
+    def finish(mode, suggestion, reason, top):
+        return {"role": "host", "seat": top["seat"], "family": top["family"], "effort": top["effort"],
+                "variant": "-", "mode": mode, "reason": reason, "reading_age_s": top["reading_age_s"],
+                "suggestion": suggestion, "selects": False, "hosts": [bot, opus]}
+
+    if bot_state == "unknown":
+        return finish("ask", None, _host_unknown("Grok Bot", bot_why), bot)
+    ready = []
+    if bot["available"] and bot_state != "ahead":
+        ready.append(("grokbot", bot, "grokbot"))
+    if opus["available"] and opus_state != "ahead":
+        ready.append(("opus", opus, "claude_week"))
+    if ready:
+        def key(item):
+            _id, _entry, pool = item
+            reset = s.get(POOLS[pool]["reset"])
+            reset = reset if _is_number(reset) else 0
+            order = 0 if _id == "grokbot" else 1
+            if _pool_burning(pool, s, now):
+                return (0, reset, order)
+            return (1, order, 0)
+        _id, top, pool = sorted(ready, key=key)[0]
+        if _id == "grokbot":
+            mode, reason = "suggest", "Grok Bot first, then Opus at high on Max"
+            if _pool_burning(pool, s, now):
+                mode, reason = "burn", "Grok Bot burn, then Opus at high on Max"
+        else:
+            mode = "burn" if opus_mode == "burn" else "suggest"
+            if bot_state == "capped":
+                reason = f"Grok Bot capped: {_opus_phrase('chair', opus_effort)}"
+            elif mode == "burn":
+                reason = f"{_opus_phrase('chair', opus_effort)} ({POOLS['claude_week']['label']} burn)"
+            else:
+                reason = f"Grok Bot ahead of pace: {_opus_phrase('chair', opus_effort)}"
+        return finish(mode, _id, reason, top)
+    if bot_state == "ahead" and opus_state == "ahead":
+        return finish("suggest", "grokbot",
+                      "both host pools over pace: Grok Bot, then Opus at high on Max", bot)
+    if opus["available"]:
+        return finish("suggest", "opus", f"Grok Bot capped: {_opus_phrase('chair', opus_effort)}", opus)
+    if opus_state == "unknown":
+        return finish("ask", None, _max_unknown_reason(states), bot)
+    return finish("ask", None, "Grok Bot and Max capped: " + _ASK, bot)
+
+
+def format_lineup(row):
+    age = row.get("reading_age_s")
+    shown = "unknown" if age is None else f"{int(age // 60)}m"
+    if row.get("mode") == "ask" or not row.get("lineup"):
+        return (f"route: lineup | - | - | - | - | ask | {row.get('reason')} | reading {shown}")
+    lines = [f"route: lineup | {row['mode']} | {row.get('rule')} | reading {shown}"]
+    for key in ("chair", "builder"):
+        party = row["lineup"][key]
+        lines.append(f"  {key}: {party['seat']} | {party['family']} | {party['effort']} | "
+                     f"{party['variant']} | {party['vendor']}")
+    for voter in row["lineup"]["voters"]:
+        lines.append(f"  voter: {voter['seat']} | {voter['family']} | {voter['effort']} | "
+                     f"{voter['variant']} | {voter['vendor']}")
+    return "\n".join(lines)
+
+
+def format_host(row):
+    lines = [format_route(row)]
+    for host in row.get("hosts") or []:
+        flag = "available" if host.get("available") else host.get("state")
+        lines.append(f"  host: {host['seat']} | {host['family']} | {host['effort']} | "
+                     f"{host['state']} | {flag}")
+    return "\n".join(lines)
+
+
+def _opt(argv, name):
+    if name not in argv:
+        return None
+    i = argv.index(name)
+    if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+        print(f"{name} needs a value", file=sys.stderr)
+        raise SystemExit(2)
+    return argv[i + 1]
+
+
+def cmd_route():
+    argv = sys.argv[1:]
+    as_json = "--json" in argv
+    cached = "--cached" in argv
+    # A bare --route, or --route followed by a flag, routes every launch role.
+    # Do not call _opt first: a missing value used to exit 2, and the launch
+    # hook treats that as silence.
+    role = None
+    if "--route" in argv:
+        i = argv.index("--route")
+        if i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+            role = argv[i + 1]
+    if role == "voter":
+        print("voters do not route", file=sys.stderr)
+        raise SystemExit(2)
+    known = list(ROLES) + ["lineup", "host"]
+    if role is not None and role not in known:
+        print(f"unknown role {role}; roles: {', '.join(known)}", file=sys.stderr)
+        raise SystemExit(2)
+    builder = None
+    if role == "lineup" and "--builder-family" in argv:
+        # Family only. Seat and effort are resolved once the summary is loaded.
+        builder = {"role": "builder", "family": _opt(argv, "--builder-family")}
+    if cached:
+        summary = _load_cache()
+    elif role == "lineup":
+        summary = refresh(list(LINEUP_SEATS))
+    elif role == "host":
+        summary = refresh(list(HOST_SEATS))
+    else:
+        chosen = tuple(ROLES) if role is None else (role,)
+        seats = []
+        for name in chosen:
+            for seat in ROLES[name]["seats"]:
+                if seat not in seats:
+                    seats.append(seat)
+        summary = refresh(seats)
+    now = time.time()
+    if role == "lineup":
+        rows = [route_lineup(summary, now, builder=builder)]
+    elif role == "host":
+        rows = [route_host(summary, now)]
+    else:
+        chosen = tuple(ROLES) if role is None else (role,)
+        rows = [route(name, summary, now) for name in chosen]
+    # A cached poll must not append the ask log, the usage history, or the cache.
+    if not cached:
+        log_asks(rows, summary, now)
+    if as_json:
+        json.dump(rows, sys.stdout)
+        sys.stdout.write("\n")
+    else:
+        for row in rows:
+            if row.get("role") == "lineup":
+                print(format_lineup(row))
+            elif row.get("role") == "host":
+                print(format_host(row))
+            else:
+                print(format_route(row))
+
+def log_asks(rows, s, now):
+    """Append one line per row the router could not settle. Write failures are silent."""
+    asked = [r for r in rows if r["mode"] == "ask" or r["reason"].endswith("no rule")]
+    if not asked:
+        return
+    pools = {pid: [pool_status(pid, s, now)[0], s.get(meta["used"])] for pid, meta in POOLS.items()}
+    try:
+        os.makedirs(os.path.dirname(ASKS), exist_ok=True)
+        with open(ASKS, "a") as f:
+            for r in asked:
+                f.write(json.dumps({"ts": now, "host": socket.gethostname(), "row": r, "pools": pools}) + "\n")
+    except Exception:
+        pass
+
+def write_cache():
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = CACHE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(SUMMARY, f)
+        os.replace(tmp, CACHE)
+    except Exception:
+        pass
+
+def print_cached():
+    """--cached: print the last run's lines from the cache, no network. For the
+    synchronous SessionStart hook; the async hook refreshes the cache."""
+    try:
+        d = json.load(open(CACHE))
+        age_m = round((NOW - d["ts"]) / 60)
+        print(f"[seat-usage] cached {age_m}m ago; run ~/.local/bin/seat-usage for live numbers")
+        for l in d["lines"]:
+            seat = l.split("|")[0].strip()
+            l = re.sub(r" \| stale \(reading [\d.]+h old\)$", "", l)   # recomputed below at the current age
+            age = seat_age_s(d, seat, NOW)
+            tag = " | no reading" if age is None else stale_tag(NOW - age)
+            print("  " + l + tag)
+        # Recomputed against the current time, so a reset that already passed drops its line.
+        for e in burn_entries(d, NOW): print("  " + burn_line(e))
+    except Exception as e:
+        print(f"[seat-usage] no cached line ({e.__class__.__name__}); run ~/.local/bin/seat-usage")
+
+def _print_full(lines, burn):
+    print("[seat-usage] " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ"))
+    for l in lines:
+        print("  " + l)
+    for e in burn:
+        print("  " + burn_line(e))
+
+def full_run(quiet=False, timeout=LOCK_TIMEOUT):
+    """Reread every seat, merge into the cache, and stamp ts to this run.
+
+    Takes the same lock as refresh. A failed seat keeps its last numbers and
+    loses as_of. A usage 429 with Retry-After keeps that seat's as_of and
+    does not call again until the deadline. On lock timeout the cache is not
+    written; the lines are still printed when not quiet. An inherited lock
+    fd is not unlocked.
+    """
+    global SUMMARY
+    now = time.time()
+    lock = _acquire_lock(timeout)
+    if lock is None:
+        SUMMARY = {"ts": now, "as_of": {}, "v": 1}
+        lines = _read_jobs((claude, codex, cursor, grok))
+        SUMMARY["lines"] = lines
+        SUMMARY["burn"] = burn_entries(SUMMARY, now)
+        if not quiet:
+            _print_full(lines, SUMMARY["burn"])
+        return SUMMARY
+    try:
+        base = _load_cache()
+        SUMMARY = {"ts": now, "as_of": {}, "v": 1}
+        lines = _read_jobs((claude, codex, cursor, grok))
+        merged = _store_merged(base, lines, LINE_SEATS, now, stamp_now=True)
+    finally:
+        _release_lock(lock)
+    if not quiet:
+        _print_full(merged["lines"], merged["burn"])
+    return merged
+
+def main():
+    if "--route" in sys.argv:
+        return cmd_route()
+    if "--cached" in sys.argv:
+        if os.environ.get("COUNCIL_VOTER") == "1":
+            return
+        return print_cached()
+    full_run(quiet="--quiet" in sys.argv)
+
+if __name__ == "__main__":
+    main()

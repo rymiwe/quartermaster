@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""Claude Code PreToolUse hook. Prints a seat route for the tool about to run.
+
+Always exits 0. Prints nothing for COUNCIL_VOTER=1, for commands that are not
+a routed CLI, and for any failure of seat-usage.
+
+Denies an Agent launch that would build code on Claude while the builder route
+names another seat, unless the prompt has a 'route-override: <reason>' line.
+"""
+import json, os, re, shlex, subprocess, sys
+
+_CONTROLS = {";", "&&", "||", "|", "&"}
+
+
+def _scan_single(s, i):
+    i += 1
+    n = len(s)
+    while i < n and s[i] != "'":
+        i += 1
+    return i + 1 if i < n else None
+
+
+def _scan_double(s, i):
+    i += 1
+    n = len(s)
+    while i < n:
+        if s[i] == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if s[i] == '"':
+            return i + 1
+        i += 1
+    return None
+
+
+def _scan_paren(s, i):
+    """i points at the '(' of a $(...). Return the index after the match."""
+    depth = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            i = _scan_single(s, i)
+            if i is None:
+                return None
+            continue
+        if c == '"':
+            i = _scan_double(s, i)
+            if i is None:
+                return None
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _scan_assign_value(s, i):
+    """A value is quotes, $(...), and other non-space runs, concatenated."""
+    n = len(s)
+    while i < n and not s[i].isspace():
+        if s[i] == "'":
+            i = _scan_single(s, i)
+        elif s[i] == '"':
+            i = _scan_double(s, i)
+        elif s.startswith("$(", i):
+            i = _scan_paren(s, i + 1)
+        else:
+            i += 1
+            continue
+        if i is None:
+            return None
+    return i
+
+
+def _strip_assignments(s):
+    """Leading VAR=value prefixes. A value may contain $(...) with balanced parens."""
+    while True:
+        m = re.match(r"[A-Za-z_][A-Za-z0-9_]*=", s)
+        if not m:
+            return s
+        end = _scan_assign_value(s, m.end())
+        if end is None or end >= len(s) or not s[end].isspace():
+            return s
+        s = s[end:].lstrip()
+
+
+def _mark_controls(s):
+    """Turn unquoted control operators into their own tokens. Leave redirects and
+    backslash-newline continuations for shlex."""
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            out.append(s[i:i + 2])
+            i += 2
+            continue
+        if c == "'":
+            j = _scan_single(s, i)
+            if j is None:
+                out.append(s[i:])
+                break
+            out.append(s[i:j])
+            i = j
+            continue
+        if c == '"':
+            j = _scan_double(s, i)
+            if j is None:
+                out.append(s[i:])
+                break
+            out.append(s[i:j])
+            i = j
+            continue
+        if c == "\n":
+            out.append(" ; ")
+            i += 1
+            continue
+        if s.startswith("&&", i) or s.startswith("||", i):
+            out.append(" " + s[i:i + 2] + " ")
+            i += 2
+            continue
+        if c in ";|":
+            out.append(" " + c + " ")
+            i += 1
+            continue
+        if c == "&":
+            prev = s[i - 1] if i else ""
+            nxt = s[i + 1] if i + 1 < n else ""
+            if prev in "<>" or nxt == ">":
+                out.append("&")
+            else:
+                out.append(" & ")
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _command_tokens(command):
+    s = _strip_assignments(command.lstrip())
+    try:
+        raw = shlex.split(_mark_controls(s), posix=True)
+    except ValueError:
+        raw = s.split()
+    out = []
+    for tok in raw:
+        if tok == "\n":
+            continue
+        if tok in _CONTROLS:
+            break
+        out.append(tok)
+    return out
+
+
+def _model_arg(args):
+    for i, tok in enumerate(args):
+        if tok == "--model" and i + 1 < len(args):
+            return args[i + 1]
+        if tok.startswith("--model="):
+            return tok[len("--model="):]
+    return None
+
+
+def command_role(command):
+    """Map a shell command to a route role, or None when it does not route.
+
+    Strips leading assignments, then reads flags from the first simple command.
+    """
+    if not isinstance(command, str):
+        return None
+    tokens = _command_tokens(command)
+    if not tokens:
+        return None
+    base = os.path.basename(tokens[0])
+    args = tokens[1:]
+    if base == "codex":
+        if args[:1] == ["exec"]:
+            return "hard-bug"
+        return None
+    if base == "cursor-agent":
+        return "builder"
+    if base == "claude":
+        if not any(t in ("-p", "--print") for t in args):
+            return None
+        if _model_arg(args) == "fable":
+            return "bounded-question"
+        return "builder"
+    if base == "grok" and any(
+        t == "-p" or t == "--prompt-file" or t.startswith("--prompt-file=") for t in args
+    ):
+        return "chair"
+    return None
+
+
+# Agent launches that only read, or that already route to another vendor.
+_READ_ONLY_AGENTS = {"Explore", "Plan", "claude-code-guide", "statusline-setup",
+                     "hookify:conversation-analyzer", "obie-dx-reviewer"}
+_OTHER_VENDOR_PREFIXES = ("grok-build:", "cursor:")
+_BUILD_WORDS = re.compile(r"\b(implement|commit|open (a )?(pr|pull request)|git push)\b", re.I)
+_OVERRIDE = re.compile(r"(?m)^route-override:\s*\S")
+
+
+def agent_deny_reason(tool_input, rows):
+    """A deny reason when a Claude subagent would build code that the builder
+    route sends to another seat, else None. Fails open."""
+    if not isinstance(tool_input, dict):
+        return None
+    kind = tool_input.get("subagent_type") or "general-purpose"
+    if kind in _READ_ONLY_AGENTS or kind.startswith(_OTHER_VENDOR_PREFIXES):
+        return None
+    prompt = tool_input.get("prompt")
+    if not isinstance(prompt, str) or not _BUILD_WORDS.search(prompt) or _OVERRIDE.search(prompt):
+        return None
+    builder = next((r for r in rows if isinstance(r, dict) and r.get("role") == "builder"), None)
+    if builder is None or builder.get("seat") == "claude":
+        return None
+    return (f"Builder route is {builder.get('family')} on {builder.get('seat')} "
+            f"(effort {builder.get('effort')}, variant {builder.get('variant')}): {builder.get('reason')}. "
+            "Run the build through that seat's CLI, or add a line 'route-override: <reason>' "
+            "to the prompt if a Claude builder is deliberate.")
+
+
+def format_route(row):
+    age = row.get("reading_age_s")
+    shown = "unknown" if age is None else f"{int(age // 60)}m"
+    return (f"route: {row['role']} | {row['seat']} | {row['family']} | {row['effort']} | "
+            f"{row['variant']} | {row['mode']} | {row['reason']} | reading {shown}")
+
+
+def _emit(data):
+    if os.environ.get("COUNCIL_VOTER") == "1":
+        return
+    tool = data.get("tool_name")
+    role = None
+    if tool == "Agent":
+        role = ""
+    elif tool == "Bash":
+        tool_input = data.get("tool_input")
+        command = tool_input.get("command") if isinstance(tool_input, dict) else None
+        role = command_role(command)
+        if role is None:
+            return
+    else:
+        return
+    cmd = [os.path.expanduser("~/.local/bin/seat-usage"), "--route"]
+    if role:
+        cmd.append(role)
+    cmd.append("--json")
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return
+    rows = json.loads(proc.stdout)
+    if not isinstance(rows, list) or not rows:
+        return
+    text = "\n".join(format_route(r) for r in rows)
+    out = {"hookEventName": "PreToolUse", "additionalContext": text}
+    if tool == "Agent":
+        reason = agent_deny_reason(data.get("tool_input"), rows)
+        if reason:
+            out.update(permissionDecision="deny", permissionDecisionReason=reason)
+    json.dump({"hookSpecificOutput": out}, sys.stdout)
+    sys.stdout.write("\n")
+
+
+def main():
+    try:
+        if os.environ.get("COUNCIL_VOTER") == "1":
+            return
+        _emit(json.load(sys.stdin))
+    except BaseException:
+        return
+
+
+if __name__ == "__main__":
+    main()
