@@ -626,6 +626,7 @@ def f11_missing_as_of_prints_no_reading():
             }, f)
         env = os.environ.copy()
         env.pop("COUNCIL_VOTER", None)
+        env["QUARTERMASTER_NO_UPDATE"] = "1"
         env["SEAT_USAGE_CACHE_DIR"] = d
         proc = subprocess.run([sys.executable, str(BIN), "--cached"], capture_output=True, text=True, env=env, timeout=15)
     assert proc.returncode == 0, (proc.returncode, proc.stderr)
@@ -1831,6 +1832,7 @@ def _run_bin(home, cache_dir, args):
         "TZ": "UTC",
         "SEAT_USAGE_CACHE_DIR": str(cache_dir),
         "SEAT_USAGE_ASKS": str(Path(cache_dir) / "asks.jsonl"),
+        "QUARTERMASTER_NO_UPDATE": "1",
     }
     return subprocess.run(
         [sys.executable, str(BIN), *args],
