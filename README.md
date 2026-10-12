@@ -50,6 +50,29 @@ Offline; uses loopback servers and a fake temp credentials file:
 
 At snapshot time this printed `69 passed, 0 failed`. The only change from the dotfiles test is the two path constants (`BIN`, `HOOK`) pointing at `bin/seat-usage` and `hooks/seat-route-hook`. `SEAT_USAGE_BIN` still overrides `BIN`.
 
+`tests/test_contract.py` is a second suite. It calls the CLI and the hook the way a user does. It covers quiet hook failure, the installed paths, cached route output, and renewals. Run it with the same empty environment:
+
+    env -i PATH=/usr/bin:/bin HOME=/tmp/emptyhome PYTHONDONTWRITEBYTECODE=1 python3 tests/test_contract.py
+
+`SEAT_USAGE_BIN` selects the CLI and `SEAT_ROUTE_HOOK` selects the hook. When those variables are unset, both point at the files in this repo. The tests are:
+
+- `hook_prints_route_and_stays_quiet_when_seat_usage_is_missing`
+- `hook_prints_route_and_stays_quiet_when_seat_usage_exits_nonzero`
+- `hook_prints_route_and_stays_quiet_when_seat_usage_prints_junk`
+- `hook_prints_route_and_stays_quiet_when_seat_usage_times_out`
+- `hook_prints_route_and_stays_silent_for_council_voter`
+- `default_home_receives_cache_asks_history_and_renewals`
+- `env_overrides_redirect_cache_asks_and_renewals`
+- `cached_lineup_json_names_the_xai_pair`
+- `cached_host_json_suggests_grokbot_and_does_not_select`
+- `bare_cached_route_prints_the_four_launch_lines`
+- `cached_route_json_rows_have_the_hook_keys`
+- `cached_is_silent_for_council_voter_and_prints_the_seed`
+- `unknown_role_exits_2_with_the_role_list`
+- `voter_route_exits_2`
+- `example_renewals_schema_sets_the_term_and_a_placeholder_date_does_not`
+- `missing_renewals_file_still_prints_the_route`
+
 ## Not in this repo
 
 The status lines (`statusline.py`, `statusline.sh`), `grok-bot-machines`, `grok-engine`, `settings.json` and council handoffs/docs remain in dotfiles or council.
