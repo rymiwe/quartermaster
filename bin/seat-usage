@@ -849,6 +849,10 @@ def pool_status(pool_id, s, now):
     code = pace_code(used, reset, _window(meta, s), now)
     if not code:
         return "unknown", "no used %"
+    if pool_id == "codex":
+        five, five_at = s.get("codex_5h"), s.get("codex_5h_reset_ts")
+        if _is_number(five) and five >= 100 and _is_number(five_at) and five_at > now:
+            return "capped", _reopen(five_at, now)
     return code, None
 
 def _pool_burning(pool_id, s, now):
@@ -914,6 +918,10 @@ def _apply_rule(role, rule, s, now, states):
              for p in rule.get("note_unknown") or () if states[p][0] == "unknown"]
     if notes and reason is not None:
         reason = reason + "; " + "; ".join(notes)
+    session = states.get("codex", (None, None))[1]
+    names_codex_cap = any(pool == "codex" and expected == "capped" for pool, expected in rule["when"])
+    if names_codex_cap and isinstance(session, str) and session.startswith("resets ") and reason:
+        reason = f"{reason}, {session}"
     return _row(role, s, now, rule["mode"], reason or "", **over)
 
 def route(role, s, now):
