@@ -300,6 +300,7 @@ BARE_ROUTE = (
 CACHED_LINE = (
     "[seat-usage] cached 0m ago; run ~/.local/bin/seat-usage for live numbers\n"
     "  claude   | max active\n"
+    "  muse     | no data yet\n"
 )
 HOOK_ROW_KEYS = {"role", "seat", "family", "effort", "variant", "mode", "reason", "reading_age_s"}
 LAUNCH_ROWS = (
