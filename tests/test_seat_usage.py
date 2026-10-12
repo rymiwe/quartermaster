@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -1637,6 +1638,298 @@ def hard_bug_without_a_5h_window_matches_the_weekly_route():
     proc = _cached_hard_bug(time.time(), codex=5)
     assert proc.returncode == 0 and proc.stderr == "", (proc.returncode, proc.stderr, proc.stdout)
     assert proc.stdout == UNDER_HARD_BUG, proc.stdout
+
+
+MUSE_FIXTURES = HERE / "fixtures" / "muse-usage"
+FRESH_MUSE_UTC = (
+    "muse     | Current 42% (resets 2099-01-01 00:00 UTC)"
+    " | Weekly 18.5% (resets 2099-01-08 00:00 UTC)"
+    " | as of 2026-10-12 15:04 UTC"
+)
+FRESH_MUSE_LA = (
+    "muse     | Current 42% (resets 2098-12-31 16:00 PST)"
+    " | Weekly 18.5% (resets 2099-01-07 16:00 PST)"
+    " | as of 2026-10-12 08:04 PDT"
+)
+STALE_MUSE_UTC = (
+    "muse     | Current 90% (resets 2020-01-01 05:00 UTC)"
+    " | Weekly 10% (resets 2099-01-08 00:00 UTC)"
+    " | as of 2020-01-01 00:00 UTC | stale (window reset)"
+)
+NO_MUSE = "muse     | no data yet"
+
+
+@contextlib.contextmanager
+def local_tz(name):
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+
+
+def load_muse_fixture(name):
+    return json.loads((MUSE_FIXTURES / name).read_text())
+
+
+def _string_consts(fn):
+    found = []
+    stack = [fn.__code__]
+    seen = set()
+    while stack:
+        code = stack.pop()
+        if id(code) in seen:
+            continue
+        seen.add(id(code))
+        for const in code.co_consts:
+            if isinstance(const, str):
+                found.append(const)
+            elif hasattr(const, "co_consts"):
+                stack.append(const)
+    return found
+
+
+@test
+def muse_fixture_prints_current_and_weekly_in_local_time():
+    data = load_muse_fixture("fresh.json")
+    with local_tz("UTC"):
+        assert su.format_muse_line(data, NOW) == FRESH_MUSE_UTC
+    with local_tz("America/Los_Angeles"):
+        assert su.format_muse_line(data, NOW) == FRESH_MUSE_LA
+    # An offset in the file is converted. The line does not echo the source zone.
+    shifted = dict(data, captured_at="2026-10-12T08:04:00-07:00")
+    with local_tz("UTC"):
+        line = su.format_muse_line(shifted, NOW)
+    assert "as of 2026-10-12 15:04 UTC" in line, line
+    assert "-07:00" not in line, line
+    assert "300" not in line, line
+    assert len(line.split("|", 1)[0]) == len("grok     "), line
+
+
+@test
+def muse_fixture_marks_stale_when_the_window_reset_has_passed():
+    data = load_muse_fixture("stale-window.json")
+    reset = datetime.fromisoformat("2020-01-01T05:00:00+00:00").timestamp()
+    with local_tz("UTC"):
+        before = su.format_muse_line(data, reset - 1)
+        at_reset = su.format_muse_line(data, reset)
+        later = su.format_muse_line(data, NOW)
+    assert before == STALE_MUSE_UTC.replace(" | stale (window reset)", ""), before
+    assert at_reset == STALE_MUSE_UTC, at_reset
+    assert later == STALE_MUSE_UTC, later
+    # The weekly reset is still in the future. Stale is the window that ended since capture.
+    assert "2099-01-08" in later, later
+
+
+@test
+def muse_weekly_reset_alone_does_not_mark_the_line_stale():
+    data = load_muse_fixture("weekly-reset-passed.json")
+    with local_tz("UTC"):
+        line = su.format_muse_line(data, NOW)
+    assert line == (
+        "muse     | Current 12% (resets 2099-06-01 00:00 UTC)"
+        " | Weekly 80% (resets 2020-01-01 00:00 UTC)"
+        " | as of 2026-10-12 15:04 UTC"
+    ), line
+    assert "stale" not in line, line
+
+
+@test
+def muse_missing_or_broken_fixture_says_no_data_yet():
+    missing = MUSE_FIXTURES / "no-such.json"
+    assert su.muse_line(now=NOW, path=str(missing)) == NO_MUSE
+    assert su.muse_line(now=NOW, path=str(MUSE_FIXTURES / "broken.json")) == NO_MUSE
+    assert su.muse_line(now=NOW, path=str(MUSE_FIXTURES / "missing-fields.json")) == NO_MUSE
+    assert su.format_muse_line(None, NOW) is None
+    assert su.format_muse_line([], NOW) is None
+    assert su.format_muse_line({"captured_at": "2026-10-12T15:04:00Z"}, NOW) is None
+    bad = load_muse_fixture("fresh.json")
+    bad["window"] = dict(bad["window"], used_percent="42")
+    assert su.format_muse_line(bad, NOW) is None
+    bad = load_muse_fixture("fresh.json")
+    bad["window"] = dict(bad["window"], window_duration_mins=-5)
+    assert su.format_muse_line(bad, NOW) is None
+    bad = load_muse_fixture("fresh.json")
+    bad["window"] = dict(bad["window"], used_percent=True)
+    assert su.format_muse_line(bad, NOW) is None
+    bad = load_muse_fixture("fresh.json")
+    bad["captured_at"] = "yesterday"
+    assert su.format_muse_line(bad, NOW) is None
+    # A named model in the file is not copied onto the line.
+    named = load_muse_fixture("fresh.json")
+    named["model"] = "muse-spark-1.3"
+    with local_tz("UTC"):
+        line = su.format_muse_line(named, NOW)
+    assert line == FRESH_MUSE_UTC, line
+    assert "spark" not in line, line
+
+
+@test
+def muse_is_not_a_routing_input():
+    for name in (
+        "POOLS", "SEAT_KEYS", "ROLES", "ROUTE_RULES", "FAMILY_VENDOR", "_FAMILY_NAME",
+        "VOTER_ROSTER", "LINE_SEATS", "LINEUP_SEATS", "HOST_SEATS", "BURN_POOLS", "RENEWAL_KEYS",
+    ):
+        blob = repr(getattr(su, name)).lower()
+        assert "muse" not in blob, name
+    for name in ("route", "_route_worker", "_apply_rule", "route_lineup", "route_host", "cmd_route", "pool_status"):
+        consts = " ".join(_string_consts(getattr(su, name))).lower()
+        assert "muse" not in consts, name
+    extra = snap(muse=40, model="muse-spark-1.3")
+    for role in ("bounded-question", "hard-bug", "builder", "chair"):
+        assert su.route(role, snap(), NOW) == su.route(role, extra, NOW), role
+    assert su.route_lineup(snap(), NOW) == su.route_lineup(extra, NOW)
+    assert su.route_host(snap(), NOW) == su.route_host(extra, NOW)
+    before = json.dumps(su.SUMMARY, sort_keys=True, default=str)
+    with local_tz("UTC"):
+        assert su.muse_line(now=NOW, path=str(MUSE_FIXTURES / "fresh.json")) == FRESH_MUSE_UTC
+    assert json.dumps(su.SUMMARY, sort_keys=True, default=str) == before
+
+
+def _seed_route_cache(path, now):
+    path.write_text(json.dumps({
+        "v": 1,
+        "ts": now,
+        "as_of": {seat: now for seat in ("claude", "chatgpt", "cursor", "grokbot", "grok")},
+        "claude_5h": 10,
+        "claude_5h_reset_ts": now + 4 * 3600,
+        "claude_week": 10,
+        "claude_week_reset_ts": now + 3 * 86400,
+        "fable": 10,
+        "fable_reset_ts": now + 3 * 86400,
+        "codex": 10,
+        "codex_reset_ts": now + 3 * 86400,
+        "codex_window_s": WEEK,
+        "cursor_auto_pct": 15,
+        "cursor_api_pct": 10,
+        "cursor_pct": 15,
+        "cursor_reset_ts": now + 15 * 86400,
+        "cursor_window_s": MONTH,
+        "grok_pct": 10,
+        "grok_reset_ts": now + 3 * 86400,
+        "grok_window_s": WEEK,
+        "grok_exhausted": False,
+        "bot_pct": 10,
+        "bot_reset_ts": now + 3 * 86400,
+        "bot_window_s": WEEK,
+        "lines": ["claude   | max active"],
+        "burn": [],
+    }))
+
+
+def _run_bin(home, cache_dir, args):
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(home),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "TZ": "UTC",
+        "SEAT_USAGE_CACHE_DIR": str(cache_dir),
+        "SEAT_USAGE_ASKS": str(Path(cache_dir) / "asks.jsonl"),
+    }
+    return subprocess.run(
+        [sys.executable, str(BIN), *args],
+        capture_output=True, text=True, env=env, timeout=20,
+    )
+
+
+@test
+def cached_cli_reads_muse_usage_json_and_route_ignores_it():
+    with tempfile.TemporaryDirectory() as home:
+        home = Path(home)
+        cache_dir = home / "seat-cache"
+        cache_dir.mkdir()
+        _seed_route_cache(cache_dir / "latest.json", time.time())
+        dest = home / ".cache" / "quartermaster" / "muse-usage.json"
+        dest.parent.mkdir(parents=True)
+        dest.write_text((MUSE_FIXTURES / "fresh.json").read_text())
+        shown = _run_bin(home, cache_dir, ["--cached"])
+        assert shown.returncode == 0 and shown.stderr == "", (shown.returncode, shown.stderr, shown.stdout)
+        assert f"  {FRESH_MUSE_UTC}\n" in shown.stdout, shown.stdout
+        assert "claude   | max active" in shown.stdout, shown.stdout
+        routed = _run_bin(home, cache_dir, ["--route", "--cached"])
+        assert routed.returncode == 0 and routed.stderr == "", (routed.returncode, routed.stderr, routed.stdout)
+        assert "muse" not in routed.stdout.lower(), routed.stdout
+        assert "route: builder | cursor | grok |" in routed.stdout, routed.stdout
+        dest.write_text((MUSE_FIXTURES / "stale-window.json").read_text())
+        stale = _run_bin(home, cache_dir, ["--cached"])
+        assert f"  {STALE_MUSE_UTC}\n" in stale.stdout, stale.stdout
+        dest.write_text((MUSE_FIXTURES / "broken.json").read_text())
+        broken = _run_bin(home, cache_dir, ["--cached"])
+        assert f"  {NO_MUSE}\n" in broken.stdout, broken.stdout
+        dest.unlink()
+        absent = _run_bin(home, cache_dir, ["--cached"])
+        assert f"  {NO_MUSE}\n" in absent.stdout, absent.stdout
+        dest.write_text((MUSE_FIXTURES / "fresh.json").read_text())
+        empty = home / "empty-cache"
+        empty.mkdir()
+        missing_cache = _run_bin(home, empty, ["--cached"])
+        assert missing_cache.returncode == 0 and missing_cache.stderr == "", (missing_cache.returncode, missing_cache.stderr)
+        assert "no cached line" in missing_cache.stdout, missing_cache.stdout
+        assert f"  {FRESH_MUSE_UTC}\n" in missing_cache.stdout, missing_cache.stdout
+        # The seat cache is not where this line lives, and --route did not write asks.
+        stored = json.loads((cache_dir / "latest.json").read_text())
+        assert all(not str(ln).startswith("muse") for ln in stored.get("lines") or [])
+        assert not any("muse" in str(key) for key in stored)
+        assert not (cache_dir / "asks.jsonl").exists()
+
+
+@test
+def full_run_prints_muse_and_leaves_it_out_of_the_cache():
+    with tempfile.TemporaryDirectory() as d:
+        cache = os.path.join(d, "latest.json")
+        old = (su.CACHE, su.CACHE_DIR, su.SUMMARY, su.muse_usage_path)
+        saved = {name: getattr(su, name) for name in ("claude", "codex", "cursor", "grok")}
+
+        def claude():
+            su.SUMMARY["as_of"]["claude"] = time.time()
+            su.SUMMARY["claude_week"] = 1
+            return ["claude   | ok"]
+
+        def codex():
+            su.SUMMARY["as_of"]["chatgpt"] = time.time()
+            return ["chatgpt  | ok"]
+
+        def cursor():
+            su.SUMMARY["as_of"]["cursor"] = time.time()
+            su.SUMMARY["as_of"]["grokbot"] = time.time()
+            return ["cursor   | ok", "grokbot  | ok"]
+
+        def grok():
+            su.SUMMARY["as_of"]["grok"] = time.time()
+            return ["grok     | ok"]
+
+        su.CACHE, su.CACHE_DIR = cache, d
+        su.SUMMARY = {"ts": time.time(), "as_of": {}, "v": 1}
+        su.muse_usage_path = lambda: str(MUSE_FIXTURES / "fresh.json")
+        su.claude, su.codex, su.cursor, su.grok = claude, codex, cursor, grok
+        try:
+            quiet_buf = io.StringIO()
+            with contextlib.redirect_stdout(quiet_buf):
+                quiet = su.full_run(quiet=True, timeout=5)
+            assert quiet_buf.getvalue() == "", quiet_buf.getvalue()
+            assert all(not ln.startswith("muse") for ln in quiet["lines"]), quiet["lines"]
+            loud_buf = io.StringIO()
+            with local_tz("UTC"):
+                with contextlib.redirect_stdout(loud_buf):
+                    loud = su.full_run(quiet=False, timeout=5)
+            text = loud_buf.getvalue()
+            muse_lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("muse")]
+            assert muse_lines == [FRESH_MUSE_UTC], text
+            assert all(not ln.startswith("muse") for ln in loud["lines"]), loud["lines"]
+            assert not any("muse" in key for key in loud), loud
+            written = json.load(open(cache))
+            assert all(not str(ln).startswith("muse") for ln in written["lines"]), written["lines"]
+            assert not any("muse" in key for key in written), written
+        finally:
+            su.CACHE, su.CACHE_DIR, su.SUMMARY, su.muse_usage_path = old
+            for name, fn in saved.items():
+                setattr(su, name, fn)
 
 
 def main():

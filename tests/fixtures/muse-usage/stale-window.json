@@ -1,0 +1,12 @@
+{
+  "captured_at": "2020-01-01T00:00:00Z",
+  "window": {
+    "used_percent": 90,
+    "window_duration_mins": 300,
+    "resets_at": "2020-01-01T05:00:00Z"
+  },
+  "weekly": {
+    "used_percent": 10,
+    "resets_at": "2099-01-08T00:00:00Z"
+  }
+}

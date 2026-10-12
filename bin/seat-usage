@@ -6,6 +6,8 @@ prints a token. Every source is best-effort with a short timeout; a failure
 prints a one-line reason and never exits non-zero. A synchronous
 SessionStart hook prints the cached lines (--cached) so the numbers land in
 context when routing is decided.
+A Muse line is read from ~/.cache/quartermaster/muse-usage.json, which
+Conclave writes. It is display-only and is not a routing input.
 Sources are documented in the Delegation Routing section of ~/.claude/CLAUDE.md.
 """
 import base64, fcntl, glob, json, os, re, socket, sys, time, urllib.error, urllib.parse, urllib.request
@@ -1838,28 +1840,109 @@ def write_cache():
     except Exception:
         pass
 
+# Conclave's cache. Read at print time. Not stored, not a pool, not a route input.
+# Model names stay in the file, if Conclave sends them; the router never sees this.
+def muse_usage_path():
+    return os.path.join(os.path.expanduser("~"), ".cache", "quartermaster", "muse-usage.json")
+
+def _muse_number(v):
+    return _is_number(v) and v == v and v != float("inf") and v != float("-inf")
+
+def _muse_epoch(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return iso_to_ts(value.strip())
+    except (ValueError, TypeError, OSError, OverflowError):
+        return None
+
+def _muse_local(ts):
+    """Clock time in the machine's zone. None when the timestamp cannot be shown."""
+    try:
+        dt = datetime.fromtimestamp(ts).astimezone()
+    except (OverflowError, OSError, ValueError):
+        return None
+    zone = dt.tzname() or dt.strftime("%z")
+    clock = dt.strftime("%Y-%m-%d %H:%M")
+    return f"{clock} {zone}" if zone else clock
+
+def format_muse_line(data, now):
+    """One Muse line from Conclave's object, or None when the shape does not match.
+
+    {captured_at, window{used_percent, window_duration_mins, resets_at},
+     weekly{used_percent, resets_at}}. Times are local. Stale once the captured
+    window's resets_at is no longer in the future.
+    """
+    if not isinstance(data, dict):
+        return None
+    window, weekly = data.get("window"), data.get("weekly")
+    if not isinstance(window, dict) or not isinstance(weekly, dict):
+        return None
+    captured = _muse_epoch(data.get("captured_at"))
+    window_reset = _muse_epoch(window.get("resets_at"))
+    weekly_reset = _muse_epoch(weekly.get("resets_at"))
+    current, weekly_pct = window.get("used_percent"), weekly.get("used_percent")
+    minutes = window.get("window_duration_mins")
+    if captured is None or window_reset is None or weekly_reset is None:
+        return None
+    if not _muse_number(current) or not _muse_number(weekly_pct) or not _muse_number(minutes) or minutes < 0:
+        return None
+    captured_s, window_s, weekly_s = _muse_local(captured), _muse_local(window_reset), _muse_local(weekly_reset)
+    if not captured_s or not window_s or not weekly_s:
+        return None
+    line = (f"{'muse':9}| Current {_fmt_pct(current)}% (resets {window_s})"
+            f" | Weekly {_fmt_pct(weekly_pct)}% (resets {weekly_s}) | as of {captured_s}")
+    if window_reset <= now:
+        line += " | stale (window reset)"
+    return line
+
+def muse_line(now=None, path=None):
+    """Read-only Muse line. Missing or unparseable input says 'no data yet'."""
+    if now is None:
+        now = time.time()
+    if path is None:
+        path = muse_usage_path()
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        line = format_muse_line(data, now)
+    except Exception:
+        return f"{'muse':9}| no data yet"
+    return line or f"{'muse':9}| no data yet"
+
 def print_cached():
     """--cached: print the last run's lines from the cache, no network. For the
     synchronous SessionStart hook; the async hook refreshes the cache."""
     try:
         d = json.load(open(CACHE))
         age_m = round((NOW - d["ts"]) / 60)
-        print(f"[seat-usage] cached {age_m}m ago; run ~/.local/bin/seat-usage for live numbers")
+        header = f"[seat-usage] cached {age_m}m ago; run ~/.local/bin/seat-usage for live numbers"
+        seats = []
         for l in d["lines"]:
             seat = l.split("|")[0].strip()
             l = re.sub(r" \| stale \(reading [\d.]+h old\)$", "", l)   # recomputed below at the current age
             age = seat_age_s(d, seat, NOW)
             tag = " | no reading" if age is None else stale_tag(NOW - age)
-            print("  " + l + tag)
+            seats.append("  " + l + tag)
         # Recomputed against the current time, so a reset that already passed drops its line.
-        for e in burn_entries(d, NOW): print("  " + burn_line(e))
+        burns = ["  " + burn_line(e) for e in burn_entries(d, NOW)]
     except Exception as e:
         print(f"[seat-usage] no cached line ({e.__class__.__name__}); run ~/.local/bin/seat-usage")
+        print("  " + muse_line())
+        return
+    print(header)
+    for line in seats:
+        print(line)
+    # Conclave's file, not the seat cache. Sits with the usage lines, ahead of burn nudges.
+    print("  " + muse_line())
+    for line in burns:
+        print(line)
 
 def _print_full(lines, burn):
     print("[seat-usage] " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ"))
     for l in lines:
         print("  " + l)
+    print("  " + muse_line())
     for e in burn:
         print("  " + burn_line(e))
 
