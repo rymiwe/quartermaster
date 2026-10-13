@@ -9,23 +9,15 @@ sys.dont_write_bytecode = True
 
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE.parents[0] / "bin" / "seat-usage"
-OLD = "[seat-usage] no cached line ({e.__class__.__name__}); run ~/.local/bin/seat-usage"
-NEW = OLD + " updated-from-origin"
-DAY2 = OLD + " updated-from-origin second-day"
+NEEDLE = "| no data yet"
+NEW = NEEDLE + " updated-from-origin"
+DAY2 = NEEDLE + " updated-from-origin second-day"
 MISS = (
     "[seat-usage] no cached line (FileNotFoundError); run ~/.local/bin/seat-usage\n"
     "  muse     | no data yet\n"
 )
-MISS_NEW = (
-    "[seat-usage] no cached line (FileNotFoundError); run ~/.local/bin/seat-usage updated-from-origin\n"
-    "  muse     | no data yet\n"
-)
-UPDATED = "[seat-usage] updated\n" + MISS_NEW
-UPDATED_DAY2 = (
-    "[seat-usage] updated\n"
-    "[seat-usage] no cached line (FileNotFoundError); run ~/.local/bin/seat-usage updated-from-origin second-day\n"
-    "  muse     | no data yet\n"
-)
+MUSE_NEW = "  muse     | no data yet updated-from-origin\n"
+MUSE_DAY2 = "  muse     | no data yet updated-from-origin second-day\n"
 
 TESTS = []
 
@@ -67,7 +59,7 @@ def write_script(repo, text):
 
 def source_text():
     text = SOURCE.read_text()
-    assert text.count(OLD) == 1, text.count(OLD)
+    assert text.count(NEEDLE) == 2, text.count(NEEDLE)
     return text
 
 
@@ -88,7 +80,7 @@ def new_checkout(tmp, *, push_upstream=False, local_commit=False):
         git("add", "LOCAL_NOTE", repo=work)
         git("commit", "-m", "local", repo=work)
     if push_upstream:
-        write_script(base, text.replace(OLD, NEW, 1))
+        write_script(base, text.replace(NEEDLE, NEW))
         git("add", "-A", repo=base)
         git("commit", "-m", "upstream", repo=base)
         git("remote", "add", "origin", str(origin), repo=base)
@@ -127,6 +119,14 @@ def age_stamp(home):
     path.write_text(f"{time.time() - 86401:.3f}\n")
 
 
+def stayed(proc, work, before):
+    assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
+    assert proc.stderr == "", proc.stderr
+    assert "[seat-usage] updated" not in proc.stdout, proc.stdout
+    assert "updated-from-origin" not in proc.stdout, proc.stdout
+    assert head(work) == before
+
+
 @test
 def fast_forward_prints_updated_and_reruns_the_pulled_script():
     with tempfile.TemporaryDirectory() as tmp:
@@ -142,28 +142,31 @@ def fast_forward_prints_updated_and_reruns_the_pulled_script():
         link = home / "bin" / "seat-usage"
         link.parent.mkdir()
         link.symlink_to(script)
-        proc = run_seat(link, home, ["--cached"])
+        proc = run_seat(link, home, [])
         assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
         assert proc.stderr == "", proc.stderr
-        assert proc.stdout == UPDATED, proc.stdout
+        assert proc.stdout.startswith("[seat-usage] updated\n"), proc.stdout
+        assert MUSE_NEW in proc.stdout, proc.stdout
         assert head(work) != before
         assert head(work) == git("rev-parse", "origin/main", repo=work)
         assert "updated-from-origin" in script.read_text()
         assert git("status", "--porcelain", repo=work) == ""
         assert git("stash", "list", repo=work) == ""
         assert muse.read_text() == '{"keep":true}\n'
-        write_script(base, source_text().replace(OLD, DAY2, 1))
+        write_script(base, source_text().replace(NEEDLE, DAY2))
         git("add", "-A", repo=base)
         git("commit", "-m", "second day", repo=base)
         git("push", "origin", "main", repo=base)
-        again = run_seat(link, home, ["--cached"])
+        again = run_seat(link, home, [])
         assert again.returncode == 0 and again.stderr == "", (again.returncode, again.stderr, again.stdout)
-        assert again.stdout == MISS_NEW, again.stdout
+        assert "[seat-usage] updated" not in again.stdout, again.stdout
+        assert MUSE_NEW in again.stdout, again.stdout
         assert "second-day" not in script.read_text()
         age_stamp(home)
-        later = run_seat(link, home, ["--cached"])
+        later = run_seat(link, home, [])
         assert later.returncode == 0 and later.stderr == "", (later.returncode, later.stderr, later.stdout)
-        assert later.stdout == UPDATED_DAY2, later.stdout
+        assert later.stdout.startswith("[seat-usage] updated\n"), later.stdout
+        assert MUSE_DAY2 in later.stdout, later.stdout
         assert "second-day" in script.read_text()
         assert muse.read_text() == '{"keep":true}\n'
         assert git("stash", "list", repo=work) == ""
@@ -177,10 +180,8 @@ def dirty_tree_keeps_the_local_edit():
         script.write_text(script.read_text() + "\n# local edit\n")
         home = Path(tmp) / "home"
         home.mkdir()
-        proc = run_seat(script, home, ["--cached"])
-        assert proc.returncode == 0 and proc.stderr == "", (proc.returncode, proc.stderr, proc.stdout)
-        assert proc.stdout == MISS, proc.stdout
-        assert head(work) == before
+        proc = run_seat(script, home, [])
+        stayed(proc, work, before)
         assert script.read_text().endswith("# local edit\n")
         assert "updated-from-origin" not in script.read_text()
         assert not stamp_path(home).exists()
@@ -194,11 +195,9 @@ def other_branch_stays_put():
         before = head(work)
         home = Path(tmp) / "home"
         home.mkdir()
-        proc = run_seat(script, home, ["--cached"])
-        assert proc.returncode == 0 and proc.stderr == "", (proc.returncode, proc.stderr, proc.stdout)
-        assert proc.stdout == MISS, proc.stdout
+        proc = run_seat(script, home, [])
+        stayed(proc, work, before)
         assert git("symbolic-ref", "--short", "HEAD", repo=work) == "side"
-        assert head(work) == before
         assert "updated-from-origin" not in script.read_text()
         assert not stamp_path(home).exists()
 
@@ -211,11 +210,9 @@ def detached_head_stays_put():
         before = head(work)
         home = Path(tmp) / "home"
         home.mkdir()
-        proc = run_seat(script, home, ["--cached"])
-        assert proc.returncode == 0 and proc.stderr == "", (proc.returncode, proc.stderr, proc.stdout)
-        assert proc.stdout == MISS, proc.stdout
+        proc = run_seat(script, home, [])
+        stayed(proc, work, before)
         assert git("rev-parse", "--abbrev-ref", "HEAD", repo=work) == "HEAD"
-        assert head(work) == before
         assert "updated-from-origin" not in script.read_text()
         assert not stamp_path(home).exists()
 
@@ -227,10 +224,8 @@ def diverged_history_is_not_reset():
         before = head(work)
         home = Path(tmp) / "home"
         home.mkdir()
-        proc = run_seat(script, home, ["--cached"])
-        assert proc.returncode == 0 and proc.stderr == "", (proc.returncode, proc.stderr, proc.stdout)
-        assert proc.stdout == MISS, proc.stdout
-        assert head(work) == before
+        proc = run_seat(script, home, [])
+        stayed(proc, work, before)
         assert (work / "LOCAL_NOTE").read_text() == "keep\n"
         assert "updated-from-origin" not in script.read_text()
         assert git("stash", "list", repo=work) == ""
@@ -243,10 +238,8 @@ def local_commits_ahead_are_kept():
         before = head(work)
         home = Path(tmp) / "home"
         home.mkdir()
-        proc = run_seat(script, home, ["--cached"])
-        assert proc.returncode == 0 and proc.stderr == "", (proc.returncode, proc.stderr, proc.stdout)
-        assert proc.stdout == MISS, proc.stdout
-        assert head(work) == before
+        proc = run_seat(script, home, [])
+        stayed(proc, work, before)
         assert (work / "LOCAL_NOTE").read_text() == "keep\n"
         assert git("stash", "list", repo=work) == ""
 
@@ -258,14 +251,13 @@ def opt_out_skips_until_the_variable_is_unset():
         before = head(work)
         home = Path(tmp) / "home"
         home.mkdir()
-        held = run_seat(script, home, ["--cached"], {"QUARTERMASTER_NO_UPDATE": "1"})
-        assert held.returncode == 0 and held.stderr == "", (held.returncode, held.stderr, held.stdout)
-        assert held.stdout == MISS, held.stdout
-        assert head(work) == before
+        held = run_seat(script, home, [], {"QUARTERMASTER_NO_UPDATE": "1"})
+        stayed(held, work, before)
         assert not stamp_path(home).exists()
-        pulled = run_seat(script, home, ["--cached"], {"QUARTERMASTER_NO_UPDATE": "0"})
+        pulled = run_seat(script, home, [], {"QUARTERMASTER_NO_UPDATE": "0"})
         assert pulled.returncode == 0 and pulled.stderr == "", (pulled.returncode, pulled.stderr, pulled.stdout)
-        assert pulled.stdout == UPDATED, pulled.stdout
+        assert pulled.stdout.startswith("[seat-usage] updated\n"), pulled.stdout
+        assert MUSE_NEW in pulled.stdout, pulled.stdout
         assert "updated-from-origin" in script.read_text()
 
 
@@ -304,20 +296,17 @@ def failed_fetch_waits_a_day_and_then_updates():
         git("remote", "set-url", "origin", str(Path(tmp) / "missing.git"), repo=work)
         home = Path(tmp) / "home"
         home.mkdir()
-        first = run_seat(script, home, ["--cached"])
-        assert first.returncode == 0 and first.stderr == "", (first.returncode, first.stderr, first.stdout)
-        assert first.stdout == MISS, first.stdout
-        assert head(work) == before
+        first = run_seat(script, home, [])
+        stayed(first, work, before)
         assert stamp_path(home).is_file()
         git("remote", "set-url", "origin", origin, repo=work)
-        second = run_seat(script, home, ["--cached"])
-        assert second.returncode == 0 and second.stderr == "", (second.returncode, second.stderr, second.stdout)
-        assert second.stdout == MISS, second.stdout
-        assert head(work) == before
+        second = run_seat(script, home, [])
+        stayed(second, work, before)
         age_stamp(home)
-        third = run_seat(script, home, ["--cached"])
+        third = run_seat(script, home, [])
         assert third.returncode == 0 and third.stderr == "", (third.returncode, third.stderr, third.stdout)
-        assert third.stdout == UPDATED, third.stdout
+        assert third.stdout.startswith("[seat-usage] updated\n"), third.stdout
+        assert MUSE_NEW in third.stdout, third.stdout
         assert head(work) == git("rev-parse", "origin/main", repo=work)
         assert "updated-from-origin" in script.read_text()
 
@@ -331,10 +320,30 @@ def a_copy_outside_a_checkout_runs_the_current_script():
         loose.chmod(0o755)
         home = Path(tmp) / "home"
         home.mkdir()
-        proc = run_seat(loose, home, ["--cached"])
+        proc = run_seat(loose, home, [])
+        assert proc.returncode == 0 and proc.stderr == "", (proc.returncode, proc.stderr, proc.stdout)
+        assert "[seat-usage] updated" not in proc.stdout, proc.stdout
+        assert not stamp_path(home).exists()
+
+
+@test
+def cached_run_does_not_pull():
+    with tempfile.TemporaryDirectory() as tmp:
+        work, script, _base = new_checkout(tmp, push_upstream=True)
+        before = head(work)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        proc = run_seat(script, home, ["--cached"])
         assert proc.returncode == 0 and proc.stderr == "", (proc.returncode, proc.stderr, proc.stdout)
         assert proc.stdout == MISS, proc.stdout
+        assert head(work) == before
+        assert "updated-from-origin" not in script.read_text()
         assert not stamp_path(home).exists()
+        pulled = run_seat(script, home, [])
+        assert pulled.returncode == 0 and pulled.stderr == "", (pulled.returncode, pulled.stderr, pulled.stdout)
+        assert pulled.stdout.startswith("[seat-usage] updated\n"), pulled.stdout
+        assert MUSE_NEW in pulled.stdout, pulled.stdout
+        assert head(work) == git("rev-parse", "origin/main", repo=work)
 
 
 def main():

@@ -10,7 +10,7 @@ A Muse line is read from ~/.cache/quartermaster/muse-usage.json, which
 Conclave writes. It is display-only and is not a routing input.
 A run from a clean checkout of main fetches and fast-forwards at most
 once a day, prints one updated line, and starts again on the new code.
---route, --quiet, COUNCIL_VOTER=1, and CONCLAVE_VOTER=1 skip that check.
+--route, --quiet, --cached, COUNCIL_VOTER=1, and CONCLAVE_VOTER=1 skip that check.
 QUARTERMASTER_NO_UPDATE=1 turns it off. The check never stashes or resets.
 Sources are documented in the Delegation Routing section of ~/.claude/CLAUDE.md.
 """
@@ -1994,7 +1994,7 @@ def _update_skipped():
     if os.environ.get("COUNCIL_VOTER") == "1" or os.environ.get("CONCLAVE_VOTER") == "1":
         return True
     argv = sys.argv[1:]
-    return "--route" in argv or "--quiet" in argv
+    return "--route" in argv or "--quiet" in argv or "--cached" in argv
 
 def _stamp_path():
     return os.path.join(os.path.expanduser("~"), ".cache", "quartermaster", "seat-usage-update")
