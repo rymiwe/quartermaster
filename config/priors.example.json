@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "updated": "2026-10-13",
+  "note": "Optional. A weekly job may write config/priors.json (or SEAT_USAGE_PRIORS) in this shape. seat-usage reads the file and does not fetch benchmarks or sentiment. Each score overrides the pool's prior seed for that role. samples and source are records for the job; the router uses score only.",
+  "scores": {
+    "fable": {
+      "bounded-question": {"score": 0.90, "samples": 0, "source": "seed"}
+    },
+    "codex": {
+      "hard-bug": {"score": 0.88, "samples": 0, "source": "seed"}
+    },
+    "cursor_models": {
+      "builder": {"score": 0.80, "samples": 0, "source": "seed"},
+      "chair": {"score": 0.80, "samples": 0, "source": "seed"}
+    }
+  }
+}

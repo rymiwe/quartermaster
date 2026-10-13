@@ -289,13 +289,13 @@ def env_overrides_redirect_cache_asks_and_renewals():
 
 BARE_ROUTE = (
     "route: bounded-question | claude | fable | - | - | suggest | "
-    "Fable under pace: bounded shot to Fable (Pace rule) | reading 0m\n"
+    "Fable under pace: score 0.87 (fit 0.90, headroom 1.00, cost 3, lose-it 0.00) | reading 0m\n"
     "route: hard-bug | chatgpt | astra | low | - | suggest | "
-    "Codex under pace: hard ticket to Astra (Pace rule) | reading 0m\n"
+    "Codex under pace: score 0.85 (fit 0.88, headroom 1.00, cost 3, lose-it 0.00) | reading 0m\n"
     "route: builder | cursor | grok | high | fast | default | "
-    "Grok on Cursor: Cursor Models under pace | reading 0m\n"
+    "Cursor Models under pace: score 0.78 (fit 0.80, headroom 1.00, cost 2, lose-it 0.00) | reading 0m\n"
     "route: chair | cursor | grok | high | fast | default | "
-    "Grok on Cursor: Cursor Models under pace | reading 0m\n"
+    "Cursor Models under pace: score 0.78 (fit 0.80, headroom 1.00, cost 2, lose-it 0.00) | reading 0m\n"
 )
 CACHED_LINE = (
     "[seat-usage] cached 0m ago; run ~/.local/bin/seat-usage for live numbers\n"
@@ -305,13 +305,13 @@ CACHED_LINE = (
 HOOK_ROW_KEYS = {"role", "seat", "family", "effort", "variant", "mode", "reason", "reading_age_s"}
 LAUNCH_ROWS = (
     {"role": "bounded-question", "seat": "claude", "family": "fable", "effort": "-",
-     "variant": "-", "mode": "suggest", "reason": "Fable under pace: bounded shot to Fable (Pace rule)"},
+     "variant": "-", "mode": "suggest", "reason": "Fable under pace: score 0.87 (fit 0.90, headroom 1.00, cost 3, lose-it 0.00)"},
     {"role": "hard-bug", "seat": "chatgpt", "family": "astra", "effort": "low",
-     "variant": "-", "mode": "suggest", "reason": "Codex under pace: hard ticket to Astra (Pace rule)"},
+     "variant": "-", "mode": "suggest", "reason": "Codex under pace: score 0.85 (fit 0.88, headroom 1.00, cost 3, lose-it 0.00)"},
     {"role": "builder", "seat": "cursor", "family": "grok", "effort": "high",
-     "variant": "fast", "mode": "default", "reason": "Grok on Cursor: Cursor Models under pace"},
+     "variant": "fast", "mode": "default", "reason": "Cursor Models under pace: score 0.78 (fit 0.80, headroom 1.00, cost 2, lose-it 0.00)"},
     {"role": "chair", "seat": "cursor", "family": "grok", "effort": "high",
-     "variant": "fast", "mode": "default", "reason": "Grok on Cursor: Cursor Models under pace"},
+     "variant": "fast", "mode": "default", "reason": "Cursor Models under pace: score 0.78 (fit 0.80, headroom 1.00, cost 2, lose-it 0.00)"},
 )
 
 
@@ -400,7 +400,7 @@ def cached_lineup_json_names_the_xai_pair():
     builder = row["lineup"]["builder"]
     assert chair["seat"] == "cursor" and chair["family"] == "grok" and chair["effort"] == "high", chair
     assert chair["variant"] == "fast" and chair["mode"] == "default", chair
-    assert chair["reason"] == "Grok on Cursor: Cursor Models under pace", chair["reason"]
+    assert chair["reason"] == "Cursor Models under pace: score 0.78 (fit 0.80, headroom 1.00, cost 2, lose-it 0.00)", chair["reason"]
     assert builder["role"] == "builder" and builder["seat"] == "cursor" and builder["effort"] == "high", builder
     assert builder["reason"] == chair["reason"], builder
     voters = [(v["role"], v["seat"], v["family"], v["effort"], v["mode"]) for v in row["lineup"]["voters"]]

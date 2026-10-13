@@ -650,10 +650,19 @@ BURN_POOLS = (       # (seat, pool, used key, reset key, window key or fixed sec
 )
 
 def burn_entries(s, now):
-    """Pools that qualify for a burn nudge, from a SUMMARY-shaped dict at time now."""
+    """Pools in the use-it-or-lose-it band, from a SUMMARY-shaped dict at time now.
+
+    Same band the scorer adds as a bonus. Thresholds live in config (lose_it_hours,
+    lose_it_gap). A disabled pool is not in POOLS, so it cannot qualify.
+    """
     out = []
-    for seat, pool, uk, rk, wk in BURN_POOLS:
-        used, reset = s.get(uk), effective_end(s, seat, s.get(rk))
+    for _pid, meta in POOLS.items():
+        if not meta.get("lose_it"):
+            continue
+        seat = meta["seat"]
+        used = s.get(meta["used"])
+        reset = effective_end(s, seat, s.get(meta["reset"]))
+        wk = meta["window"]
         window = wk if isinstance(wk, (int, float)) else s.get(wk)
         if not isinstance(used, (int, float)) or not reset or not window:
             continue
@@ -666,7 +675,8 @@ def burn_entries(s, now):
         elapsed_pct = 100 * max(0.0, min(1.0, 1 - left_s / window))
         if elapsed_pct - used < BURN_GAP:
             continue
-        out.append({"seat": seat, "pool": pool, "used_pct": round(used, 1), "elapsed_pct": round(elapsed_pct),
+        out.append({"seat": seat, "pool": meta.get("burn") or meta["label"],
+                    "used_pct": round(used, 1), "elapsed_pct": round(elapsed_pct),
                     "left_pct": round(100 - used), "reset_ts": reset, "hours": round(left_s / 3600, 1)})
     return out
 
@@ -699,107 +709,574 @@ SEAT_KEYS = {
 }
 LINE_SEATS = ("claude", "chatgpt", "cursor", "grokbot", "grok")
 
-# Pools the router knows. Fable and weekly-all are 7-day windows. The 5h pool
-# is session-limited: capped or not, no pace rule. cursor_models is autoPercentUsed,
-# never cursor_pct.
-# serves: families this pool can run. only: a harness no other pool offers.
-# Ordinary work spends a pool with an empty only before one that has a harness
-# to keep. A burn (the pool would expire unused) outranks that (Ryan, 2026-10-08).
-POOLS = {
-    "claude_5h": {"seat": "claude", "used": "claude_5h", "reset": "claude_5h_reset_ts", "window": 5 * 3600, "pace": False, "label": "claude 5h", "serves": ("opus", "fable"), "only": ()},
-    "claude_week": {"seat": "claude", "used": "claude_week", "reset": "claude_week_reset_ts", "window": 7 * 86400, "label": "claude weekly all", "burn": "weekly all", "serves": ("opus", "fable"), "only": ()},
-    "fable": {"seat": "claude", "used": "fable", "reset": "fable_reset_ts", "window": 7 * 86400, "label": "Fable", "burn": "weekly Fable", "serves": ("fable",), "only": ()},
-    "codex": {"seat": "chatgpt", "used": "codex", "reset": "codex_reset_ts", "window": "codex_window_s", "label": "Codex", "burn": "weekly", "serves": ("astra", "sol"), "only": ()},
-    "cursor_models": {"seat": "cursor", "used": "cursor_auto_pct", "reset": "cursor_reset_ts", "window": "cursor_window_s", "label": "Cursor Models", "burn": "cursor models (month)", "serves": ("grok",), "only": ()},
-    "cursor_other": {"seat": "cursor", "used": "cursor_api_pct", "reset": "cursor_reset_ts", "window": "cursor_window_s", "label": "Other Models", "burn": "other models (month)", "serves": ("fable",), "only": ()},
-    "grokbot": {"seat": "grokbot", "used": "bot_pct", "reset": "bot_reset_ts", "window": "bot_window_s", "label": "grokbot", "burn": "week", "exhausted": "bot_exhausted", "serves": ("grokbot",), "only": ()},
-    "grok": {"seat": "grok", "used": "grok_pct", "reset": "grok_reset_ts", "window": "grok_window_s", "label": "grok", "burn": "week", "exhausted": "grok_exhausted", "serves": ("grok",), "only": ("grok-build",)},
-}
-
-# Daily work — one bounded Fable question. No written effort.
-# Daily work — one bounded Astra run, low or medium first.
-# Chair and builder are Grok. Cursor Models, then SuperGrok, by the pace rules.
-# Opus when both of those pools are over pace.
-ROLES = {
-    "bounded-question": {"seats": ("claude", "cursor"), "primary": "fable",
-                         "default": {"seat": "claude", "family": "fable", "effort": "-", "variant": "-"}},
-    "hard-bug": {"seats": ("chatgpt",), "primary": "codex",
-                 "default": {"seat": "chatgpt", "family": "astra", "effort": "low", "variant": "-"}},
-    "builder": {"seats": ("cursor", "grok", "claude"), "primary": "cursor_models",
-                "default": {"seat": "cursor", "family": "grok", "effort": "high", "variant": "fast"}},
-    "chair": {"seats": ("cursor", "grok", "claude"), "primary": "cursor_models",
-              "default": {"seat": "cursor", "family": "grok", "effort": "high", "variant": "fast"}},
-}
-
+# Pool records, role defaults, and score weights are loaded from config/pools.json.
+# Model ids live in that file. ROUTE_RULES is empty: score_route replaced the table.
+# A pool with enabled false is left out of POOLS.
+POOLS = {}
+ROLES = {}
+POOL_ORDER = ()
+SCORING = {}
+PRIORS = {}
+ROUTE_RULES = ()
+BURN_POOLS = ()
+NEAR_CAP = 95
 _ASK = "ask Ryan"
 _FIX_ASK = "fix the failed reading, then ask Ryan"
 
-# The only home of the routing rules. Each comment names the CLAUDE.md section.
-# First match wins. "not_capped" means the pool is known and not capped.
-# "room" means the pool is known, under 95% used, and not capped. Near the hard
-# cap outranks pace. "burn" matches burn_entries (thresholds stay in BURN_HOURS / BURN_GAP).
-NEAR_CAP = 95
-ROUTE_RULES = [
-    # Council (design, planning, review), item 1 — Max capped: Cursor's newest Fable at thinking-xhigh is the substitute
-    {"role": "bounded-question", "when": (("claude_week", "capped"), ("cursor_other", "not_capped")),
-     "mode": "suggest", "seat": "cursor", "family": "fable", "effort": "xhigh", "variant": "-",
-     "reason": "Max capped: Cursor Fable on Other Models"},
-    # Council (design, planning, review), item 1 — Max capped: Cursor's newest Fable at thinking-xhigh is the substitute
-    {"role": "bounded-question", "when": (("claude_5h", "capped"), ("cursor_other", "not_capped")),
-     "mode": "suggest", "seat": "cursor", "family": "fable", "effort": "xhigh", "variant": "-",
-     "reason": "Max capped: Cursor Fable on Other Models"},
-    # Ryan, 2026-10-03 — Max capped and Cursor Fable unavailable or unknown: ask
-    {"role": "bounded-question", "when": (("claude_week", "capped"),), "mode": "ask",
-     "ask_pools": ("cursor_other",)},
-    {"role": "bounded-question", "when": (("claude_5h", "capped"),), "mode": "ask",
-     "ask_pools": ("cursor_other",)},
-    # Ryan, 2026-10-03 — burn on Fable: top effort
-    {"role": "bounded-question", "when": (("fable", "burn"),), "mode": "burn", "effort": "max",
-     "reason": "Fable burn: effort max"},
-    # Near the hard cap beats pace. Opus on Max at high when that pool can take it.
-    {"role": "bounded-question", "when": (("fable", "near_cap"), ("claude_week", "room"), ("claude_5h", "room")),
-     "mode": "suggest", "seat": "claude", "family": "opus", "effort": "high", "variant": "-",
-     "reason": "Fable near hard cap: Opus on Max at high"},
-    {"role": "bounded-question", "when": (("fable", "near_cap"),), "mode": "ask",
-     "reason": "Fable near hard cap and Max cannot take Opus: " + _ASK},
-    # Pace rule — under pace: bounded shot to Fable
-    {"role": "bounded-question", "when": (("fable", "under"),), "mode": "suggest",
-     "reason": "Fable under pace: bounded shot to Fable (Pace rule)"},
-    # Pace rule — on pace: routing as written
-    {"role": "bounded-question", "when": (("fable", "on"),), "mode": "default",
-     "reason": "Fable on pace"},
-    # Pace rule — ahead of pace: judgment shot to Opus
-    {"role": "bounded-question", "when": (("fable", "ahead"),), "mode": "suggest",
-     "seat": "claude", "family": "opus", "effort": "-", "variant": "-",
-     "reason": "Fable ahead of pace: judgment shot to Opus (Pace rule)"},
-    # Overflow crosses seats — Fable slice capped, Max weekly-all and 5h still open: Opus on Max
-    {"role": "bounded-question", "when": (("fable", "capped"), ("claude_week", "not_capped"), ("claude_5h", "not_capped")),
-     "mode": "suggest", "seat": "claude", "family": "opus", "effort": "-", "variant": "-",
-     "reason": "Fable slice capped: Opus on Max (Overflow crosses seats)"},
-    # Ryan, 2026-10-03 — Fable capped and a Max reading unknown: fix the reading, ask
-    {"role": "bounded-question", "when": (("fable", "capped"), ("claude_week", "unknown")),
-     "mode": "ask", "reason": "Max weekly reading unknown: " + _FIX_ASK},
-    {"role": "bounded-question", "when": (("fable", "capped"), ("claude_5h", "unknown")),
-     "mode": "ask", "reason": "Max 5h reading unknown: " + _FIX_ASK},
-    # Pace rule — burn on the Codex bucket: low or medium effort first, so medium
-    {"role": "hard-bug", "when": (("codex", "burn"),), "mode": "burn", "effort": "medium",
-     "reason": "Codex burn: low or medium effort first"},
-    # Pace rule — under pace: hard ticket to Astra
-    {"role": "hard-bug", "when": (("codex", "under"),), "mode": "suggest",
-     "reason": "Codex under pace: hard ticket to Astra (Pace rule)"},
-    # Pace rule — on pace: routing as written
-    {"role": "hard-bug", "when": (("codex", "on"),), "mode": "default",
-     "reason": "Codex on pace"},
-    # Pace rule — ahead of pace: Sol where it can do the job
-    {"role": "hard-bug", "when": (("codex", "ahead"),), "mode": "suggest",
-     "seat": "chatgpt", "family": "sol", "effort": "-", "variant": "-",
-     "reason": "Codex ahead of pace: Sol where it can do the job (Pace rule)"},
-    # Ryan, 2026-10-03 — ChatGPT capped: ask (Cursor has no Astra; a reviewer does not review its own output)
-    {"role": "hard-bug", "when": (("codex", "capped"),), "mode": "ask",
-     "reason": "ChatGPT capped: " + _ASK + " (Cursor has no Astra; a reviewer does not review its own output)"},
-]
-# Chair and builder are selected in _route_worker. The rule table no longer
-# walls SuperGrok off from those roles (Ryan, 2026-10-08, routing principles).
+def _repo_root():
+    return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+def pools_file():
+    env = os.environ.get("SEAT_USAGE_POOLS")
+    if env:
+        return env
+    return os.path.join(_repo_root(), "config", "pools.json")
+
+def priors_file():
+    """External prior file. Absent means the seeds in pools.json stand."""
+    env = os.environ.get("SEAT_USAGE_PRIORS")
+    if env:
+        return env
+    path = os.path.join(_repo_root(), "config", "priors.json")
+    return path if os.path.isfile(path) else None
+
+def outcomes_files():
+    """Local track-record logs. A missing file is not an error.
+
+    Council writes ~/.local/state/seat-usage/runs.jsonl (SEAT_USAGE_RUNS).
+    Each run line carries the task role and seat agreement: a seats list, or
+    the lineup's chair, builder, and voters. agreed is whether that seat
+    matched the verdict. SEAT_USAGE_OUTCOMES is an extra log of
+    {role, pool, agreed} lines.
+    """
+    home = os.path.expanduser("~")
+    outcomes = os.environ.get("SEAT_USAGE_OUTCOMES") or os.path.join(
+        home, ".local", "state", "seat-usage", "outcomes.jsonl")
+    runs = os.environ.get("SEAT_USAGE_RUNS") or os.path.join(
+        home, ".local", "state", "seat-usage", "runs.jsonl")
+    return (outcomes, runs)
+
+def blend_strength(provider, prior, track, n, provider_pseudo=8, prior_pseudo=8):
+    """Blend provider facts, an external prior, and our own track record.
+
+    effective = (P * provider + R * prior + n * track) / (P + R + n)
+
+    P is provider_pseudo when provider is present, else 0. R is prior_pseudo
+    when prior is present, else 0. n is the number of local samples. A missing
+    source is left out of both the numerator and the denominator, so it does
+    not count as zero. With the defaults, n = 0 returns the mean of whichever
+    seeds exist, n = 16 ties our data with the two seeds together, and larger
+    n lets the track record outweigh the prior.
+    """
+    num = 0.0
+    den = 0.0
+    if provider is not None:
+        num += provider_pseudo * float(provider)
+        den += provider_pseudo
+    if prior is not None:
+        num += prior_pseudo * float(prior)
+        den += prior_pseudo
+    if track is not None and n:
+        num += n * float(track)
+        den += n
+    if den == 0:
+        return None
+    return num / den
+
+def _prior_value(raw):
+    if isinstance(raw, bool) or raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, dict):
+        score = raw.get("score")
+        if isinstance(score, (int, float)) and not isinstance(score, bool):
+            return float(score)
+    return None
+
+def read_priors(path):
+    """Map pool id -> role -> prior score. Missing or unreadable file returns {}."""
+    if not path:
+        return {}
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    scores = data.get("scores") if isinstance(data, dict) else None
+    if not isinstance(scores, dict):
+        return {}
+    out = {}
+    for pid, roles in scores.items():
+        if not isinstance(roles, dict):
+            continue
+        parsed = {}
+        for role, raw in roles.items():
+            value = _prior_value(raw)
+            if value is not None:
+                parsed[role] = value
+        if parsed:
+            out[pid] = parsed
+    return out
+
+def _absorb_sample(samples, role, pool, agreed):
+    if not role or not pool or not isinstance(agreed, bool):
+        return
+    samples.setdefault((pool, role), []).append(1.0 if agreed else 0.0)
+
+def _agreement(obj):
+    """True when this seat matched the verdict, false when it did not."""
+    for key in ("agreed", "agreed_with_verdict"):
+        val = obj.get(key)
+        if isinstance(val, bool):
+            return val
+    return None
+
+def _pool_for(seat, family, pool):
+    """Pool id for a council seat. An explicit pool id wins when it is configured."""
+    if isinstance(pool, str) and pool:
+        return pool
+    exact, served = [], []
+    for pid, meta in POOLS.items():
+        if seat and meta.get("seat") != seat:
+            continue
+        if family and meta.get("family") == family:
+            exact.append(pid)
+        elif family and family in (meta.get("serves") or ()):
+            served.append(pid)
+        elif seat and not family:
+            exact.append(pid)
+    cands = exact or served
+    if not cands:
+        return None
+    def rank(pid):
+        meta = POOLS[pid]
+        return (0 if meta.get("strengths") else 1, 0 if meta.get("lose_it") else 1, pid)
+    return sorted(cands, key=rank)[0]
+
+def _sample_role(party_role, parent_role):
+    """A launch role on the seat wins. A voter inherits the task role."""
+    if party_role in ROLES:
+        return party_role
+    return parent_role
+
+def _absorb_party(samples, parent_role, party):
+    if not isinstance(party, dict):
+        return
+    agreed = _agreement(party)
+    if agreed is None:
+        return
+    pool = _pool_for(party.get("seat"), party.get("family") or party.get("model"), party.get("pool"))
+    _absorb_sample(samples, _sample_role(party.get("role"), parent_role), pool, agreed)
+
+def _absorb_row(samples, row):
+    nested = False
+    parent = row.get("role")
+    for key in ("seats", "votes", "ballots"):
+        items = row.get(key)
+        if isinstance(items, list):
+            nested = True
+            for party in items:
+                _absorb_party(samples, parent, party)
+    lineup = row.get("lineup")
+    if isinstance(lineup, dict):
+        nested = True
+        for key in ("chair", "builder"):
+            _absorb_party(samples, parent, lineup.get(key))
+        for party in lineup.get("voters") or []:
+            _absorb_party(samples, parent, party)
+    if nested:
+        return
+    agreed = _agreement(row)
+    if agreed is None:
+        return
+    pool = _pool_for(row.get("seat"), row.get("family") or row.get("model"), row.get("pool"))
+    _absorb_sample(samples, parent, pool, agreed)
+
+def read_track(paths=None):
+    """Map (pool, role) -> (agreement rate, sample count).
+
+    Reads the council runs log and the optional outcomes log. A missing file,
+    a blank line, or a bad line is skipped. No file at all returns {}.
+    """
+    if paths is None:
+        paths = outcomes_files()
+    samples = {}
+    for path in paths:
+        if not path:
+            continue
+        try:
+            fh = open(path)
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+        try:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                _absorb_row(samples, row)
+        finally:
+            fh.close()
+    return {key: (sum(vals) / len(vals), len(vals)) for key, vals in samples.items()}
+
+def _copy_maps(raw, meta, *names):
+    for name in names:
+        if isinstance(raw.get(name), dict):
+            meta[name] = dict(raw[name])
+
+def _empty_pool_tables():
+    global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, FAMILY_VENDOR, _FAMILY_NAME
+    POOLS = {}
+    ROLES = {}
+    POOL_ORDER = ()
+    SCORING = {}
+    PRIORS = {}
+    BURN_POOLS = ()
+    FAMILY_VENDOR = {}
+    _FAMILY_NAME = {}
+
+def load_config(pools_path=None, priors_path=None):
+    """Load pool records and score weights. Disabled pools are not routable.
+
+    Pass paths to point a test at a temporary file. The default config is the
+    checkout's config/pools.json, found from this file's real path so a symlink
+    install still sees it.
+    """
+    global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, BURN_HOURS, BURN_GAP, NEAR_CAP
+    global FAMILY_VENDOR, _FAMILY_NAME
+    path = pools_path or pools_file()
+    try:
+        fh = open(path)
+    except FileNotFoundError:
+        if pools_path:
+            raise RuntimeError(f"cannot read pool config {path}: FileNotFoundError")
+        # A copied script with no checkout beside it still prints usage. Routing
+        # has nothing to score until a config file is present.
+        _empty_pool_tables()
+        return None
+    except Exception as e:
+        raise RuntimeError(f"cannot read pool config {path}: {e.__class__.__name__}") from e
+    try:
+        try:
+            data = json.load(fh)
+        except Exception as e:
+            raise RuntimeError(f"cannot read pool config {path}: {e.__class__.__name__}") from e
+    finally:
+        fh.close()
+    if not isinstance(data, dict) or not isinstance(data.get("pools"), dict):
+        raise RuntimeError(f"pool config {path} needs a pools object")
+    scoring = data.get("scoring") or {}
+    SCORING = dict(scoring)
+    BURN_HOURS = scoring.get("lose_it_hours", BURN_HOURS)
+    BURN_GAP = scoring.get("lose_it_gap", BURN_GAP)
+    NEAR_CAP = scoring.get("near_cap_pct", NEAR_CAP)
+    pools = {}
+    burn = []
+    for pid, raw in data["pools"].items():
+        if not isinstance(raw, dict) or raw.get("enabled", True) is False:
+            continue
+        usage = raw.get("usage") or {}
+        if not usage.get("used") or not usage.get("reset"):
+            raise RuntimeError(f"pool {pid} needs usage.used and usage.reset")
+        window = usage.get("window_key", usage.get("window_s"))
+        meta = {
+            "seat": raw.get("seat"),
+            "used": usage["used"],
+            "reset": usage["reset"],
+            "window": window,
+            "label": raw.get("label") or pid,
+            "serves": tuple(raw.get("serves") or ()),
+            "only": tuple(raw.get("only") or ()),
+            "family": raw.get("family"),
+            "models": list(raw.get("models") or []),
+            "cost_tier": raw.get("cost_tier", 0),
+            "variant": raw.get("variant", "-"),
+            "effort": raw.get("effort", "-"),
+            "facts": dict(raw.get("facts") or {}),
+            "strengths": dict(raw.get("strengths") or {}),
+        }
+        if raw.get("pace") is False:
+            meta["pace"] = False
+        if raw.get("lose_it"):
+            meta["lose_it"] = True
+        if raw.get("near_cap"):
+            meta["near_cap"] = True
+        if raw.get("burn"):
+            meta["burn"] = raw["burn"]
+        if raw.get("exhausted"):
+            meta["exhausted"] = raw["exhausted"]
+        if raw.get("ask_label"):
+            meta["ask_label"] = raw["ask_label"]
+        if raw.get("blocked_by"):
+            meta["blocked_by"] = list(raw["blocked_by"])
+        if raw.get("gates"):
+            meta["gates"] = list(raw["gates"])
+        if raw.get("cohort"):
+            meta["cohort"] = raw["cohort"]
+        if raw.get("burn_effort"):
+            meta["burn_effort"] = raw["burn_effort"]
+        _copy_maps(raw, meta, "effort_by_role", "effort_by_pace", "burn_effort_by_role", "family_by_pace")
+        pools[pid] = meta
+        if meta.get("lose_it"):
+            burn.append((meta["seat"], meta.get("burn") or meta["label"], meta["used"], meta["reset"], window))
+    roles = {}
+    for name, raw in (data.get("roles") or {}).items():
+        roles[name] = {
+            "seats": tuple(raw.get("seats") or ()),
+            "primary": raw.get("primary"),
+            "on_unknown": raw.get("on_unknown", "fallthrough"),
+            "under_mode": raw.get("under_mode", "suggest"),
+            "default": dict(raw.get("default") or {}),
+        }
+    POOLS = pools
+    ROLES = roles
+    POOL_ORDER = tuple(pools)
+    BURN_POOLS = tuple(burn)
+    FAMILY_VENDOR = dict(data.get("vendors") or {})
+    _FAMILY_NAME = dict(data.get("family_names") or {})
+    if priors_path is None:
+        priors_path = priors_file()
+    PRIORS = read_priors(priors_path)
+    return data
+
+def _strength_for(pid, role, track):
+    spec = (POOLS[pid].get("strengths") or {}).get(role)
+    if not isinstance(spec, dict):
+        return None
+    provider = spec.get("provider")
+    if isinstance(provider, bool) or not isinstance(provider, (int, float)):
+        provider = None
+    prior = spec.get("prior")
+    if isinstance(prior, bool) or not isinstance(prior, (int, float)):
+        prior = None
+    external = PRIORS.get(pid) or {}
+    if role in external:
+        prior = external[role]
+    if provider is None and prior is None:
+        return None
+    seen = track.get((pid, role)) if track else None
+    tscore, n = (None, 0) if not seen else seen
+    return blend_strength(
+        provider, prior, tscore, n,
+        SCORING.get("provider_pseudo", 8), SCORING.get("prior_pseudo", 8),
+    )
+
+def _ranked(role, track):
+    ranked = []
+    for index, pid in enumerate(POOL_ORDER):
+        fit = _strength_for(pid, role, track)
+        if fit is None:
+            continue
+        ranked.append((fit, index, pid))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    return ranked
+
+def _blockage(pid, states):
+    for gate in POOLS[pid].get("blocked_by") or ():
+        st, why = states.get(gate, ("unknown", "no reading"))
+        if st == "capped":
+            return ("capped", gate, why)
+        if st == "unknown":
+            return ("unknown", gate, why)
+    return None
+
+def _cohort_factor(pid, states):
+    cohort = POOLS[pid].get("cohort")
+    if not cohort:
+        return 1.0
+    members = [p for p, meta in POOLS.items() if meta.get("cohort") == cohort]
+    if len(members) < 2:
+        return 1.0
+    if all(states.get(p, ("unknown", None))[0] == "ahead" for p in members):
+        return SCORING.get("cohort_ahead_factor", 1.0)
+    return 1.0
+
+def _burn_effort(meta, role):
+    by_role = meta.get("burn_effort_by_role")
+    if isinstance(by_role, dict):
+        return by_role.get(role)
+    return meta.get("burn_effort")
+
+def _family_for(meta, pace):
+    return (meta.get("family_by_pace") or {}).get(pace) or meta.get("family")
+
+def _effort_for_score(meta, role, pace, burning):
+    if burning:
+        burn = _burn_effort(meta, role)
+        if burn:
+            return burn
+    by_pace = (meta.get("effort_by_pace") or {}).get(pace)
+    if by_pace:
+        return by_pace
+    by_role = (meta.get("effort_by_role") or {}).get(role)
+    if by_role:
+        return by_role
+    return meta.get("effort", "-")
+
+def _mode_for(role, meta, family, parts):
+    if parts["burning"] and _burn_effort(meta, role):
+        return "burn"
+    default = ROLES[role]["default"]
+    if family != default.get("family"):
+        return "suggest"
+    pace = parts["pace"]
+    if pace == "under":
+        return ROLES[role].get("under_mode", "suggest")
+    if pace in ("ahead", "near_cap"):
+        return "suggest"
+    return "default"
+
+_PACE_WORD = {
+    "under": "under pace",
+    "on": "on pace",
+    "ahead": "ahead of pace",
+    "open": "open",
+    "near_cap": "near hard cap",
+}
+
+def _scored_reason(meta, parts):
+    if parts["burning"] and parts["lose_it"]:
+        head = f"{meta['label']} use-it-or-lose-it"
+    else:
+        head = f"{meta['label']} {_PACE_WORD.get(parts['pace'], parts['pace'])}"
+    return (
+        f"{head}: score {parts['total']:.2f} "
+        f"(fit {parts['fit']:.2f}, headroom {parts['headroom']:.2f}, "
+        f"cost {parts['cost']}, lose-it {parts['lose_it']:.2f})"
+    )
+
+def _ask_label(pid):
+    meta = POOLS[pid]
+    return meta.get("ask_label") or meta["label"]
+
+def _cohort_unknown_ask(role, states, track):
+    """Ask when a cohort has a missing reading and nothing in it is ready to spend.
+
+    An ahead or capped sibling does not excuse the missing one, and a fallback
+    outside the cohort does not either. A member that is under or on pace still
+    wins, in score_route.
+    """
+    cohorts = {}
+    for pid, meta in POOLS.items():
+        cohort = meta.get("cohort")
+        if not cohort or _strength_for(pid, role, track) is None:
+            continue
+        cohorts.setdefault(cohort, []).append(pid)
+    for members in cohorts.values():
+        rows = [(pid, states[pid][0], states[pid][1]) for pid in members]
+        if any(st in ("under", "on", "open") for _pid, st, _why in rows):
+            continue
+        unknown = [(pid, why) for pid, st, why in rows if st == "unknown"]
+        if unknown:
+            pid, why = unknown[0]
+            return _unknown_reason(_ask_label(pid), why)
+    return None
+
+def _unknown_reason(label, why):
+    why = why or "unknown"
+    if why.startswith("reading ") and why.endswith(" old"):
+        return f"{label} {why}: {_ASK}"
+    return f"{label} reading unknown: {_FIX_ASK}"
+
+def _capped_reason(pid, why):
+    reason = f"{_ask_label(pid)} capped: {_ASK}"
+    if isinstance(why, str) and why.startswith("resets "):
+        reason = f"{reason}, {why}"
+    return reason
+
+def _score_parts(pid, role, s, now, states, fit):
+    st, _why = states[pid]
+    if st in ("unknown", "capped"):
+        return None
+    if _blockage(pid, states) is not None:
+        return None
+    headroom = (SCORING.get("headroom") or {}).get(st, 0.9) * _cohort_factor(pid, states)
+    burning = _pool_burning(pid, s, now)
+    lose = (SCORING.get("lose_it_bonus") or 0) if burning else 0.0
+    meta = POOLS[pid]
+    cost = meta.get("cost_tier") or 0
+    harness = (SCORING.get("harness_penalty") or 0) if meta.get("only") else 0.0
+    total = fit * headroom + lose - (SCORING.get("cost_weight") or 0) * cost - harness
+    return {
+        "fit": fit, "headroom": headroom, "cost": cost, "lose_it": lose,
+        "total": total, "pace": st, "burning": burning,
+    }
+
+def _hold_unknown(role, s, now, states):
+    cfg = ROLES[role]
+    if cfg.get("on_unknown") != "hold":
+        return None
+    primary = cfg.get("primary")
+    if primary not in states:
+        return None
+    st, why = states[primary]
+    if st != "unknown":
+        return None
+    block = _blockage(primary, states)
+    if block and block[0] == "capped":
+        return None
+    label = POOLS[primary]["label"]
+    return _row(role, s, now, "default", f"{label}: {why or 'unknown'}")
+
+def _explain_none(ranked, states):
+    last = None
+    for _fit, _index, pid in ranked:
+        st, why = states[pid]
+        block = _blockage(pid, states)
+        if st == "capped" or (block and block[0] == "capped"):
+            last = (pid, why if st == "capped" else (block[2] if block else None))
+            continue
+        if st == "unknown":
+            return _unknown_reason(_ask_label(pid), why)
+        if block and block[0] == "unknown":
+            return _unknown_reason(_ask_label(block[1]), block[2])
+        last = (pid, why)
+    if last:
+        return _capped_reason(last[0], last[1])
+    return "ask Ryan"
+
+def score_route(role, s, now, states=None):
+    """Pick a pool by fit, headroom, cost, and use-it-or-lose-it. No rule table."""
+    if states is None:
+        states = {pid: pool_status(pid, s, now) for pid in POOLS}
+    held = _hold_unknown(role, s, now, states)
+    if held is not None:
+        return held
+    track = read_track()
+    missing = _cohort_unknown_ask(role, states, track)
+    if missing:
+        return _row(role, s, now, "ask", missing)
+    ranked = _ranked(role, track)
+    best = None
+    best_pid = None
+    for fit, _index, pid in ranked:
+        parts = _score_parts(pid, role, s, now, states, fit)
+        if parts is None:
+            continue
+        if best is None or parts["total"] > best["total"]:
+            best = parts
+            best_pid = pid
+    if best is None:
+        return _row(role, s, now, "ask", _explain_none(ranked, states))
+    meta = POOLS[best_pid]
+    family = _family_for(meta, best["pace"])
+    effort = _effort_for_score(meta, role, best["pace"], best["burning"])
+    mode = _mode_for(role, meta, family, best)
+    row = _row(
+        role, s, now, mode, _scored_reason(meta, best),
+        seat=meta["seat"], family=family, effort=effort, variant=meta.get("variant", "-"),
+    )
+    row["reading_age_s"] = _reading_age(best_pid, s, now)
+    return row
+
 
 def _is_number(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -848,17 +1325,18 @@ def pool_status(pool_id, s, now):
     reset = end
     if (meta.get("exhausted") and s.get(meta["exhausted"])) or used >= 100:
         return "capped", None
-    if pool_id == "fable" and used >= NEAR_CAP:
+    for gate in meta.get("gates") or ():
+        gused, greset = s.get(gate.get("used")), s.get(gate.get("reset"))
+        at = gate.get("at", 100)
+        if _is_number(gused) and gused >= at and _is_number(greset) and greset > now:
+            return "capped", _reopen(greset, now)
+    if meta.get("near_cap") and used >= NEAR_CAP:
         return "near_cap", None
     if not meta.get("pace", True):
         return "open", None
     code = pace_code(used, reset, _window(meta, s), now)
     if not code:
         return "unknown", "no used %"
-    if pool_id == "codex":
-        five, five_at = s.get("codex_5h"), s.get("codex_5h_reset_ts")
-        if _is_number(five) and five >= 100 and _is_number(five_at) and five_at > now:
-            return "capped", _reopen(five_at, now)
     return code, None
 
 def _pool_burning(pool_id, s, now):
@@ -893,61 +1371,16 @@ def _has_room(pool_id, states, s):
     used = s.get(POOLS[pool_id]["used"])
     return _is_number(used) and used < NEAR_CAP
 
-def _rule_matches(rule, states, s, now):
-    for pool, expected in rule["when"]:
-        if expected == "burn":
-            if not _pool_burning(pool, s, now):
-                return False
-        elif expected == "not_capped":
-            if states[pool][0] not in ("under", "on", "ahead", "open"):
-                return False
-        elif expected == "room":
-            if not _has_room(pool, states, s):
-                return False
-        elif states[pool][0] != expected:
-            return False
-    return True
-
 def _apply_rule(role, rule, s, now, states):
-    over = {k: rule[k] for k in ("seat", "family", "effort", "variant") if k in rule}
-    reason = rule.get("reason")
-    if reason is None and rule.get("ask_pools"):
-        unknown = [POOLS[p]["label"] for p in rule["ask_pools"] if states[p][0] == "unknown"]
-        capped = [POOLS[p]["label"] for p in rule["ask_pools"] if states[p][0] == "capped"]
-        if unknown:
-            reason = f"{', '.join(unknown)} reading unknown: {_FIX_ASK}"
-        else:
-            reason = f"{', '.join(capped) or 'no fallback'} capped: {_ASK}"
-    if reason and "{pct}" in reason:
-        reason = reason.format(pct=_fmt_pct(s.get(POOLS[ROLES[role]["primary"]]["used"])))
-    notes = [f"{POOLS[p]['label']} reading unknown: fix the failed reading"
-             for p in rule.get("note_unknown") or () if states[p][0] == "unknown"]
-    if notes and reason is not None:
-        reason = reason + "; " + "; ".join(notes)
-    session = states.get("codex", (None, None))[1]
-    names_codex_cap = any(pool == "codex" and expected == "capped" for pool, expected in rule["when"])
-    if names_codex_cap and isinstance(session, str) and session.startswith("resets ") and reason:
-        reason = f"{reason}, {session}"
-    return _row(role, s, now, rule["mode"], reason or "", **over)
+    """Kept so older callers still resolve. The rule argument is ignored."""
+    return score_route(role, s, now, states)
 
 def route(role, s, now):
-    """One role's routing row from a SUMMARY-shaped dict. Pure: does not read the network or the clock."""
-    if role in ("chair", "builder"):
-        return _route_worker(role, s, now)
-    states = {pid: pool_status(pid, s, now) for pid in POOLS}
-    primary = ROLES[role]["primary"]
-    st, why = states[primary]
-    for rule in ROUTE_RULES:
-        if rule["role"] != role:
-            continue
-        if st == "unknown" and any(pool == primary for pool, _expected in rule["when"]):
-            continue
-        if _rule_matches(rule, states, s, now):
-            return _apply_rule(role, rule, s, now, states)
-    if st == "unknown":
-        label = POOLS[primary]["label"]
-        return _row(role, s, now, "default", f"{label}: {why}")
-    return _row(role, s, now, "default", f"{st}: no rule")
+    """One role's routing row from a SUMMARY-shaped dict.
+
+    Does not read the network. Reads local outcome logs when they exist.
+    """
+    return score_route(role, s, now)
 
 def format_route(row):
     age = row.get("reading_age_s")
@@ -1203,15 +1636,10 @@ def refresh(seats):
         _release_lock(lock)
 
 # Vendor is the model provider, not the seat that is billed (Ryan, 2026-10-08).
-FAMILY_VENDOR = {
-    "grok": "xai",
-    "opus": "anthropic",
-    "fable": "anthropic",
-    "astra": "openai",
-    "sol": "openai",
-}
 _VENDOR_NAME = {"xai": "xAI", "anthropic": "Anthropic", "openai": "OpenAI"}
-_FAMILY_NAME = {"fable": "Fable", "astra": "Astra", "grok": "Grok", "opus": "Opus"}
+FAMILY_VENDOR = {}
+_FAMILY_NAME = {}
+load_config()
 
 # Voter effort follows the same burn rule as chair and builder. Grok is on the
 # roster and is excluded when its vendor chairs or builds, and is not seated
@@ -1461,15 +1889,8 @@ def _xai_worker(role, s, now, states):
 
 
 def _route_worker(role, s, now, states=None):
-    """Chair and builder. Same pools, so the two rows cannot disagree on the Grok seat."""
-    if states is None:
-        states = {pid: pool_status(pid, s, now) for pid in POOLS}
-    got = _xai_worker(role, s, now, states)
-    if got is not None:
-        return got
-    kind, _band = _grok_pools(states)
-    prefix = "both Grok pools over pace" if kind == "over" else "both Grok pools capped"
-    return _opus_row(role, s, now, states, prefix)
+    """Chair and builder use the same scorer as every other role."""
+    return score_route(role, s, now, states)
 
 
 def _constrained_worker(family, role, s, now, states):
