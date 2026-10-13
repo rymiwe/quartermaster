@@ -1,0 +1,309 @@
+{
+  "version": 1,
+  "scoring": {
+    "provider_pseudo": 8,
+    "prior_pseudo": 8,
+    "headroom": {
+      "under": 1.0,
+      "on": 0.9,
+      "open": 0.95,
+      "ahead": 0.55,
+      "near_cap": 0.22
+    },
+    "lose_it_bonus": 0.2,
+    "harness_penalty": 0.04,
+    "cost_weight": 0.01,
+    "cohort_ahead_factor": 0.5,
+    "lose_it_hours": 24,
+    "lose_it_gap": 25,
+    "near_cap_pct": 95
+  },
+  "vendors": {
+    "grok": "xai",
+    "grokbot": "xai",
+    "opus": "anthropic",
+    "fable": "anthropic",
+    "astra": "openai",
+    "sol": "openai"
+  },
+  "family_names": {
+    "fable": "Fable",
+    "astra": "Astra",
+    "grok": "Grok",
+    "opus": "Opus"
+  },
+  "roles": {
+    "bounded-question": {
+      "seats": ["claude", "cursor"],
+      "primary": "fable",
+      "on_unknown": "hold",
+      "under_mode": "suggest",
+      "default": {"seat": "claude", "family": "fable", "effort": "-", "variant": "-"}
+    },
+    "hard-bug": {
+      "seats": ["chatgpt"],
+      "primary": "codex",
+      "on_unknown": "hold",
+      "under_mode": "suggest",
+      "default": {"seat": "chatgpt", "family": "astra", "effort": "low", "variant": "-"}
+    },
+    "builder": {
+      "seats": ["cursor", "grok", "claude"],
+      "primary": "cursor_models",
+      "on_unknown": "fallthrough",
+      "under_mode": "default",
+      "default": {"seat": "cursor", "family": "grok", "effort": "high", "variant": "fast"}
+    },
+    "chair": {
+      "seats": ["cursor", "grok", "claude"],
+      "primary": "cursor_models",
+      "on_unknown": "fallthrough",
+      "under_mode": "default",
+      "default": {"seat": "cursor", "family": "grok", "effort": "high", "variant": "fast"}
+    }
+  },
+  "pools": {
+    "claude_5h": {
+      "enabled": true,
+      "seat": "claude",
+      "label": "claude 5h",
+      "ask_label": "Max 5h",
+      "family": "opus",
+      "models": ["opus"],
+      "serves": ["opus", "fable"],
+      "only": [],
+      "cost_tier": 4,
+      "pace": false,
+      "lose_it": false,
+      "variant": "-",
+      "usage": {
+        "used": "claude_5h",
+        "reset": "claude_5h_reset_ts",
+        "window_s": 18000,
+        "as_of": "claude"
+      },
+      "facts": {"context": 200000, "limits": "Max session window", "window": "5h"}
+    },
+    "claude_week": {
+      "enabled": true,
+      "seat": "claude",
+      "label": "claude weekly all",
+      "ask_label": "Max weekly",
+      "family": "opus",
+      "models": ["opus"],
+      "serves": ["opus", "fable"],
+      "only": [],
+      "cost_tier": 4,
+      "pace": true,
+      "lose_it": true,
+      "burn": "weekly all",
+      "blocked_by": ["claude_5h"],
+      "variant": "-",
+      "effort": "-",
+      "effort_by_role": {"builder": "low", "chair": "high", "bounded-question": "-"},
+      "burn_effort_by_role": {"builder": "xhigh", "chair": "xhigh"},
+      "usage": {
+        "used": "claude_week",
+        "reset": "claude_week_reset_ts",
+        "window_s": 604800,
+        "as_of": "claude"
+      },
+      "facts": {"context": 200000, "limits": "Max weekly, all models", "window": "7d"},
+      "strengths": {
+        "bounded-question": {"provider": 0.62, "prior": 0.62},
+        "builder": {"provider": 0.40, "prior": 0.40},
+        "chair": {"provider": 0.40, "prior": 0.40}
+      }
+    },
+    "fable": {
+      "enabled": true,
+      "seat": "claude",
+      "label": "Fable",
+      "family": "fable",
+      "models": ["fable"],
+      "serves": ["fable"],
+      "only": [],
+      "cost_tier": 3,
+      "pace": true,
+      "lose_it": true,
+      "burn": "weekly Fable",
+      "near_cap": true,
+      "blocked_by": ["claude_week", "claude_5h"],
+      "variant": "-",
+      "effort": "-",
+      "burn_effort": "max",
+      "usage": {
+        "used": "fable",
+        "reset": "fable_reset_ts",
+        "window_s": 604800,
+        "as_of": "claude"
+      },
+      "facts": {"context": 200000, "limits": "Max weekly Fable slice", "window": "7d"},
+      "strengths": {
+        "bounded-question": {"provider": 0.90, "prior": 0.90}
+      }
+    },
+    "codex": {
+      "enabled": true,
+      "seat": "chatgpt",
+      "label": "Codex",
+      "ask_label": "ChatGPT",
+      "family": "astra",
+      "models": ["astra", "sol"],
+      "serves": ["astra", "sol"],
+      "only": [],
+      "cost_tier": 3,
+      "pace": true,
+      "lose_it": true,
+      "burn": "weekly",
+      "family_by_pace": {"under": "astra", "on": "astra", "ahead": "sol", "open": "astra", "near_cap": "astra"},
+      "variant": "-",
+      "effort": "low",
+      "effort_by_pace": {"ahead": "-"},
+      "burn_effort": "medium",
+      "gates": [{"used": "codex_5h", "reset": "codex_5h_reset_ts", "at": 100}],
+      "usage": {
+        "used": "codex",
+        "reset": "codex_reset_ts",
+        "window_key": "codex_window_s",
+        "as_of": "chatgpt"
+      },
+      "facts": {"context": 200000, "limits": "ChatGPT weekly, plus a 5h session gate", "window": "weekly"},
+      "strengths": {
+        "hard-bug": {"provider": 0.88, "prior": 0.88}
+      }
+    },
+    "cursor_models": {
+      "enabled": true,
+      "seat": "cursor",
+      "label": "Cursor Models",
+      "family": "grok",
+      "models": ["grok"],
+      "serves": ["grok"],
+      "only": [],
+      "cost_tier": 2,
+      "pace": true,
+      "lose_it": true,
+      "burn": "cursor models (month)",
+      "cohort": "grok-worker",
+      "variant": "fast",
+      "effort": "high",
+      "effort_by_pace": {"ahead": "low"},
+      "burn_effort": "xhigh",
+      "usage": {
+        "used": "cursor_auto_pct",
+        "reset": "cursor_reset_ts",
+        "window_key": "cursor_window_s",
+        "as_of": "cursor"
+      },
+      "facts": {"context": 200000, "limits": "Cursor included models, monthly", "window": "month"},
+      "strengths": {
+        "builder": {"provider": 0.80, "prior": 0.80},
+        "chair": {"provider": 0.80, "prior": 0.80}
+      }
+    },
+    "cursor_other": {
+      "enabled": true,
+      "seat": "cursor",
+      "label": "Other Models",
+      "family": "fable",
+      "models": ["fable"],
+      "serves": ["fable"],
+      "only": [],
+      "cost_tier": 3,
+      "pace": true,
+      "lose_it": true,
+      "burn": "other models (month)",
+      "variant": "-",
+      "effort": "high",
+      "effort_by_role": {"bounded-question": "xhigh"},
+      "burn_effort": "xhigh",
+      "usage": {
+        "used": "cursor_api_pct",
+        "reset": "cursor_reset_ts",
+        "window_key": "cursor_window_s",
+        "as_of": "cursor"
+      },
+      "facts": {"context": 200000, "limits": "Cursor other models, monthly", "window": "month"},
+      "strengths": {
+        "bounded-question": {"provider": 0.25, "prior": 0.25}
+      }
+    },
+    "grokbot": {
+      "enabled": true,
+      "seat": "grokbot",
+      "label": "grokbot",
+      "family": "grokbot",
+      "models": ["grokbot"],
+      "serves": ["grokbot"],
+      "only": [],
+      "cost_tier": 2,
+      "pace": true,
+      "lose_it": true,
+      "burn": "week",
+      "exhausted": "bot_exhausted",
+      "variant": "-",
+      "effort": "-",
+      "usage": {
+        "used": "bot_pct",
+        "reset": "bot_reset_ts",
+        "window_key": "bot_window_s",
+        "as_of": "grokbot"
+      },
+      "facts": {"context": 200000, "limits": "Grok Bot weekly", "window": "7d"}
+    },
+    "grok": {
+      "enabled": true,
+      "seat": "grok",
+      "label": "grok",
+      "family": "grok",
+      "models": ["grok"],
+      "serves": ["grok"],
+      "only": ["grok-build"],
+      "cost_tier": 2,
+      "pace": true,
+      "lose_it": true,
+      "burn": "week",
+      "exhausted": "grok_exhausted",
+      "cohort": "grok-worker",
+      "variant": "-",
+      "effort": "high",
+      "effort_by_pace": {"ahead": "low"},
+      "burn_effort": "xhigh",
+      "usage": {
+        "used": "grok_pct",
+        "reset": "grok_reset_ts",
+        "window_key": "grok_window_s",
+        "as_of": "grok"
+      },
+      "facts": {"context": 200000, "limits": "SuperGrok weekly", "window": "7d"},
+      "strengths": {
+        "builder": {"provider": 0.80, "prior": 0.80},
+        "chair": {"provider": 0.80, "prior": 0.80}
+      }
+    },
+    "muse": {
+      "enabled": false,
+      "seat": "muse",
+      "label": "muse",
+      "family": "muse",
+      "models": ["muse"],
+      "serves": ["muse"],
+      "only": [],
+      "cost_tier": 2,
+      "pace": true,
+      "lose_it": false,
+      "variant": "-",
+      "usage": {
+        "used": "muse_pct",
+        "reset": "muse_reset_ts",
+        "window_s": 604800,
+        "as_of": "muse"
+      },
+      "facts": {"context": null, "limits": "display-only until enabled", "window": "weekly"},
+      "strengths": {
+        "bounded-question": {"provider": 0.50, "prior": 0.50}
+      }
+    }
+  }
+}

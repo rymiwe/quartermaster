@@ -6,7 +6,9 @@ Snapshot of Ryan's "router core": `seat-usage` (reads per-seat/pool usage for Cl
 
 | Path | Role |
 | --- | --- |
-| `bin/seat-usage` | the command (byte-identical to dotfiles `dot_local/bin/executable_seat-usage`) |
+| `bin/seat-usage` | the command |
+| `config/pools.json` | pool records, role defaults, and score weights. Model ids live here |
+| `config/priors.example.json` | shape a weekly job can write as `config/priors.json` |
 | `hooks/seat-route-hook` | Claude Code PreToolUse hook (byte-identical to dotfiles `dot_claude/hooks/executable_seat-route-hook`) |
 | `tests/test_seat_usage.py` | test suite (only the two path constants changed, see Tests) |
 | `renewals.example.json` | placeholder for `~/.config/seat-usage/renewals.json` (same schema, placeholder values) |
@@ -21,6 +23,7 @@ The command name stays `seat-usage`; council hardcodes it. Install locations are
 - `~/.cache/seat-usage/latest.json`
 - `~/.config/seat-usage/renewals.json` (real file is private; see `renewals.example.json`)
 - `~/.local/state/seat-usage/asks.jsonl` and `history.jsonl`
+- `~/.local/state/seat-usage/outcomes.jsonl` (optional track record; `SEAT_USAGE_OUTCOMES`)
 - `~/.local/state/seat-usage/runs.jsonl` is written only by council's `council.sh`, not by this code. Override with `SEAT_USAGE_RUNS`.
 
 ## Claude Code registration (owned by dotfiles)
@@ -74,7 +77,7 @@ The check does not stash, reset, or overwrite local changes. A dirty tree, a bra
 - WSL/Windows assumptions, including the `op.exe` WinGet path (`$SEAT_USAGE_OP` overrides).
 - 1Password item path `op://claude/grok web cookie/credential`.
 - Fixed Thursday 5:38 PM PT fallback for the Grok reset.
-- `ROUTE_RULES` encode dated decisions by Ryan.
+- Council lineup and host order still name families in code. Launch routing does not.
 - The hook's role mapping depends on specific command shapes.
 
 ## Provenance
@@ -123,6 +126,64 @@ At snapshot time this printed `69 passed, 0 failed`. The only change from the do
 ## Not in this repo
 
 The status lines (`statusline.py`, `statusline.sh`), `grok-bot-machines`, `grok-engine`, `settings.json` and council handoffs/docs remain in dotfiles or council.
+
+## Routing
+
+`seat-usage --route` still prints one line per role:
+
+```
+route: <role> | <seat> | <family> | <effort> | <variant> | <mode> | <reason> | reading <age>
+```
+
+The reason names the winning pool and the score. JSON rows keep the same keys.
+
+Pools, the models they serve, cost tier, and how headroom is read (`usage.used`, `usage.reset`, `usage.window_s` or `usage.window_key`) live in `config/pools.json`. A pool with `"enabled": false` is not routed. Muse is in that file and disabled. Turning it on does not by itself add a usage reader.
+
+For each enabled pool and role the score is:
+
+```
+total = fit * headroom + lose_it - cost_weight * cost_tier - harness_penalty
+```
+
+`headroom` comes from the pace band (under, on, ahead, open, near cap). `lose_it` is the old burn nudge, applied to every pool that sets `lose_it`: the reset is inside `lose_it_hours` and used percent is at least `lose_it_gap` points below the elapsed percent. A non-empty `only` list pays `harness_penalty`, so a harness kept for one job is not the default spend. When every pool in a `cohort` is ahead, `cohort_ahead_factor` multiplies headroom again so a fallback outside the cohort can win. A cohort with a missing reading and nothing under or on pace asks, instead of skipping to that fallback.
+
+`fit` blends three fields stored separately for each pool and role:
+
+```
+effective = (P * provider + R * prior + n * track) / (P + R + n)
+```
+
+`provider` is the owner's reading of the facts in config (cost tier, limits, window, context). `prior` is the external seed. `track` is the agreement rate from local outcome logs, and `n` is how many of those samples named that pool and role. `P` and `R` are `provider_pseudo` and `prior_pseudo` (both 8). A missing source is left out of the fraction, so it is not a zero. At `n = 0` the fit is the mean of the seeds that exist. At `n = 16` the track record weighs as much as those two seeds together. Larger `n` lets our own data outweigh the prior.
+
+There is no fetcher. A weekly job may write `config/priors.json`, or the path in `SEAT_USAGE_PRIORS`, in the shape of `config/priors.example.json`. A number or `{"score", "samples", "source"}` overrides that pool's prior for that role. `samples` and `source` are notes for the job. The router uses `score` only.
+
+Track records are JSON lines. `SEAT_USAGE_OUTCOMES` defaults to `~/.local/state/seat-usage/outcomes.jsonl`. `SEAT_USAGE_CONCLAVE` defaults to `~/.local/state/conclave/outcomes.jsonl`. A missing file is skipped. Each line is either `{"role", "pool", "agreed"}` or a verdict `{"role", "votes": [{"pool", "agreed", "role"?}]}`. `agreed` true counts as 1 and false as 0. The track score is the mean. A bad line is ignored.
+
+A copied script with no `config/pools.json` beside it still prints usage. Routing then has no pools to score.
+
+### Parity
+
+Seat, family, mode, and effort match the old rule table on the cases the suite already named. The reason text is the score, which is the intentional difference. Two ask phrases got shorter. One untested corner does not match, and is called out at the bottom.
+
+| Scenario | Old | New |
+| --- | --- | --- |
+| Fable under / on pace | Fable, suggest / default | same; reason cites the score |
+| Fable ahead, weekly pool under | Opus on Max, suggest, effort `-` | same |
+| Fable slice capped, Max open | Opus, suggest | same |
+| Max weekly or 5h capped, Other Models open | Cursor Fable, suggest, xhigh | same |
+| Other Models capped or unreadable | ask, default Fable seat | same ask phrases |
+| Fable reading missing, Max open | default Fable, mode default | same |
+| Codex under / on / ahead | Astra low, Astra low, Sol | same |
+| Codex capped, including a full 5h window | ask, names the reopen | same |
+| Codex or Fable in the lose-it band | burn, medium / max | same, for every such pool |
+| Cursor Models under, or both Grok pools on | Cursor Grok, high, fast | same |
+| Cursor on pace, SuperGrok under | SuperGrok | same |
+| Cursor capped, SuperGrok open | SuperGrok | same |
+| SuperGrok in the lose-it band | SuperGrok, burn, xhigh | same |
+| Both Grok pools ahead, or both capped, Max open | Opus; chair high, builder low | same |
+| SuperGrok reading missing, Cursor capped | ask | same phrase |
+| Both Grok pools and Max weekly capped | ask | ask, phrase is now `Max weekly capped: ask Ryan` |
+| Fable and the weekly pool both ahead | Opus (the ahead rule did not look at the weekly pace) | Fable keeps the seat. Its fit is higher and both bands match. Not covered by the old tests |
 
 ## Usage/routing seam
 

@@ -149,12 +149,12 @@ def fable_under_on_ahead():
     under = su.route("bounded-question", snap(fable=10), NOW)
     assert under["mode"] == "suggest" and under["family"] == "fable" and under["seat"] == "claude", under
     assert under["effort"] == "-" and under["variant"] == "-", under
-    assert under["reason"] == "Fable under pace: bounded shot to Fable (Pace rule)", under
+    assert under["reason"] == "Fable under pace: score 0.87 (fit 0.90, headroom 1.00, cost 3, lose-it 0.00)", under
     on = su.route("bounded-question", snap(fable=57), NOW)
     assert on["mode"] == "default" and on["family"] == "fable" and on["effort"] == "-", on
     ahead = su.route("bounded-question", snap(fable=80), NOW)
     assert ahead["mode"] == "suggest" and ahead["family"] == "opus" and ahead["seat"] == "claude", ahead
-    assert ahead["reason"] == "Fable ahead of pace: judgment shot to Opus (Pace rule)", ahead
+    assert ahead["reason"] == "claude weekly all under pace: score 0.58 (fit 0.62, headroom 1.00, cost 4, lose-it 0.00)", ahead
     assert su.pace_code(10, NOW + 3 * 86400, WEEK, NOW) == "under"
     assert su.pace_code(57, NOW + 3 * 86400, WEEK, NOW) == "on"
     assert su.pace_code(80, NOW + 3 * 86400, WEEK, NOW) == "ahead"
@@ -164,13 +164,13 @@ def fable_under_on_ahead():
 def codex_under_on_ahead():
     under = su.route("hard-bug", snap(codex=10), NOW)
     assert under["mode"] == "suggest" and under["family"] == "astra" and under["effort"] == "low", under
-    assert under["reason"] == "Codex under pace: hard ticket to Astra (Pace rule)", under
+    assert under["reason"] == "Codex under pace: score 0.85 (fit 0.88, headroom 1.00, cost 3, lose-it 0.00)", under
     on = su.route("hard-bug", snap(codex=57), NOW)
     assert on["mode"] == "default" and on["family"] == "astra" and on["effort"] == "low", on
     ahead = su.route("hard-bug", snap(codex=80), NOW)
     assert ahead["mode"] == "suggest" and ahead["family"] == "sol" and ahead["effort"] == "-", ahead
     assert ahead["seat"] == "chatgpt", ahead
-    assert ahead["reason"] == "Codex ahead of pace: Sol where it can do the job (Pace rule)", ahead
+    assert ahead["reason"] == "Codex ahead of pace: score 0.45 (fit 0.88, headroom 0.55, cost 3, lose-it 0.00)", ahead
 
 
 @test
@@ -179,14 +179,14 @@ def builder_spends_the_under_pool_and_keeps_cursor_when_both_are_on():
     under = su.route("builder", snap(cursor_auto_pct=15), NOW)
     assert under["mode"] == "default" and under["seat"] == "cursor" and under["family"] == "grok", under
     assert under["effort"] == "high" and under["variant"] == "fast", under
-    assert under["reason"] == "Grok on Cursor: Cursor Models under pace", under
+    assert under["reason"] == "Cursor Models under pace: score 0.78 (fit 0.80, headroom 1.00, cost 2, lose-it 0.00)", under
     assert under["reading_age_s"] == 0, under
     moved = su.route("builder", snap(cursor_auto_pct=50), NOW)
     assert moved["seat"] == "grok" and moved["variant"] == "-" and moved["effort"] == "high", moved
-    assert moved["reason"] == "Grok on SuperGrok: grok under pace", moved
+    assert moved["reason"] == "grok under pace: score 0.74 (fit 0.80, headroom 1.00, cost 2, lose-it 0.00)", moved
     both_on = su.route("builder", snap(cursor_auto_pct=50, grok_pct=57), NOW)
     assert both_on["mode"] == "default" and both_on["seat"] == "cursor" and both_on["variant"] == "fast", both_on
-    assert both_on["reason"] == "Grok on Cursor: Cursor Models on pace", both_on
+    assert both_on["reason"] == "Cursor Models on pace: score 0.70 (fit 0.80, headroom 0.90, cost 2, lose-it 0.00)", both_on
     ahead = su.route("builder", snap(cursor_auto_pct=80), NOW)
     assert ahead["seat"] == "grok" and ahead["effort"] == "high" and ahead["mode"] == "default", ahead
     chair = su.route("chair", snap(cursor_auto_pct=15), NOW)
@@ -200,14 +200,14 @@ def fable_capped_goes_to_opus_on_max():
     r = su.route("bounded-question", snap(fable=100, claude_week=10, claude_5h=10), NOW)
     assert r["mode"] == "suggest" and r["seat"] == "claude" and r["family"] == "opus", r
     assert r["effort"] == "-" and r["variant"] == "-", r
-    assert r["reason"] == "Fable slice capped: Opus on Max (Overflow crosses seats)", r
+    assert r["reason"] == "claude weekly all under pace: score 0.58 (fit 0.62, headroom 1.00, cost 4, lose-it 0.00)", r
 
 
 @test
 def max_capped_goes_to_cursor_fable():
     week = su.route("bounded-question", snap(fable=100, claude_week=100, claude_5h=10, cursor_api_pct=10), NOW)
     assert week["mode"] == "suggest" and week["seat"] == "cursor" and week["family"] == "fable", week
-    assert week["reason"] == "Max capped: Cursor Fable on Other Models", week
+    assert week["reason"] == "Other Models under pace: score 0.22 (fit 0.25, headroom 1.00, cost 3, lose-it 0.00)", week
     session = su.route("bounded-question", snap(fable=100, claude_week=10, claude_5h=100, cursor_api_pct=10), NOW)
     assert session["mode"] == "suggest" and session["seat"] == "cursor" and session["family"] == "fable", session
     blocked = su.route("bounded-question", snap(fable=100, claude_week=100, cursor_api_pct=100), NOW)
@@ -237,11 +237,11 @@ def builder_cursor_capped_uses_supergrok_until_that_pool_is_capped_too():
     ok = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_week=10, claude_5h=10), NOW)
     assert ok["mode"] == "suggest" and ok["seat"] == "claude" and ok["family"] == "opus", ok
     assert ok["effort"] == "low" and ok["variant"] == "-", ok
-    assert ok["reason"] == "both Grok pools capped: Opus at low on Max", ok
+    assert ok["reason"] == "claude weekly all under pace: score 0.36 (fit 0.40, headroom 1.00, cost 4, lose-it 0.00)", ok
     blocked = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_week=100, claude_5h=10), NOW)
     assert blocked["mode"] == "ask" and blocked["seat"] == "cursor" and blocked["family"] == "grok", blocked
     assert blocked["effort"] == "high" and blocked["variant"] == "fast", blocked
-    assert blocked["reason"] == "both Grok pools capped and Max capped: ask Ryan", blocked
+    assert blocked["reason"] == "Max weekly capped: ask Ryan", blocked
     unknown = snap(cursor_auto_pct=100, grok_pct=100, claude_5h=10)
     del unknown["claude_week"]
     u = su.route("builder", unknown, NOW)
@@ -263,7 +263,7 @@ def chair_uses_supergrok_when_cursor_is_capped_and_opus_only_when_both_are_dead(
     assert native["effort"] == "high" and native["variant"] == "-", native
     none = su.route("chair", snap(cursor_auto_pct=100, grok_pct=100, claude_week=100, claude_5h=100), NOW)
     assert none["mode"] == "ask" and none["seat"] == "cursor", none
-    assert none["reason"] == "both Grok pools capped and Max capped: ask Ryan", none
+    assert none["reason"] == "Max weekly capped: ask Ryan", none
 
 
 @test
@@ -453,10 +453,10 @@ def f1_unknown_fable_still_overflows_capped_max():
     del week["fable"]
     r = su.route("bounded-question", week, NOW)
     assert r["mode"] == "suggest" and r["seat"] == "cursor" and r["family"] == "fable", r
-    assert r["reason"] == "Max capped: Cursor Fable on Other Models", r
+    assert r["reason"] == "Other Models under pace: score 0.22 (fit 0.25, headroom 1.00, cost 3, lose-it 0.00)", r
     session = snap(claude_5h=100, cursor_api_pct=31, fable_reset_ts=NOW)
     r = su.route("bounded-question", session, NOW)
-    assert r["mode"] == "suggest" and r["reason"] == "Max capped: Cursor Fable on Other Models", r
+    assert r["mode"] == "suggest" and r["reason"] == "Other Models under pace: score 0.22 (fit 0.25, headroom 1.00, cost 3, lose-it 0.00)", r
     ask = snap(claude_week=100, cursor_api_pct=100, fable_reset_ts=NOW)
     r = su.route("bounded-question", ask, NOW)
     assert r["mode"] == "ask" and r["reason"] == "Other Models capped: ask Ryan", r
@@ -488,7 +488,7 @@ def f3_chair_asks_when_the_grok_reading_is_missing():
     capped = su.route("chair", snap(cursor_auto_pct=100, grok_pct=100, claude_week=10, claude_5h=10), NOW)
     assert capped["mode"] == "suggest" and capped["seat"] == "claude" and capped["family"] == "opus", capped
     assert capped["effort"] == "high", capped
-    assert capped["reason"] == "both Grok pools capped: Opus on Max at high", capped
+    assert capped["reason"] == "claude weekly all under pace: score 0.36 (fit 0.40, headroom 1.00, cost 4, lose-it 0.00)", capped
     same = su.route_lineup(snap(cursor_auto_pct=100, grok_pct=100, claude_week=10, claude_5h=10), NOW)
     assert same["lineup"]["chair"]["effort"] == capped["effort"] == "high", same
     assert same["lineup"]["builder"]["effort"] == "low", same
@@ -500,7 +500,7 @@ def f4_zero_5h_without_reset_is_open():
     r = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_5h=0, claude_5h_reset_ts=None), NOW)
     assert r["mode"] == "suggest", r
     assert r["seat"] == "claude" and r["family"] == "opus" and r["effort"] == "low", r
-    assert r["reason"] == "both Grok pools capped: Opus at low on Max", r
+    assert r["reason"] == "claude weekly all under pace: score 0.36 (fit 0.40, headroom 1.00, cost 4, lose-it 0.00)", r
     past = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_5h=0, claude_5h_reset_ts=NOW - 1), NOW)
     assert past["mode"] == "ask" and "Max 5h reading unknown" in past["reason"], past
     used = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_5h=1, claude_5h_reset_ts=None), NOW)
@@ -793,10 +793,10 @@ mod.full_run(quiet=True, timeout=0)
 def cursor_fable_overflow_effort_xhigh():
     week = su.route("bounded-question", snap(fable=100, claude_week=100, claude_5h=10, cursor_api_pct=10), NOW)
     assert week["seat"] == "cursor" and week["family"] == "fable" and week["effort"] == "xhigh", week
-    assert week["reason"] == "Max capped: Cursor Fable on Other Models", week
+    assert week["reason"] == "Other Models under pace: score 0.22 (fit 0.25, headroom 1.00, cost 3, lose-it 0.00)", week
     session = su.route("bounded-question", snap(fable=100, claude_week=10, claude_5h=100, cursor_api_pct=10), NOW)
     assert session["seat"] == "cursor" and session["family"] == "fable" and session["effort"] == "xhigh", session
-    assert session["reason"] == "Max capped: Cursor Fable on Other Models", session
+    assert session["reason"] == "Other Models under pace: score 0.22 (fit 0.25, headroom 1.00, cost 3, lose-it 0.00)", session
 
 
 _PROFILE_OK = json.dumps({
@@ -1588,7 +1588,7 @@ def host_both_ahead_suggests_the_bot_and_names_over_pace():
 
 UNDER_HARD_BUG = (
     "route: hard-bug | chatgpt | astra | low | - | suggest | "
-    "Codex under pace: hard ticket to Astra (Pace rule) | reading 0m\n"
+    "Codex under pace: score 0.85 (fit 0.88, headroom 1.00, cost 3, lose-it 0.00) | reading 0m\n"
 )
 
 
@@ -1932,6 +1932,133 @@ def full_run_prints_muse_and_leaves_it_out_of_the_cache():
             su.CACHE, su.CACHE_DIR, su.SUMMARY, su.muse_usage_path = old
             for name, fn in saved.items():
                 setattr(su, name, fn)
+
+
+@test
+def blend_lets_track_outweigh_the_prior():
+    # n = 0 keeps the mean of the seeds. A track value with n = 0 does not count.
+    assert abs(su.blend_strength(0.8, 0.4, None, 0) - 0.6) < 1e-9
+    assert abs(su.blend_strength(0.8, 0.4, 1.0, 0) - 0.6) < 1e-9
+    # (8 * 0.8 + 8 * 0.4 + 80 * 1) / 96. The track record is most of the weight.
+    got = su.blend_strength(0.8, 0.4, 1.0, 80)
+    assert abs(got - (89.6 / 96)) < 1e-9, got
+    assert got > 0.9
+    # A missing prior is omitted. It is not a zero.
+    assert su.blend_strength(0.5, None, None, 0) == 0.5
+    assert su.blend_strength(None, None, None, 0) is None
+
+
+@test
+def track_reader_ignores_a_missing_file_and_counts_agreement():
+    assert su.read_track(["/no/such/outcomes.jsonl"]) == {}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "outcomes.jsonl")
+        with open(path, "w") as f:
+            f.write('{"role": "builder", "pool": "spare", "agreed": true}\n')
+            f.write('{"role": "builder", "pool": "spare", "agreed": false}\n')
+            f.write("not json\n\n")
+            f.write('{"role": "lineup", "votes": [{"pool": "fable", "agreed": true}, {"pool": "codex", "agreed": false}]}\n')
+        got = su.read_track([path])
+    assert got[("spare", "builder")] == (0.5, 2), got
+    assert got[("fable", "lineup")] == (1.0, 1), got
+    assert got[("codex", "lineup")] == (0.0, 1), got
+
+
+@test
+def prior_file_overrides_the_pool_seed():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "priors.json")
+        with open(path, "w") as f:
+            json.dump({
+                "version": 1,
+                "scores": {"fable": {"bounded-question": {"score": 0.0, "samples": 3, "source": "test"}}},
+            }, f)
+        try:
+            su.load_config(priors_path=path)
+            assert su.PRIORS["fable"]["bounded-question"] == 0.0
+            blended = su.blend_strength(0.9, 0.0, None, 0)
+            assert abs(blended - 0.45) < 1e-9, blended
+            moved = su.route("bounded-question", snap(fable=10), NOW)
+            assert moved["family"] == "opus", moved
+        finally:
+            su.load_config()
+    restored = su.route("bounded-question", snap(fable=10), NOW)
+    assert restored["family"] == "fable", restored
+
+
+@test
+def local_outcomes_move_a_route_once_the_sample_count_grows():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "outcomes.jsonl")
+        with open(path, "w") as f:
+            for _ in range(80):
+                f.write('{"role": "builder", "pool": "cursor_models", "agreed": false}\n')
+        old = os.environ.get("SEAT_USAGE_OUTCOMES")
+        os.environ["SEAT_USAGE_OUTCOMES"] = path
+        try:
+            moved = su.route("builder", snap(), NOW)
+            assert moved["seat"] == "grok", moved
+        finally:
+            if old is None:
+                os.environ.pop("SEAT_USAGE_OUTCOMES", None)
+            else:
+                os.environ["SEAT_USAGE_OUTCOMES"] = old
+    restored = su.route("builder", snap(), NOW)
+    assert restored["seat"] == "cursor", restored
+
+
+@test
+def a_pool_added_only_in_config_can_win():
+    assert "Spare" not in BIN.read_text()
+    with tempfile.TemporaryDirectory() as d:
+        src = json.loads(Path(su.pools_file()).read_text())
+        src["pools"]["spare"] = {
+            "enabled": True,
+            "seat": "cursor",
+            "label": "Spare",
+            "family": "grok",
+            "models": ["spare-model"],
+            "serves": ["grok"],
+            "only": [],
+            "cost_tier": 1,
+            "pace": True,
+            "lose_it": False,
+            "variant": "fast",
+            "effort": "high",
+            "usage": {
+                "used": "cursor_auto_pct",
+                "reset": "cursor_reset_ts",
+                "window_key": "cursor_window_s",
+                "as_of": "cursor",
+            },
+            "facts": {"context": 1000, "limits": "test pool", "window": "month"},
+            "strengths": {
+                "builder": {"provider": 0.99, "prior": 0.99},
+                "chair": {"provider": 0.99, "prior": 0.99},
+            },
+        }
+        path = os.path.join(d, "pools.json")
+        Path(path).write_text(json.dumps(src))
+        try:
+            su.load_config(pools_path=path)
+            assert "spare" in su.POOLS and "muse" not in su.POOLS
+            routed = su.route("builder", snap(), NOW)
+            assert routed["seat"] == "cursor" and routed["family"] == "grok", routed
+            assert routed["reason"].startswith("Spare under pace: score "), routed
+            assert "fit 0.99" in routed["reason"], routed
+        finally:
+            su.load_config()
+    restored = su.route("builder", snap(), NOW)
+    assert restored["reason"].startswith("Cursor Models under pace:"), restored
+
+
+@test
+def disabled_pool_is_config_only():
+    raw = json.loads(Path(su.pools_file()).read_text())
+    assert raw["pools"]["muse"]["enabled"] is False
+    assert "muse" not in su.POOLS
+    assert "muse" not in su.ROLES
+    assert "muse" not in su.ROUTE_RULES
 
 
 def main():
