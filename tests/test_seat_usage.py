@@ -2101,6 +2101,52 @@ def disabled_pool_is_config_only():
     assert "muse" not in su.ROUTE_RULES
 
 
+@test
+def grok_cookie_reads_seat_usage_op_ref():
+    old_ref = os.environ.get("SEAT_USAGE_OP_REF")
+    old_op = os.environ.get("SEAT_USAGE_OP")
+    os.environ.pop("SEAT_USAGE_OP_REF", None)
+    assert su.op_ref() == "op://claude/grok web cookie/credential"
+    os.environ["SEAT_USAGE_OP_REF"] = ""
+    assert su.op_ref() == "op://claude/grok web cookie/credential"
+    seen = {}
+
+    def which(name):
+        return "/tmp/fake-op" if name == "op.exe" else None
+
+    class Result:
+        returncode = 0
+        stdout = "sso-cookie\r\n"
+
+    def run(cmd, capture_output, text, timeout):
+        seen["cmd"] = cmd
+        return Result()
+
+    import shutil
+    import subprocess as sp
+    old_which, old_run = shutil.which, sp.run
+    old_tried = list(su.COOKIE_TRIED)
+    os.environ["SEAT_USAGE_OP_REF"] = "op://other/item/credential"
+    os.environ.pop("SEAT_USAGE_OP", None)
+    shutil.which, sp.run = which, run
+    su.COOKIE_TRIED = []
+    try:
+        assert su.op_ref() == "op://other/item/credential"
+        assert su.grok_cookie() == "sso-cookie"
+        assert seen["cmd"] == ["/tmp/fake-op", "read", "op://other/item/credential"], seen
+    finally:
+        shutil.which, sp.run = old_which, old_run
+        su.COOKIE_TRIED[:] = old_tried
+        if old_ref is None:
+            os.environ.pop("SEAT_USAGE_OP_REF", None)
+        else:
+            os.environ["SEAT_USAGE_OP_REF"] = old_ref
+        if old_op is None:
+            os.environ.pop("SEAT_USAGE_OP", None)
+        else:
+            os.environ["SEAT_USAGE_OP"] = old_op
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:

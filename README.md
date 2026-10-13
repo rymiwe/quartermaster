@@ -75,7 +75,7 @@ The check does not stash, reset, or overwrite local changes. A dirty tree, a bra
 
 - Hardcoded paths (see contract above).
 - WSL/Windows assumptions, including the `op.exe` WinGet path (`$SEAT_USAGE_OP` overrides).
-- 1Password item path `op://claude/grok web cookie/credential`.
+- 1Password item path defaults to `op://claude/grok web cookie/credential` (`$SEAT_USAGE_OP_REF` overrides).
 - Fixed Thursday 5:38 PM PT fallback for the Grok reset.
 - Council lineup and host order still name families in code. Launch routing does not.
 - The hook's role mapping depends on specific command shapes.

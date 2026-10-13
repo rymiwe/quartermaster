@@ -503,12 +503,16 @@ def grok_bot(tok):
     except Exception as e:
         return f"grokbot  | usage failed: {e.__class__.__name__}"
 
-OP_REF = "op://claude/grok web cookie/credential"
+DEFAULT_OP_REF = "op://claude/grok web cookie/credential"
 COOKIE_TRIED = []   # why each cookie source failed, for the grok line
 
+def op_ref():
+    return os.environ.get("SEAT_USAGE_OP_REF") or DEFAULT_OP_REF
+
 def grok_cookie():
-    """The grok.com browser 'sso' cookie. 1Password first (service account, claude
-    vault, item 'grok web cookie', field 'credential'), then ~/.grok/web-cookie.
+    """The grok.com browser 'sso' cookie. 1Password first (`op read` of
+    $SEAT_USAGE_OP_REF, default op://claude/grok web cookie/credential),
+    then ~/.grok/web-cookie.
     The op binary is found by name: $SEAT_USAGE_OP if set, else op.exe (Windows
     1Password from WSL), else op. The first one that returns a value wins.
     Hooks and the status line's background refresh can run without the Windows
@@ -521,7 +525,7 @@ def grok_cookie():
         if not path:
             COOKIE_TRIED.append(f"{name} not on PATH"); continue
         try:
-            r = subprocess.run([path, "read", OP_REF], capture_output=True, text=True, timeout=20)
+            r = subprocess.run([path, "read", op_ref()], capture_output=True, text=True, timeout=20)
             v = r.stdout.replace("\r", "").strip()
             if r.returncode == 0 and v: return v
             COOKIE_TRIED.append(f"{name} read failed")
@@ -625,7 +629,7 @@ def grok():
     SUMMARY["grok_402_h"] = round((NOW - last402) / 3600, 1) if last402 else None
     parts = [f"{tier} {status}".strip() + (f", sub {'ends' if cancels else 'renews'} {when(iso_to_ts(expiry)).replace('resets ', '')}" if expiry else "")]
     if weekly is None:
-        parts.append("weekly pool needs the browser sso cookie (1Password item 'grok web cookie', claude vault, field credential): " + "; ".join(COOKIE_TRIED))
+        parts.append(f"weekly pool needs the browser sso cookie ({op_ref()}): " + "; ".join(COOKIE_TRIED))
     elif "error" in weekly:
         parts.append(f"weekly pool read failed with cookie: {weekly['error']}")
     elif "grok_pct" in SUMMARY:
