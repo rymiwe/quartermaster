@@ -1,0 +1,4 @@
+{"ts":1,"role":"builder","verdict":"ship","seats":[{"seat":"cursor","family":"grok","agreed":true},{"seat":"grok","family":"grok","agreed":false},{"seat":"claude","family":"fable","role":"voter","agreed":true},{"seat":"chatgpt","family":"astra","agreed_with_verdict":false}]}
+{"role":"chair","lineup":{"chair":{"seat":"cursor","family":"grok","agreed":false},"builder":{"seat":"grok","family":"grok","role":"builder","agreed":true},"voters":[{"seat":"claude","family":"opus","agreed":true}]}}
+not a run record
+

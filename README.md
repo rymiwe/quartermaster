@@ -23,8 +23,8 @@ The command name stays `seat-usage`; council hardcodes it. Install locations are
 - `~/.cache/seat-usage/latest.json`
 - `~/.config/seat-usage/renewals.json` (real file is private; see `renewals.example.json`)
 - `~/.local/state/seat-usage/asks.jsonl` and `history.jsonl`
-- `~/.local/state/seat-usage/outcomes.jsonl` (optional track record; `SEAT_USAGE_OUTCOMES`)
-- `~/.local/state/seat-usage/runs.jsonl` is written only by council's `council.sh`, not by this code. Override with `SEAT_USAGE_RUNS`.
+- `~/.local/state/seat-usage/outcomes.jsonl` (optional extra track record; `SEAT_USAGE_OUTCOMES`)
+- `~/.local/state/seat-usage/runs.jsonl` is council's run log. This command reads it and does not write it. Override with `SEAT_USAGE_RUNS`.
 
 ## Claude Code registration (owned by dotfiles)
 
@@ -157,7 +157,7 @@ effective = (P * provider + R * prior + n * track) / (P + R + n)
 
 There is no fetcher. A weekly job may write `config/priors.json`, or the path in `SEAT_USAGE_PRIORS`, in the shape of `config/priors.example.json`. A number or `{"score", "samples", "source"}` overrides that pool's prior for that role. `samples` and `source` are notes for the job. The router uses `score` only.
 
-Track records are JSON lines. `SEAT_USAGE_OUTCOMES` defaults to `~/.local/state/seat-usage/outcomes.jsonl`. `SEAT_USAGE_CONCLAVE` defaults to `~/.local/state/conclave/outcomes.jsonl`. A missing file is skipped. Each line is either `{"role", "pool", "agreed"}` or a verdict `{"role", "votes": [{"pool", "agreed", "role"?}]}`. `agreed` true counts as 1 and false as 0. The track score is the mean. A bad line is ignored.
+Track records are JSON lines. Council's run log is `~/.local/state/seat-usage/runs.jsonl` (`SEAT_USAGE_RUNS`). A missing file is skipped. A run line has the task `role` and seat agreement in `seats`, `votes`, or `lineup` (chair, builder, voters). `agreed` or `agreed_with_verdict` is whether that seat matched the verdict. A seat is `seat` plus `family` (or `model`), or a `pool` id. A voter inherits the task role. `SEAT_USAGE_OUTCOMES` is an extra log of `{role, pool, agreed}` lines. `agreed` true counts as 1 and false as 0. The track score is the mean. A bad line is ignored.
 
 A copied script with no `config/pools.json` beside it still prints usage. Routing then has no pools to score.
 

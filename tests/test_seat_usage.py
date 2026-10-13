@@ -1948,6 +1948,46 @@ def blend_lets_track_outweigh_the_prior():
     assert su.blend_strength(None, None, None, 0) is None
 
 
+RUNS_FIXTURE = HERE / "fixtures" / "conclave" / "runs.jsonl"
+
+
+@test
+def conclave_runs_fixture_counts_seat_agreement():
+    assert not Path("/no/such/conclave/runs.jsonl").exists()
+    assert su.read_track(["/no/such/conclave/runs.jsonl"]) == {}
+    got = su.read_track([str(RUNS_FIXTURE)])
+    assert got[("cursor_models", "builder")] == (1.0, 1), got
+    assert got[("grok", "builder")] == (0.5, 2), got
+    assert got[("fable", "builder")] == (1.0, 1), got
+    assert got[("codex", "builder")] == (0.0, 1), got
+    assert got[("cursor_models", "chair")] == (0.0, 1), got
+    assert got[("claude_week", "chair")] == (1.0, 1), got
+    assert ("claude_5h", "chair") not in got, got
+
+
+@test
+def conclave_runs_log_can_move_a_route():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "runs.jsonl")
+        line = (
+            '{"role":"builder","seats":[{"seat":"cursor","family":"grok","agreed":false}]}\n'
+        )
+        with open(path, "w") as f:
+            f.write(line * 80)
+        old = os.environ.get("SEAT_USAGE_RUNS")
+        os.environ["SEAT_USAGE_RUNS"] = path
+        try:
+            moved = su.route("builder", snap(), NOW)
+            assert moved["seat"] == "grok", moved
+        finally:
+            if old is None:
+                os.environ.pop("SEAT_USAGE_RUNS", None)
+            else:
+                os.environ["SEAT_USAGE_RUNS"] = old
+    restored = su.route("builder", snap(), NOW)
+    assert restored["seat"] == "cursor", restored
+
+
 @test
 def track_reader_ignores_a_missing_file_and_counts_agreement():
     assert su.read_track(["/no/such/outcomes.jsonl"]) == {}

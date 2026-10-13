@@ -741,18 +741,20 @@ def priors_file():
     return path if os.path.isfile(path) else None
 
 def outcomes_files():
-    """Local track-record logs. Missing files are not an error.
+    """Local track-record logs. A missing file is not an error.
 
-    Default lines are {role, pool, agreed}. A Conclave verdict may instead carry
-    votes: [{pool, agreed, role?}]. SEAT_USAGE_OUTCOMES and SEAT_USAGE_CONCLAVE
-    override the two default paths.
+    Council writes ~/.local/state/seat-usage/runs.jsonl (SEAT_USAGE_RUNS).
+    Each run line carries the task role and seat agreement: a seats list, or
+    the lineup's chair, builder, and voters. agreed is whether that seat
+    matched the verdict. SEAT_USAGE_OUTCOMES is an extra log of
+    {role, pool, agreed} lines.
     """
     home = os.path.expanduser("~")
     outcomes = os.environ.get("SEAT_USAGE_OUTCOMES") or os.path.join(
         home, ".local", "state", "seat-usage", "outcomes.jsonl")
-    conclave = os.environ.get("SEAT_USAGE_CONCLAVE") or os.path.join(
-        home, ".local", "state", "conclave", "outcomes.jsonl")
-    return (outcomes, conclave)
+    runs = os.environ.get("SEAT_USAGE_RUNS") or os.path.join(
+        home, ".local", "state", "seat-usage", "runs.jsonl")
+    return (outcomes, runs)
 
 def blend_strength(provider, prior, track, n, provider_pseudo=8, prior_pseudo=8):
     """Blend provider facts, an external prior, and our own track record.
@@ -822,12 +824,80 @@ def _absorb_sample(samples, role, pool, agreed):
         return
     samples.setdefault((pool, role), []).append(1.0 if agreed else 0.0)
 
+def _agreement(obj):
+    """True when this seat matched the verdict, false when it did not."""
+    for key in ("agreed", "agreed_with_verdict"):
+        val = obj.get(key)
+        if isinstance(val, bool):
+            return val
+    return None
+
+def _pool_for(seat, family, pool):
+    """Pool id for a council seat. An explicit pool id wins when it is configured."""
+    if isinstance(pool, str) and pool:
+        return pool
+    exact, served = [], []
+    for pid, meta in POOLS.items():
+        if seat and meta.get("seat") != seat:
+            continue
+        if family and meta.get("family") == family:
+            exact.append(pid)
+        elif family and family in (meta.get("serves") or ()):
+            served.append(pid)
+        elif seat and not family:
+            exact.append(pid)
+    cands = exact or served
+    if not cands:
+        return None
+    def rank(pid):
+        meta = POOLS[pid]
+        return (0 if meta.get("strengths") else 1, 0 if meta.get("lose_it") else 1, pid)
+    return sorted(cands, key=rank)[0]
+
+def _sample_role(party_role, parent_role):
+    """A launch role on the seat wins. A voter inherits the task role."""
+    if party_role in ROLES:
+        return party_role
+    return parent_role
+
+def _absorb_party(samples, parent_role, party):
+    if not isinstance(party, dict):
+        return
+    agreed = _agreement(party)
+    if agreed is None:
+        return
+    pool = _pool_for(party.get("seat"), party.get("family") or party.get("model"), party.get("pool"))
+    _absorb_sample(samples, _sample_role(party.get("role"), parent_role), pool, agreed)
+
+def _absorb_row(samples, row):
+    nested = False
+    parent = row.get("role")
+    for key in ("seats", "votes", "ballots"):
+        items = row.get(key)
+        if isinstance(items, list):
+            nested = True
+            for party in items:
+                _absorb_party(samples, parent, party)
+    lineup = row.get("lineup")
+    if isinstance(lineup, dict):
+        nested = True
+        for key in ("chair", "builder"):
+            _absorb_party(samples, parent, lineup.get(key))
+        for party in lineup.get("voters") or []:
+            _absorb_party(samples, parent, party)
+    if nested:
+        return
+    agreed = _agreement(row)
+    if agreed is None:
+        return
+    pool = _pool_for(row.get("seat"), row.get("family") or row.get("model"), row.get("pool"))
+    _absorb_sample(samples, parent, pool, agreed)
+
 def read_track(paths=None):
     """Map (pool, role) -> (agreement rate, sample count).
 
-    Each JSON line is one sample, {role, pool, agreed}, or a verdict with
-    votes: [{pool, agreed}]. A missing file, a blank line, or a bad line is
-    skipped. No file at all returns {}.
+    Reads the council runs log and the optional outcomes log. A missing file,
+    a blank line, or a bad line is skipped. No file at all returns {}.
     """
     if paths is None:
         paths = outcomes_files()
@@ -852,10 +922,7 @@ def read_track(paths=None):
                     continue
                 if not isinstance(row, dict):
                     continue
-                _absorb_sample(samples, row.get("role"), row.get("pool"), row.get("agreed"))
-                for vote in row.get("votes") or []:
-                    if isinstance(vote, dict):
-                        _absorb_sample(samples, vote.get("role") or row.get("role"), vote.get("pool"), vote.get("agreed"))
+                _absorb_row(samples, row)
         finally:
             fh.close()
     return {key: (sum(vals) / len(vals), len(vals)) for key, vals in samples.items()}
