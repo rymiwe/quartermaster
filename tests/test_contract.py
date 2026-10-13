@@ -365,6 +365,7 @@ def cached_env(cache_dir, extra=None):
         "PYTHONDONTWRITEBYTECODE": "1",
         "SEAT_USAGE_CACHE_DIR": str(cache_dir),
         "SEAT_USAGE_ASKS": str(Path(cache_dir) / "asks.jsonl"),
+        "QUARTERMASTER_NO_UPDATE": "1",
     }
     if extra:
         env.update(extra)

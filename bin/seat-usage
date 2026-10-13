@@ -8,9 +8,13 @@ SessionStart hook prints the cached lines (--cached) so the numbers land in
 context when routing is decided.
 A Muse line is read from ~/.cache/quartermaster/muse-usage.json, which
 Conclave writes. It is display-only and is not a routing input.
+A run from a clean checkout of main fetches and fast-forwards at most
+once a day, prints one updated line, and starts again on the new code.
+--route, --quiet, --cached, COUNCIL_VOTER=1, and CONCLAVE_VOTER=1 skip that check.
+QUARTERMASTER_NO_UPDATE=1 turns it off. The check never stashes or resets.
 Sources are documented in the Delegation Routing section of ~/.claude/CLAUDE.md.
 """
-import base64, fcntl, glob, json, os, re, socket, sys, time, urllib.error, urllib.parse, urllib.request
+import base64, fcntl, glob, json, os, re, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 
 H = os.path.expanduser("~")
@@ -1977,7 +1981,143 @@ def full_run(quiet=False, timeout=LOCK_TIMEOUT):
         _print_full(merged["lines"], merged["burn"])
     return merged
 
+UPDATE_INTERVAL_S = 24 * 60 * 60
+UPDATE_GIT_TIMEOUT_S = 5
+_GIT_ENV_DROP = (
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+    "GIT_COMMON_DIR", "GIT_PREFIX", "GIT_NAMESPACE", "GIT_ASKPASS", "SSH_ASKPASS",
+)
+
+def _update_skipped():
+    if os.environ.get("QUARTERMASTER_NO_UPDATE") == "1":
+        return True
+    if os.environ.get("COUNCIL_VOTER") == "1" or os.environ.get("CONCLAVE_VOTER") == "1":
+        return True
+    argv = sys.argv[1:]
+    return "--route" in argv or "--quiet" in argv or "--cached" in argv
+
+def _stamp_path():
+    return os.path.join(os.path.expanduser("~"), ".cache", "quartermaster", "seat-usage-update")
+
+def _stamp_fresh(path, now):
+    try:
+        with open(path) as handle:
+            stamp = float(handle.read().strip())
+    except (OSError, ValueError):
+        return False
+    return now - stamp < UPDATE_INTERVAL_S
+
+def _write_stamp(path, now):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w") as handle:
+            handle.write(f"{now:.3f}\n")
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+def _git_env():
+    env = os.environ.copy()
+    for key in _GIT_ENV_DROP:
+        env.pop(key, None)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_EDITOR"] = "true"
+    env["GCM_INTERACTIVE"] = "never"
+    if "GIT_SSH_COMMAND" not in env:
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=3"
+    return env
+
+def _stop_git(proc):
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+        return
+    try:
+        proc.communicate(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.communicate()
+
+def _git(root, args):
+    proc = subprocess.Popen(
+        ["git", "-C", root, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        env=_git_env(),
+        start_new_session=True,
+    )
+    try:
+        out, _ = proc.communicate(timeout=UPDATE_GIT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _stop_git(proc)
+        return None
+    if proc.returncode != 0:
+        return None
+    return out
+
+def _rev(root, spec):
+    out = _git(root, ["rev-parse", spec])
+    if out is None:
+        return None
+    rev = out.strip()
+    return rev or None
+
+def _fast_forward_checkout():
+    script = os.path.realpath(__file__)
+    top = _git(os.path.dirname(script), ["rev-parse", "--show-toplevel"])
+    if top is None:
+        return
+    root = top.strip()
+    if not root:
+        return
+    rel = os.path.relpath(script, root)
+    if _git(root, ["ls-files", "--error-unmatch", "--", rel]) is None:
+        return
+    branch = _git(root, ["symbolic-ref", "--short", "HEAD"])
+    if branch is None or branch.strip() != "main":
+        return
+    status = _git(root, ["status", "--porcelain", "--untracked-files=no"])
+    if status is None or status.strip():
+        return
+    path = _stamp_path()
+    now = time.time()
+    if _stamp_fresh(path, now):
+        return
+    _write_stamp(path, now)
+    if _git(root, ["fetch", "--quiet"]) is None:
+        return
+    head = _rev(root, "HEAD")
+    upstream = _rev(root, "@{u}")
+    if head is None or upstream is None or head == upstream:
+        return
+    if _git(root, ["merge-base", "--is-ancestor", "HEAD", "@{u}"]) is None:
+        return
+    pulled = _git(root, ["-c", "pull.rebase=false", "-c", "pull.ff=only", "pull", "--ff-only", "--quiet"])
+    if pulled is None:
+        return
+    if _rev(root, "HEAD") in (None, head):
+        return
+    print("[seat-usage] updated", flush=True)
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+def maybe_self_update():
+    if _update_skipped():
+        return
+    try:
+        _fast_forward_checkout()
+    except Exception:
+        return
+
 def main():
+    maybe_self_update()
     if "--route" in sys.argv:
         return cmd_route()
     if "--cached" in sys.argv:
