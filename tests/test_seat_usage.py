@@ -1881,8 +1881,9 @@ def muse_missing_or_broken_fixture_says_no_data_yet():
 
 @test
 def muse_is_not_a_routing_input():
+    assert su.SEAT_KEYS["muse"] == ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts")
     for name in (
-        "POOLS", "SEAT_KEYS", "ROLES", "ROUTE_RULES", "FAMILY_VENDOR", "_FAMILY_NAME",
+        "POOLS", "ROLES", "ROUTE_RULES", "FAMILY_VENDOR", "_FAMILY_NAME",
         "VOTER_ROSTER", "LINE_SEATS", "LINEUP_SEATS", "HOST_SEATS", "BURN_POOLS", "RENEWAL_KEYS",
     ):
         blob = repr(getattr(su, name)).lower()
@@ -1899,6 +1900,45 @@ def muse_is_not_a_routing_input():
     with local_tz("UTC"):
         assert su.muse_line(now=NOW, path=str(MUSE_FIXTURES / "fresh.json")) == FRESH_MUSE_UTC
     assert json.dumps(su.SUMMARY, sort_keys=True, default=str) == before
+
+
+@test
+def muse_numeric_reset_prints_and_a_past_window_is_stale():
+    # Conclave stores whichever type the API sent. The live file's 5h reset is a unix time.
+    data = load_muse_fixture("fresh.json")
+    data["window"] = dict(data["window"], resets_at=4102444800)  # 2100-01-01T00:00:00Z
+    with local_tz("UTC"):
+        line = su.format_muse_line(data, NOW)
+    assert line is not None and line.startswith("muse     | Current 42% (resets 2100-01-01 00:00 UTC)"), line
+    assert "stale" not in line, line
+    data["window"] = dict(data["window"], resets_at=1759910000)  # 2025-10-08
+    with local_tz("UTC"):
+        stale = su.format_muse_line(data, NOW)
+    assert stale is not None and stale.endswith("| stale (window reset)"), stale
+
+
+@test
+def muse_cache_stamps_a_current_window_and_drops_a_stale_one():
+    captured = datetime.fromisoformat("2026-10-12T15:04:00+00:00").timestamp()
+    current = {"v": 1, "as_of": {}, "errors": {"muse": "no data yet"}, "muse_week": 9}
+    su.apply_muse(current, NOW, path=str(MUSE_FIXTURES / "fresh.json"))
+    assert current["muse_5h"] == 42, current
+    assert current["muse_week"] == 18.5, current
+    assert current["as_of"]["muse"] == captured, current["as_of"]
+    assert abs(current["muse_5h_reset_ts"] - datetime.fromisoformat("2099-01-01T00:00:00+00:00").timestamp()) < 1
+    assert "muse" not in current["errors"], current
+
+    stale = {"v": 1, "as_of": {"muse": NOW}, "errors": {}, "muse_week": 9, "muse_5h": 1}
+    su.apply_muse(stale, NOW, path=str(MUSE_FIXTURES / "stale-window.json"))
+    assert "muse" not in stale["as_of"], stale
+    assert stale["errors"]["muse"] == "stale (window reset)", stale
+    assert stale["muse_week"] == 9 and stale["muse_5h"] == 1, stale
+
+    missing = {"v": 1, "as_of": {"muse": NOW}, "muse_week": 4}
+    su.apply_muse(missing, NOW, path=str(MUSE_FIXTURES / "no-such.json"))
+    assert "muse" not in missing["as_of"], missing
+    assert missing["errors"]["muse"] == "no data yet", missing
+    assert missing["muse_week"] == 4, missing
 
 
 def _seed_route_cache(path, now):
@@ -1990,7 +2030,7 @@ def cached_cli_reads_muse_usage_json_and_route_ignores_it():
 
 
 @test
-def full_run_prints_muse_and_leaves_it_out_of_the_cache():
+def full_run_prints_muse_and_stores_it_beside_the_seat_lines():
     with tempfile.TemporaryDirectory() as d:
         cache = os.path.join(d, "latest.json")
         old = (su.CACHE, su.CACHE_DIR, su.SUMMARY, su.muse_usage_path)
@@ -2031,11 +2071,15 @@ def full_run_prints_muse_and_leaves_it_out_of_the_cache():
             text = loud_buf.getvalue()
             muse_lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("muse")]
             assert muse_lines == [FRESH_MUSE_UTC], text
+            # The printed line stays out of the seat lines. The numbers live in the cache fields.
             assert all(not ln.startswith("muse") for ln in loud["lines"]), loud["lines"]
-            assert not any("muse" in key for key in loud), loud
+            captured = datetime.fromisoformat("2026-10-12T15:04:00+00:00").timestamp()
+            assert loud["muse_5h"] == 42 and loud["muse_week"] == 18.5, loud
+            assert loud["as_of"]["muse"] == captured, loud["as_of"]
             written = json.load(open(cache))
             assert all(not str(ln).startswith("muse") for ln in written["lines"]), written["lines"]
-            assert not any("muse" in key for key in written), written
+            assert written["muse_5h"] == 42 and written["as_of"]["muse"] == captured, written
+            assert quiet["muse_5h"] == 42 and quiet["as_of"]["muse"] == captured, quiet
         finally:
             su.CACHE, su.CACHE_DIR, su.SUMMARY, su.muse_usage_path = old
             for name, fn in saved.items():

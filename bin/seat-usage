@@ -7,7 +7,10 @@ prints a one-line reason and never exits non-zero. A synchronous
 SessionStart hook prints the cached lines (--cached) so the numbers land in
 context when routing is decided.
 A Muse line is read from ~/.cache/quartermaster/muse-usage.json, which
-Conclave writes. It is display-only and is not a routing input.
+Conclave writes. A current snapshot is copied into this cache (muse_5h,
+muse_week, and their resets, stamped as_of["muse"]). It is display-only
+and is not a routing input. A missing file, or a 5h window whose reset
+has passed, drops that stamp and records the reason.
 A run from a clean checkout of main fetches and fast-forwards at most
 once a day, prints one updated line, and starts again on the new code.
 --route, --quiet, --cached, COUNCIL_VOTER=1, and CONCLAVE_VOTER=1 skip that check.
@@ -720,6 +723,8 @@ SEAT_KEYS = {
         "grok", "grok_cookie_ok", "grok_pct", "grok_pace", "grok_reset_ts", "grok_window_s",
         "grok_products", "grok_exhausted", "grok_402_h", "grok_renews_ts", "grok_renews",
     ),
+    # Display only. route() does not read these.
+    "muse": ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts"),
 }
 LINE_SEATS = ("claude", "chatgpt", "cursor", "grokbot", "grok")
 
@@ -1641,6 +1646,7 @@ def _store_merged(base, lines, seats, now, stamp_now):
     fresh["lines"] = lines
     fresh["ts"] = now
     merged = merge_summary(base, fresh, seats, now=now)
+    apply_muse(merged, now)
     if stamp_now:
         merged["ts"] = now
     SUMMARY = merged
@@ -2374,8 +2380,9 @@ def write_cache():
     except Exception:
         pass
 
-# Conclave's cache. Read at print time. Not stored, not a pool, not a route input.
+# Conclave's cache. Copied into the seat cache for display. Not a pool, not a route input.
 # Model names stay in the file, if Conclave sends them; the router never sees this.
+# resets_at is an ISO string or a unix time, whichever the API sent.
 def muse_usage_path():
     return os.path.join(os.path.expanduser("~"), ".cache", "quartermaster", "muse-usage.json")
 
@@ -2383,12 +2390,41 @@ def _muse_number(v):
     return _is_number(v) and v == v and v != float("inf") and v != float("-inf")
 
 def _muse_epoch(value):
+    if _is_number(value):
+        try:
+            return float(value)
+        except (OverflowError, ValueError):
+            return None
     if not isinstance(value, str) or not value.strip():
         return None
     try:
         return iso_to_ts(value.strip())
     except (ValueError, TypeError, OSError, OverflowError):
         return None
+
+def _muse_snapshot(data):
+    """Parsed percents and epochs, or None when the shape does not match."""
+    if not isinstance(data, dict):
+        return None
+    window, weekly = data.get("window"), data.get("weekly")
+    if not isinstance(window, dict) or not isinstance(weekly, dict):
+        return None
+    captured = _muse_epoch(data.get("captured_at"))
+    window_reset = _muse_epoch(window.get("resets_at"))
+    weekly_reset = _muse_epoch(weekly.get("resets_at"))
+    current, weekly_pct = window.get("used_percent"), weekly.get("used_percent")
+    minutes = window.get("window_duration_mins")
+    if captured is None or window_reset is None or weekly_reset is None:
+        return None
+    if not _muse_number(current) or not _muse_number(weekly_pct) or not _muse_number(minutes) or minutes < 0:
+        return None
+    return {
+        "captured": captured,
+        "window_reset": window_reset,
+        "weekly_reset": weekly_reset,
+        "current": current,
+        "weekly": weekly_pct,
+    }
 
 def _muse_local(ts):
     """Clock time in the machine's zone. None when the timestamp cannot be shown."""
@@ -2404,23 +2440,15 @@ def format_muse_line(data, now):
     """One Muse line from Conclave's object, or None when the shape does not match.
 
     {captured_at, window{used_percent, window_duration_mins, resets_at},
-     weekly{used_percent, resets_at}}. Times are local. Stale once the captured
-    window's resets_at is no longer in the future.
+     weekly{used_percent, resets_at}}. Times are local. A reset is an ISO
+    string or a unix time. Stale once the captured window's resets_at is no
+    longer in the future.
     """
-    if not isinstance(data, dict):
+    snap = _muse_snapshot(data)
+    if snap is None:
         return None
-    window, weekly = data.get("window"), data.get("weekly")
-    if not isinstance(window, dict) or not isinstance(weekly, dict):
-        return None
-    captured = _muse_epoch(data.get("captured_at"))
-    window_reset = _muse_epoch(window.get("resets_at"))
-    weekly_reset = _muse_epoch(weekly.get("resets_at"))
-    current, weekly_pct = window.get("used_percent"), weekly.get("used_percent")
-    minutes = window.get("window_duration_mins")
-    if captured is None or window_reset is None or weekly_reset is None:
-        return None
-    if not _muse_number(current) or not _muse_number(weekly_pct) or not _muse_number(minutes) or minutes < 0:
-        return None
+    captured, window_reset, weekly_reset = snap["captured"], snap["window_reset"], snap["weekly_reset"]
+    current, weekly_pct = snap["current"], snap["weekly"]
     captured_s, window_s, weekly_s = _muse_local(captured), _muse_local(window_reset), _muse_local(weekly_reset)
     if not captured_s or not window_s or not weekly_s:
         return None
@@ -2443,6 +2471,39 @@ def muse_line(now=None, path=None):
     except Exception:
         return f"{'muse':9}| no data yet"
     return line or f"{'muse':9}| no data yet"
+
+def apply_muse(summary, now, path=None):
+    """Copy a current Muse snapshot into summary. Display only.
+
+    A missing file, a shape that does not match, or a 5h window whose reset
+    has passed drops as_of["muse"] and records errors["muse"]. Numbers already
+    in summary stay, the same way a failed seat read keeps its last values.
+    """
+    if not isinstance(summary, dict):
+        return summary
+    if path is None:
+        path = muse_usage_path()
+    as_of = dict(summary.get("as_of") or {})
+    errors = dict(summary.get("errors") or {})
+    snap = None
+    try:
+        with open(path) as f:
+            snap = _muse_snapshot(json.load(f))
+    except Exception:
+        snap = None
+    if snap is not None and snap["window_reset"] > now:
+        summary["muse_5h"] = snap["current"]
+        summary["muse_5h_reset_ts"] = snap["window_reset"]
+        summary["muse_week"] = snap["weekly"]
+        summary["muse_week_reset_ts"] = snap["weekly_reset"]
+        as_of["muse"] = snap["captured"]
+        errors.pop("muse", None)
+    else:
+        as_of.pop("muse", None)
+        errors["muse"] = "stale (window reset)" if snap is not None else "no data yet"
+    summary["as_of"] = as_of
+    summary["errors"] = errors
+    return summary
 
 def print_cached():
     """--cached: print the last run's lines from the cache, no network. For the
