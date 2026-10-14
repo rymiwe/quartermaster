@@ -752,7 +752,7 @@ SEAT_KEYS = {
         "grok", "grok_cookie_ok", "grok_pct", "grok_pace", "grok_reset_ts", "grok_window_s",
         "grok_products", "grok_exhausted", "grok_402_h", "grok_renews_ts", "grok_renews",
     ),
-    # Display only. route() does not read these.
+    # Lineup and ask read these. Launch roles do not: Muse has no strength there.
     "muse": ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts"),
 }
 LINE_SEATS = ("claude", "chatgpt", "cursor", "grokbot", "grok")
@@ -1719,20 +1719,23 @@ def refresh(seats):
         _release_lock(lock)
 
 # Vendor is the model provider, not the seat that is billed (Ryan, 2026-10-08).
-_VENDOR_NAME = {"xai": "xAI", "anthropic": "Anthropic", "openai": "OpenAI"}
+_VENDOR_NAME = {"xai": "xAI", "anthropic": "Anthropic", "openai": "OpenAI", "meta": "Meta"}
 FAMILY_VENDOR = {}
 _FAMILY_NAME = {}
 load_config()
 
 # Voter effort follows the same burn rule as chair and builder. Grok is on the
 # roster and is excluded when its vendor chairs or builds, and is not seated
-# on a pool that is over pace.
+# on a pool that is over pace. Muse is Meta, which never chairs or builds, so
+# the vendor rule does not exclude it. It is not seated when either Muse
+# window is over pace.
 VOTER_ROSTER = (
     {"family": "fable", "seat": "claude", "pools": ("fable", "claude_week", "claude_5h")},
     {"family": "astra", "seat": "chatgpt", "pools": ("codex",)},
     {"family": "grok", "seat": "grok", "pools": ("grok",)},
+    {"family": "muse", "seat": "muse", "pools": ("muse_week", "muse_5h")},
 )
-# lineup and host are not in ROLES: `--route` with no role stays the four
+# lineup, host, and ask are not in ROLES: `--route` with no role stays the four
 # launch roles the hook already prints.
 LINEUP_SEATS = ("cursor", "claude", "chatgpt", "grok")
 HOST_SEATS = ("grokbot", "claude")
@@ -1781,8 +1784,18 @@ def _party(row):
             "vendor": row.get("vendor"), "effort": row.get("effort"), "variant": row.get("variant", "-")}
 
 
+def _name_list(voters):
+    """'A', 'A and B', or 'A, B, and C'."""
+    names = [_FAMILY_NAME.get(v["family"], v["family"]) for v in voters]
+    if len(names) <= 1:
+        return names[0] if names else ""
+    if len(names) == 2:
+        return f"{names[0]} and {names[1]}"
+    return ", ".join(names[:-1]) + ", and " + names[-1]
+
+
 def _rule_text(chair, builder, voters):
-    names = " and ".join(_FAMILY_NAME.get(v["family"], v["family"]) for v in voters)
+    names = _name_list(voters)
     chair_name = _VENDOR_NAME.get(chair["vendor"], chair["vendor"])
     builder_name = _VENDOR_NAME.get(builder["vendor"], builder["vendor"])
     if chair["vendor"] == builder["vendor"]:
@@ -2057,6 +2070,25 @@ def _fable_voter(states, s, now, required):
     return "skip", None
 
 
+def _muse_voter(states, s, now, skip_ahead=True):
+    """Muse on the weekly pool, when neither window is capped.
+
+    skip_ahead drops the voter when either window is over pace. An unknown
+    reading asks, the same as Grok. Meta never chairs, so this voter is not
+    removed by the vendor rule.
+    """
+    watched = ("muse_5h", "muse_week")
+    if any(states[pid][0] == "unknown" for pid in watched):
+        pid = next(pid for pid in watched if states[pid][0] == "unknown")
+        return "ask", _unknown_text(_ask_label(pid), states[pid][1])
+    if any(states[pid][0] == "capped" for pid in watched):
+        return "skip", None
+    if skip_ahead and any(states[pid][0] == "ahead" for pid in watched):
+        return "skip", None
+    effort, mode, reason = _voter_effort("muse_week", s, now, states)
+    return "row", _voter("muse", "muse", "muse_week", s, now, effort, mode, reason)
+
+
 def _other_voter(family, pool_id, states, s, now, skip_ahead=False):
     state, why = states[pool_id]
     if state == "unknown":
@@ -2094,6 +2126,8 @@ def _collect_voters(chair, states, s, now):
             status, payload = _fable_voter(states, s, now, required)
         elif spec["family"] == "grok":
             status, payload = _other_voter("grok", "grok", states, s, now, skip_ahead=True)
+        elif spec["family"] == "muse":
+            status, payload = _muse_voter(states, s, now, skip_ahead=True)
         else:
             status, payload = _other_voter(spec["family"], spec["pools"][0], states, s, now)
         if status == "ask":
@@ -2111,7 +2145,8 @@ def route_lineup(s, now, builder=None):
     Chair and builder come from one vendor. Grok while either Grok pool is under
     or on pace. Opus only when both are over pace, or when both are capped.
     A builder family the caller already used is kept when that pool can take it,
-    and dropped when the pool is capped. Voter effort follows burn. One voter
+    and dropped when the pool is capped. Muse is seated unless either of its
+    windows is over pace or capped. Voter effort follows burn. One voter
     is a weaker lineup, not an ask.
     """
     states = {pid: pool_status(pid, s, now) for pid in POOLS}
@@ -2138,7 +2173,7 @@ def route_lineup(s, now, builder=None):
     rule = _rule_text(chair_row, builder_row, voters)
     weaker = None
     if len(voters) < 2:
-        names = " and ".join(_FAMILY_NAME.get(v["family"], v["family"]) for v in voters)
+        names = _name_list(voters)
         weaker = f"one voter ({names})"
     elif chair_row.get("family") != "grok":
         weaker = chair_row.get("reason")
@@ -2290,6 +2325,101 @@ def route_host(s, now):
     return finish("ask", None, ", ".join(parts) if parts else "no open host", bot)
 
 
+def _ask_headroom(state):
+    return (SCORING.get("headroom") or {}).get(state, 0.9)
+
+
+def _ask_one(spec, states, s, now):
+    """One seatable ask voter and the pool whose pace ranks it, or None.
+
+    Unknown and capped families are left out. The route still returns the
+    others. Muse is left out when either window is over pace. Grok is not:
+    an ahead Grok pool ranks lower and can still answer a question.
+    """
+    family = spec["family"]
+    if family == "fable":
+        status, payload = _fable_voter(states, s, now, required=False)
+        if status != "row":
+            return None
+        pool = "fable" if payload["seat"] == "claude" else "cursor_other"
+    elif family == "grok":
+        status, payload = _other_voter("grok", "grok", states, s, now, skip_ahead=False)
+        pool = "grok"
+    elif family == "muse":
+        status, payload = _muse_voter(states, s, now, skip_ahead=True)
+        pool = "muse_week"
+    else:
+        pool = spec["pools"][0]
+        status, payload = _other_voter(family, pool, states, s, now, skip_ahead=False)
+    if status != "row":
+        return None
+    state = states[pool][0]
+    used = s.get(POOLS[pool]["used"])
+    used = used if _is_number(used) else 101
+    row = dict(payload)
+    row["pace"] = state
+    return _ask_headroom(state), used, row
+
+
+def route_ask(s, now):
+    """Two voters on two vendors, the ones with the most headroom.
+
+    No vendor is excluded: a question is not a review of the chair's work.
+    Each row carries family, effort, and pace. effort is the burn rule
+    (high, xhigh on a burn, low when ahead). pace is the band that effort
+    came from, so a caller can step a separate lean without applying burn twice.
+    """
+    states = {pid: pool_status(pid, s, now) for pid in POOLS}
+    ranked = []
+    for index, spec in enumerate(VOTER_ROSTER):
+        got = _ask_one(spec, states, s, now)
+        if got is None:
+            continue
+        headroom, used, row = got
+        ranked.append((headroom, used, index, row))
+    ranked.sort(key=lambda item: (-item[0], item[1], item[2]))
+    picked = []
+    seen = set()
+    for _headroom, _used, _index, row in ranked:
+        if row["vendor"] in seen:
+            continue
+        picked.append(row)
+        seen.add(row["vendor"])
+        if len(picked) == 2:
+            break
+    candidates = [item[3] for item in ranked]
+    age = _snapshot_age(s, now)
+    if not picked:
+        return {"role": "ask", "mode": "ask", "reason": f"nothing usable left: {_ASK}",
+                "voters": [], "candidates": [], "reading_age_s": age,
+                "usage": _usage_snapshot(states, s), "usage_age_s": age}
+    mode = "default"
+    if any(v.get("mode") == "burn" for v in picked):
+        mode = "burn"
+    elif len(picked) < 2 or any(v.get("mode") == "suggest" for v in picked):
+        mode = "suggest"
+    reason = f"{_name_list(picked)} by headroom"
+    if len(picked) < 2:
+        reason = f"{reason}; one voter"
+    ages = [v.get("reading_age_s") for v in picked]
+    known = [item for item in ages if isinstance(item, (int, float)) and not isinstance(item, bool)]
+    seated = max(known) if known else None
+    return {"role": "ask", "mode": mode, "reason": reason, "voters": picked, "candidates": candidates,
+            "reading_age_s": seated, "usage": _usage_snapshot(states, s), "usage_age_s": age}
+
+
+def format_ask(row):
+    age = row.get("reading_age_s")
+    shown = "unknown" if age is None else f"{int(age // 60)}m"
+    if row.get("mode") == "ask" or not row.get("voters"):
+        return f"route: ask | - | - | - | - | ask | {row.get('reason')} | reading {shown}"
+    lines = [f"route: ask | {row['mode']} | {row.get('reason')} | reading {shown}"]
+    for voter in row["voters"]:
+        lines.append(f"  voter: {voter['seat']} | {voter['family']} | {voter['effort']} | "
+                     f"{voter.get('pace', '-')} | {voter['vendor']}")
+    return "\n".join(lines)
+
+
 def format_lineup(row):
     age = row.get("reading_age_s")
     shown = "unknown" if age is None else f"{int(age // 60)}m"
@@ -2340,7 +2470,7 @@ def cmd_route():
     if role == "voter":
         print("voters do not route", file=sys.stderr)
         raise SystemExit(2)
-    known = list(ROLES) + ["lineup", "host"]
+    known = list(ROLES) + ["lineup", "host", "ask"]
     if role is not None and role not in known:
         print(f"unknown role {role}; roles: {', '.join(known)}", file=sys.stderr)
         raise SystemExit(2)
@@ -2354,6 +2484,8 @@ def cmd_route():
         summary = refresh(list(LINEUP_SEATS))
     elif role == "host":
         summary = refresh(list(HOST_SEATS))
+    elif role == "ask":
+        summary = refresh(list(LINEUP_SEATS))
     else:
         chosen = tuple(ROLES) if role is None else (role,)
         seats = []
@@ -2367,6 +2499,8 @@ def cmd_route():
         rows = [route_lineup(summary, now, builder=builder)]
     elif role == "host":
         rows = [route_host(summary, now)]
+    elif role == "ask":
+        rows = [route_ask(summary, now)]
     else:
         chosen = tuple(ROLES) if role is None else (role,)
         rows = [route(name, summary, now) for name in chosen]
@@ -2382,6 +2516,8 @@ def cmd_route():
                 print(format_lineup(row))
             elif row.get("role") == "host":
                 print(format_host(row))
+            elif row.get("role") == "ask":
+                print(format_ask(row))
             else:
                 print(format_route(row))
 
@@ -2409,8 +2545,9 @@ def write_cache():
     except Exception:
         pass
 
-# Conclave's cache. Copied into the seat cache for display. Not a pool, not a route input.
-# Model names stay in the file, if Conclave sends them; the router never sees this.
+# Conclave's cache. Copied into the seat cache. The muse_5h and muse_week pools
+# read those fields. Model names stay in the file, if Conclave sends them; the
+# router never sees this.
 # resets_at is an ISO string or a unix time, whichever the API sent.
 def muse_usage_path():
     return os.path.join(os.path.expanduser("~"), ".cache", "quartermaster", "muse-usage.json")
@@ -2725,7 +2862,10 @@ def refresh_muse_usage(now=None, path=None, binary=None, timeout=40):
     return True
 
 def apply_muse(summary, now, path=None):
-    """Copy a parsed Muse snapshot into summary. Display only.
+    """Copy a parsed Muse snapshot into summary.
+
+    The muse_5h and muse_week pools read these fields. A launch role does not:
+    Muse has no chair or builder strength.
 
     A 5h window whose reset has passed is still stored. The printed line says
     so. A missing file or a shape that does not match drops as_of["muse"],

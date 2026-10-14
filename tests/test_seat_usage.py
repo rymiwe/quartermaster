@@ -46,7 +46,7 @@ def snap(**kw):
     s = {
         "v": 1,
         "ts": NOW,
-        "as_of": {"claude": NOW, "chatgpt": NOW, "cursor": NOW, "grokbot": NOW, "grok": NOW},
+        "as_of": {"claude": NOW, "chatgpt": NOW, "cursor": NOW, "grokbot": NOW, "grok": NOW, "muse": NOW},
         "claude_5h": 10,
         "claude_5h_reset_ts": NOW + 4 * 3600,
         "claude_week": 10,
@@ -68,6 +68,10 @@ def snap(**kw):
         "bot_pct": 10,
         "bot_reset_ts": NOW + 3 * 86400,
         "bot_window_s": WEEK,
+        "muse_5h": 10,
+        "muse_5h_reset_ts": NOW + 4 * 3600,
+        "muse_week": 10,
+        "muse_week_reset_ts": NOW + 3 * 86400,
     }
     s.update(kw)
     if as_of is not None:
@@ -1221,6 +1225,7 @@ def lineup_default_is_xai_with_fable_and_astra():
     assert [(v["family"], v["effort"], v["vendor"], v["seat"]) for v in r["lineup"]["voters"]] == [
         ("fable", "high", "anthropic", "claude"),
         ("astra", "high", "openai", "chatgpt"),
+        ("muse", "high", "meta", "muse"),
     ], r["lineup"]["voters"]
     assert r["alternatives"] == [], r
     assert "xAI chairs and builds" in r["rule"], r
@@ -1234,8 +1239,8 @@ def lineup_burn_raises_chair_and_builder_effort_not_voters():
     assert r["mode"] == "burn", r
     assert r["lineup"]["chair"]["effort"] == "xhigh", r["lineup"]["chair"]
     assert r["lineup"]["builder"]["effort"] == "xhigh", r["lineup"]["builder"]
-    assert [v["effort"] for v in r["lineup"]["voters"]] == ["high", "high"], r["lineup"]["voters"]
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra"], r
+    assert [v["effort"] for v in r["lineup"]["voters"]] == ["high", "high", "high"], r["lineup"]["voters"]
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra", "muse"], r
 
 
 @test
@@ -1244,7 +1249,7 @@ def lineup_cursor_ahead_moves_to_supergrok_while_that_pool_is_under():
     assert r["mode"] == "default", r
     assert r["lineup"]["chair"]["seat"] == "grok" and r["lineup"]["chair"]["effort"] == "high", r
     assert r["lineup"]["builder"]["seat"] == "grok" and r["lineup"]["builder"]["effort"] == "high", r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra", "muse"], r
 
 
 @test
@@ -1271,7 +1276,7 @@ def lineup_opus_builder_uses_opus_chair_and_grok_voter():
     assert r["mode"] != "ask", r
     assert r["lineup"]["chair"]["family"] == "opus" and r["lineup"]["chair"]["effort"] == "high", r
     assert r["lineup"]["chair"]["seat"] == "claude" and r["lineup"]["chair"]["vendor"] == "anthropic", r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "grok"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "grok", "muse"], r
     grok = r["lineup"]["voters"][1]
     assert grok["effort"] == "high" and grok["seat"] == "grok" and grok["vendor"] == "xai", grok
     assert r["alternatives"] == [], r
@@ -1283,7 +1288,7 @@ def lineup_cursor_capped_stays_on_supergrok_with_fable_and_astra():
     assert r["mode"] == "default", r
     assert r["lineup"]["chair"]["family"] == "grok" and r["lineup"]["chair"]["seat"] == "grok", r
     assert r["lineup"]["builder"]["family"] == "grok" and r["lineup"]["builder"]["seat"] == "grok", r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra", "muse"], r
     assert all(v["effort"] == "high" for v in r["lineup"]["voters"]), r
 
 
@@ -1292,7 +1297,7 @@ def lineup_both_grok_pools_capped_degrades_to_opus_and_one_voter():
     r = su.route_lineup(snap(cursor_auto_pct=100, grok_exhausted=True), NOW)
     assert r["mode"] == "suggest" and r["lineup"] is not None, r
     assert r["lineup"]["chair"]["family"] == "opus" and r["lineup"]["builder"]["family"] == "opus", r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "muse"], r
     assert "weaker:" in r["reason"], r
     assert all(v["family"] != "grok" for v in r["lineup"]["voters"]), r
 
@@ -1317,11 +1322,14 @@ def lineup_unknown_fable_asks():
 
 
 @test
-def lineup_codex_capped_degrades_to_one_voter():
+def lineup_codex_capped_keeps_muse_until_that_pool_is_ahead():
     r = su.route_lineup(snap(codex=100), NOW)
-    assert r["mode"] == "suggest" and r["lineup"] is not None, r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable"], r
-    assert "weaker:" in r["reason"], r
+    assert r["mode"] == "default" and r["lineup"] is not None, r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "muse"], r
+    ahead = su.route_lineup(snap(codex=100, muse_week=80), NOW)
+    assert ahead["mode"] == "suggest" and ahead["lineup"] is not None, ahead
+    assert [v["family"] for v in ahead["lineup"]["voters"]] == ["fable"], ahead
+    assert "one voter" in ahead["reason"], ahead
 
 
 @test
@@ -1525,8 +1533,8 @@ def cached_route_in_process_does_not_refresh_or_log():
             with contextlib.redirect_stdout(buf):
                 su.cmd_route()
             row = json.loads(buf.getvalue())[0]
-            assert row["mode"] == "suggest" and row["lineup"] is not None, row
-            assert [v["family"] for v in row["lineup"]["voters"]] == ["fable"], row
+            assert row["mode"] == "default" and row["lineup"] is not None, row
+            assert [v["family"] for v in row["lineup"]["voters"]] == ["fable", "muse"], row
             assert not os.path.exists(su.ASKS)
             assert not os.path.exists(su.HISTORY)
             assert called == [], called
@@ -1623,7 +1631,7 @@ def both_grok_pools_over_pace_seats_opus_and_no_grok_voter():
     r = su.route_lineup(s, NOW)
     assert r["lineup"]["chair"]["effort"] == chair["effort"], r
     assert r["lineup"]["builder"]["effort"] == builder["effort"], r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "muse"], r
     assert "weaker:" in r["reason"], r
 
 
@@ -1927,26 +1935,53 @@ def muse_missing_or_broken_fixture_says_no_data_yet():
 
 
 @test
-def muse_is_not_a_routing_input():
+def muse_pools_seat_a_voter_and_do_not_change_launch_routes():
     assert su.SEAT_KEYS["muse"] == ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts")
-    for name in (
-        "POOLS", "ROLES", "ROUTE_RULES", "FAMILY_VENDOR", "_FAMILY_NAME",
-        "VOTER_ROSTER", "LINE_SEATS", "LINEUP_SEATS", "HOST_SEATS", "BURN_POOLS", "RENEWAL_KEYS",
-    ):
-        blob = repr(getattr(su, name)).lower()
-        assert "muse" not in blob, name
-    for name in ("route", "_route_worker", "_apply_rule", "route_lineup", "route_host", "cmd_route", "pool_status"):
-        consts = " ".join(_string_consts(getattr(su, name))).lower()
-        assert "muse" not in consts, name
-    extra = snap(muse=40, model="muse-spark-1.3")
+    assert "muse_5h" in su.POOLS and "muse_week" in su.POOLS
+    assert su.FAMILY_VENDOR["muse"] == "meta"
+    assert su._FAMILY_NAME["muse"] == "Muse"
+    assert any(spec["family"] == "muse" for spec in su.VOTER_ROSTER)
+    assert "muse" not in su.ROLES
+    for role in ("bounded-question", "hard-bug", "builder", "chair"):
+        assert su.POOLS["muse_week"].get("strengths", {}).get(role) is None
+        assert su.route(role, snap(), NOW)["family"] != "muse"
+    seated = su.route_lineup(snap(), NOW)
+    assert [v["family"] for v in seated["lineup"]["voters"]] == ["fable", "astra", "muse"], seated
+    ahead = su.route_lineup(snap(muse_5h=80), NOW)
+    assert "muse" not in [v["family"] for v in ahead["lineup"]["voters"]], ahead
+    missing = su.route_lineup(without_as_of(snap(), "muse"), NOW)
+    assert missing["mode"] == "ask" and missing["lineup"] is None, missing
+    assert "Muse" in missing["reason"], missing
+    # A named model on the snapshot is not a route input.
+    extra = snap(model="muse-spark-1.3")
     for role in ("bounded-question", "hard-bug", "builder", "chair"):
         assert su.route(role, snap(), NOW) == su.route(role, extra, NOW), role
-    assert su.route_lineup(snap(), NOW) == su.route_lineup(extra, NOW)
     assert su.route_host(snap(), NOW) == su.route_host(extra, NOW)
     before = json.dumps(su.SUMMARY, sort_keys=True, default=str)
     with local_tz("UTC"):
         assert su.muse_line(now=NOW, path=str(MUSE_FIXTURES / "fresh.json")) == FRESH_MUSE_UTC
     assert json.dumps(su.SUMMARY, sort_keys=True, default=str) == before
+
+
+@test
+def route_ask_picks_two_vendors_by_headroom():
+    r = su.route_ask(snap(), NOW)
+    assert r["role"] == "ask" and r["mode"] == "default", r
+    assert [(v["family"], v["effort"], v["vendor"]) for v in r["voters"]] == [
+        ("fable", "high", "anthropic"),
+        ("astra", "high", "openai"),
+    ], r
+    assert [v["family"] for v in r["candidates"]] == ["fable", "astra", "grok", "muse"], r
+    # Grok stays a candidate. Ask mode does not drop the chair's vendor.
+    assert any(v["family"] == "grok" for v in r["candidates"]), r
+    full = su.route_ask(snap(fable=100, claude_week=100, claude_5h=100, cursor_api_pct=100, codex=100), NOW)
+    assert [v["family"] for v in full["voters"]] == ["grok", "muse"], full
+    assert len({v["vendor"] for v in full["voters"]}) == 2, full
+    over = su.route_ask(snap(muse_week=90), NOW)
+    assert "muse" not in [v["family"] for v in over["candidates"]], over
+    burning = su.route_ask(snap(muse_week=10, muse_week_reset_ts=NOW + 12 * 3600), NOW)
+    muse = next(v for v in burning["candidates"] if v["family"] == "muse")
+    assert muse["effort"] == "xhigh" and muse["mode"] == "burn" and muse["pace"] == "under", muse
 
 
 @test
@@ -2389,10 +2424,25 @@ def a_pool_added_only_in_config_can_win():
 @test
 def disabled_pool_is_config_only():
     raw = json.loads(Path(su.pools_file()).read_text())
-    assert raw["pools"]["muse"]["enabled"] is False
-    assert "muse" not in su.POOLS
-    assert "muse" not in su.ROLES
-    assert "muse" not in su.ROUTE_RULES
+    assert raw["pools"]["muse_week"]["enabled"] is True
+    assert raw["pools"]["muse_5h"]["enabled"] is True
+    assert "muse_week" in su.POOLS and "muse" not in su.ROLES
+    with tempfile.TemporaryDirectory() as d:
+        src = json.loads(Path(su.pools_file()).read_text())
+        src["pools"]["spare"] = {
+            "enabled": False,
+            "seat": "cursor",
+            "label": "Spare",
+            "usage": {"used": "cursor_auto_pct", "reset": "cursor_reset_ts"},
+        }
+        path = os.path.join(d, "pools.json")
+        Path(path).write_text(json.dumps(src))
+        try:
+            su.load_config(pools_path=path)
+            assert "spare" not in su.POOLS
+            assert "muse_week" in su.POOLS
+        finally:
+            su.load_config()
 
 
 @test

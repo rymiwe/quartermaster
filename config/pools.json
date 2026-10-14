@@ -24,13 +24,15 @@
     "opus": "anthropic",
     "fable": "anthropic",
     "astra": "openai",
-    "sol": "openai"
+    "sol": "openai",
+    "muse": "meta"
   },
   "family_names": {
     "fable": "Fable",
     "astra": "Astra",
     "grok": "Grok",
-    "opus": "Opus"
+    "opus": "Opus",
+    "muse": "Muse"
   },
   "roles": {
     "bounded-question": {
@@ -304,10 +306,11 @@
         "chair": {"provider": 0.80, "prior": 0.80}
       }
     },
-    "muse": {
-      "enabled": false,
+    "muse_5h": {
+      "enabled": true,
       "seat": "muse",
-      "label": "muse",
+      "label": "muse 5h",
+      "ask_label": "Muse 5h",
       "family": "muse",
       "models": ["muse"],
       "serves": ["muse"],
@@ -316,16 +319,40 @@
       "pace": true,
       "lose_it": false,
       "variant": "-",
+      "effort": "high",
       "usage": {
-        "used": "muse_pct",
-        "reset": "muse_reset_ts",
+        "used": "muse_5h",
+        "reset": "muse_5h_reset_ts",
+        "window_s": 18000,
+        "as_of": "muse"
+      },
+      "facts": {"context": null, "limits": "Muse session window", "window": "5h"}
+    },
+    "muse_week": {
+      "enabled": true,
+      "seat": "muse",
+      "label": "muse weekly",
+      "ask_label": "Muse weekly",
+      "family": "muse",
+      "models": ["muse"],
+      "serves": ["muse"],
+      "only": [],
+      "cost_tier": 2,
+      "pace": true,
+      "lose_it": true,
+      "burn": "weekly",
+      "blocked_by": ["muse_5h"],
+      "variant": "-",
+      "effort": "high",
+      "effort_by_pace": {"ahead": "low"},
+      "burn_effort": "xhigh",
+      "usage": {
+        "used": "muse_week",
+        "reset": "muse_week_reset_ts",
         "window_s": 604800,
         "as_of": "muse"
       },
-      "facts": {"context": null, "limits": "display-only until enabled", "window": "weekly"},
-      "strengths": {
-        "bounded-question": {"provider": 0.50, "prior": 0.50}
-      }
+      "facts": {"context": null, "limits": "Muse weekly", "window": "7d"}
     }
   }
 }

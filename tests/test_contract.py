@@ -321,7 +321,7 @@ def fresh_cache(now):
     return {
         "v": 1,
         "ts": now,
-        "as_of": {seat: now for seat in ("claude", "chatgpt", "cursor", "grokbot", "grok")},
+        "as_of": {seat: now for seat in ("claude", "chatgpt", "cursor", "grokbot", "grok", "muse")},
         "claude_5h": 10,
         "claude_5h_reset_ts": now + 4 * 3600,
         "claude_week": 10,
@@ -343,6 +343,10 @@ def fresh_cache(now):
         "bot_pct": 10,
         "bot_reset_ts": now + 3 * 86400,
         "bot_window_s": 7 * 86400,
+        "muse_5h": 10,
+        "muse_5h_reset_ts": now + 4 * 3600,
+        "muse_week": 10,
+        "muse_week_reset_ts": now + 3 * 86400,
         "lines": ["claude   | max active"],
         "burn": [],
     }
@@ -396,7 +400,7 @@ def cached_lineup_json_names_the_xai_pair():
     assert proc.stderr == "", proc.stderr
     row = json.loads(proc.stdout)[0]
     assert row["role"] == "lineup" and row["mode"] == "default", row
-    assert row["reason"] == "xAI chairs and builds: Fable and Astra vote", row["reason"]
+    assert row["reason"] == "xAI chairs and builds: Fable, Astra, and Muse vote", row["reason"]
     assert row["rule"] == row["reason"], row["rule"]
     chair = row["lineup"]["chair"]
     builder = row["lineup"]["builder"]
@@ -409,6 +413,7 @@ def cached_lineup_json_names_the_xai_pair():
     assert voters == [
         ("voter", "claude", "fable", "high", "default"),
         ("voter", "chatgpt", "astra", "high", "default"),
+        ("voter", "muse", "muse", "high", "default"),
     ], voters
 
 
@@ -472,7 +477,7 @@ def unknown_role_exits_2_with_the_role_list():
         })
     assert proc.returncode == 2, proc.returncode
     assert proc.stdout == "", proc.stdout
-    assert proc.stderr == "unknown role nope; roles: bounded-question, hard-bug, builder, chair, lineup, host\n", proc.stderr
+    assert proc.stderr == "unknown role nope; roles: bounded-question, hard-bug, builder, chair, lineup, host, ask\n", proc.stderr
 
 
 @test
