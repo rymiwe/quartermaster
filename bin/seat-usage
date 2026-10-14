@@ -335,8 +335,13 @@ def claude_renewal():
         r = json.load(open(RENEWALS_FILE)).get("claude") or {}
         at = r.get("at")
         if at:
-            SUMMARY["claude_renews_ts"] = iso_to_ts(at if "T" in at else at + "T00:00:00-07:00")
+            # A date with no clock is a calendar day. The timestamp is only the
+            # day's start in Pacific time, so callers must not print it as a known hour.
+            date_only = "T" not in at
+            SUMMARY["claude_renews_ts"] = iso_to_ts(at if not date_only else at + "T00:00:00-07:00")
             SUMMARY["claude_renews"] = r.get("renews")
+            SUMMARY["claude_renews_date_only"] = date_only
+            SUMMARY["claude_renews_on"] = at if date_only else None
     except Exception:
         pass
 
@@ -694,7 +699,7 @@ SEAT_KEYS = {
     "claude": (
         "claude_5h", "claude_5h_reset_ts", "claude_week", "claude_week_pace", "claude_week_reset_ts",
         "fable", "fable_pace", "fable_reset_ts", "claude_plan", "claude_status",
-        "claude_renews_ts", "claude_renews",
+        "claude_renews_ts", "claude_renews", "claude_renews_date_only", "claude_renews_on",
     ),
     "chatgpt": (
         "codex", "codex_pace", "codex_reset_ts", "codex_window_s", "codex_plan", "codex_age_h", "codex_source",
@@ -1236,7 +1241,11 @@ def _explain_none(ranked, states):
         st, why = states[pid]
         block = _blockage(pid, states)
         if st == "capped" or (block and block[0] == "capped"):
-            last = (pid, why if st == "capped" else (block[2] if block else None))
+            # Name the short window when it is what blocked a weekly pool.
+            if block and block[0] == "capped" and st != "capped":
+                last = (block[1], block[2])
+            else:
+                last = (pid, why)
             continue
         if st == "unknown":
             return _unknown_reason(_ask_label(pid), why)
@@ -1302,8 +1311,9 @@ def pool_status(pool_id, s, now):
     unknown when the seat has no as_of, the reading is older than 10 minutes,
     used% is absent or not a number (absent is never 0%), or the reset is
     missing or already past. grok is also capped when grok_exhausted.
-    The 5h pool (pace False) is open when a fresh used% is 0 and reset is None
-    (no session started). It returns 'open' when it is known and not capped.
+    A 5h pool (facts.window 5h) is open when the plan has no session keys, or
+    when a used% under 100 has no reset still in the future. At 100% with a
+    future reset it is capped. Otherwise it follows pace, and it never burns.
     """
     meta = POOLS[pool_id]
     as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
@@ -1320,9 +1330,20 @@ def pool_status(pool_id, s, now):
     if age > ROUTE_FRESH_S:
         return "unknown", f"reading {int(age // 60)}m old"
     used = s.get(meta["used"])
+    short = (meta.get("facts") or {}).get("window") == "5h"
     if not _is_number(used):
+        # No 5h keys means this plan has no session window. That must not
+        # block the weekly pool the way a failed reading would.
+        if short:
+            return "open", None
         return "unknown", "no used %"
     if not meta.get("pace", True) and used == 0 and reset is None:
+        return "open", None
+    # Full with no clock is capped. A clock that already passed, or any
+    # reading under 100% with no clock, is an open window, not a failed read.
+    if short and used >= 100 and not _is_number(reset):
+        return "capped", None
+    if short and (not _is_number(reset) or reset <= now):
         return "open", None
     if not _is_number(reset) or reset <= now:
         return "unknown", "reset passed"
@@ -1345,6 +1366,13 @@ def pool_status(pool_id, s, now):
 
 def _pool_burning(pool_id, s, now):
     meta = POOLS[pool_id]
+    # A short window that is ahead or capped is the binding limit. The weekly
+    # pool does not burn, and effort stays at its default, while that is true.
+    for gate in meta.get("blocked_by") or ():
+        if gate not in POOLS:
+            continue
+        if pool_status(gate, s, now)[0] in ("ahead", "capped"):
+            return False
     for e in burn_entries(s, now):
         if e["seat"] == meta["seat"] and e["pool"] == meta.get("burn"):
             return True
@@ -2080,35 +2108,98 @@ def route_lineup(s, now, builder=None):
             "usage": _usage_snapshot(states, s), "usage_age_s": _snapshot_age(s, now)}
 
 
-def _host_entry(id_, seat, family, effort, state, used, age):
+def _host_entry(id_, seat, family, effort, state, used, age, binding, windows):
     return {"id": id_, "seat": seat, "family": family, "effort": effort, "state": state,
-            "available": state not in ("unknown", "capped"), "used_pct": used, "reading_age_s": age}
+            "available": state not in ("unknown", "capped"), "used_pct": used,
+            "binding": binding, "windows": windows, "reading_age_s": age}
 
 
 def _host_unknown(label, why):
     return _unknown_text(label, why)
 
 
+def _host_windows(pool_ids, s):
+    return {pid: s.get(POOLS[pid]["used"]) for pid in pool_ids}
+
+
+def _host_binding(pool_id, states):
+    """Worst of this pool and the pools that block it.
+
+    capped outranks ahead, and either outranks under, on, or open. used_pct
+    follows the pool whose state won. An unknown reading stays unknown.
+    """
+    ids = [pool_id] + [gate for gate in (POOLS[pool_id].get("blocked_by") or []) if gate in states]
+    if any(states[i][0] == "unknown" for i in ids):
+        return "unknown", pool_id
+    for rank in ("capped", "ahead"):
+        for i in ids:
+            if states[i][0] == rank:
+                return rank, i
+    return states[pool_id][0], pool_id
+
+
+_HOST_NAME = {"grokbot": "Bot", "claude_week": "Max", "claude_5h": "Max 5h"}
+
+
+def _host_phrase(pool_id, state):
+    """Ask vocabulary. A short window says full; a long one says capped."""
+    name = _HOST_NAME.get(pool_id) or POOLS[pool_id].get("ask_label") or POOLS[pool_id]["label"]
+    if state == "ahead":
+        return f"{name} over pace"
+    if state == "capped" and (POOLS[pool_id].get("facts") or {}).get("window") == "5h":
+        return f"{name} full"
+    if state == "capped":
+        return f"{name} capped"
+    return ""
+
+
+def _host_burn_reason(pool_id):
+    if pool_id == "claude_week":
+        return "weekly all-models pool burning"
+    if pool_id == "grokbot":
+        return "bot week pool burning"
+    burn = POOLS[pool_id].get("burn") or POOLS[pool_id]["label"]
+    return f"{burn} pool burning"
+
+
+def _host_lean(s, now, states):
+    """Cursor Models, then SuperGrok. SuperGrok first only when it would expire unused."""
+    order = ["grok", "cursor_models"] if _pool_burning("grok", s, now) else ["cursor_models", "grok"]
+    lean = []
+    for pid in order:
+        if pid not in states or states[pid][0] in ("capped", "unknown"):
+            continue
+        lean.append(pid)
+    return lean
+
+
 def route_host(s, now):
     """Suggest where to start a host session. Does not select one.
 
-    Capable order is Grok Bot, then Opus at high on Max. A burning pool is spent
-    first. Both ahead: suggest the Bot and name the over-pace. An aged Bot
-    reading says the reading is old. A missing reading says the read failed.
+    Capable order is Grok Bot, then Opus on Max. A burning pool is spent first,
+    unless its short window is ahead or capped: that window is binding, Max
+    leaves the ready list, and effort stays at the default. The reason names
+    no host, no effort, and contains no parentheses. The page adds one pair.
+    Both ahead: suggest the Bot. An aged Bot reading says the reading is old.
+    A missing reading says the read failed.
     """
     states = {pid: pool_status(pid, s, now) for pid in POOLS}
     bot_state, bot_why = states["grokbot"]
-    opus_state = _join_open(states["claude_week"][0], states["claude_5h"][0])
-    opus_effort, opus_mode = _effort_for("claude_week", s, now, states, default="high")
-    bot = _host_entry("grokbot", "grokbot", "grokbot", "-", bot_state, s.get("bot_pct"),
-                      _reading_age("grokbot", s, now))
-    opus = _host_entry("opus", "claude", "opus", opus_effort, opus_state, s.get("claude_week"),
-                       _reading_age("claude_week", s, now))
+    opus_state, opus_binding = _host_binding("claude_week", states)
+    opus_effort, _opus_mode = _effort_for("claude_week", s, now, states, default="high")
+    bot_windows = _host_windows(["grokbot"], s)
+    opus_windows = _host_windows(["claude_week", "claude_5h"], s)
+    bot = _host_entry("grokbot", "grokbot", "grokbot", "-", bot_state, bot_windows.get("grokbot"),
+                      _reading_age("grokbot", s, now), "grokbot", bot_windows)
+    opus = _host_entry(
+        "opus", "claude", "opus", opus_effort, opus_state, opus_windows.get(opus_binding),
+        _reading_age("claude_week", s, now), opus_binding, opus_windows)
+    lean = _host_lean(s, now, states)
 
     def finish(mode, suggestion, reason, top):
         return {"role": "host", "seat": top["seat"], "family": top["family"], "effort": top["effort"],
                 "variant": "-", "mode": mode, "reason": reason, "reading_age_s": top["reading_age_s"],
-                "suggestion": suggestion, "selects": False, "hosts": [bot, opus]}
+                "suggestion": suggestion, "selects": False, "lean": lean, "hosts": [bot, opus]}
 
     if bot_state == "unknown":
         return finish("ask", None, _host_unknown("Grok Bot", bot_why), bot)
@@ -2127,27 +2218,21 @@ def route_host(s, now):
                 return (0, reset, order)
             return (1, order, 0)
         _id, top, pool = sorted(ready, key=key)[0]
-        if _id == "grokbot":
-            mode, reason = "suggest", "Grok Bot first, then Opus at high on Max"
-            if _pool_burning(pool, s, now):
-                mode, reason = "burn", "Grok Bot burn, then Opus at high on Max"
+        if _pool_burning(pool, s, now):
+            mode, reason = "burn", _host_burn_reason(pool)
+        elif _id == "opus" and bot_state == "capped":
+            mode, reason = "suggest", "Bot capped"
+        elif _id == "opus" and bot_state == "ahead":
+            mode, reason = "suggest", "Bot over pace"
         else:
-            mode = "burn" if opus_mode == "burn" else "suggest"
-            if bot_state == "capped":
-                reason = f"Grok Bot capped: {_opus_phrase('chair', opus_effort)}"
-            elif mode == "burn":
-                reason = f"{_opus_phrase('chair', opus_effort)} ({POOLS['claude_week']['label']} burn)"
-            else:
-                reason = f"Grok Bot ahead of pace: {_opus_phrase('chair', opus_effort)}"
+            mode, reason = "suggest", ""
         return finish(mode, _id, reason, top)
     if bot_state == "ahead" and opus_state == "ahead":
-        return finish("suggest", "grokbot",
-                      "both host pools over pace: Grok Bot, then Opus at high on Max", bot)
-    if opus["available"]:
-        return finish("suggest", "opus", f"Grok Bot capped: {_opus_phrase('chair', opus_effort)}", opus)
+        return finish("suggest", "grokbot", "both over pace", bot)
     if opus_state == "unknown":
         return finish("ask", None, _max_unknown_reason(states), bot)
-    return finish("ask", None, "Grok Bot and Max capped: " + _ASK, bot)
+    parts = [p for p in (_host_phrase("grokbot", bot_state), _host_phrase(opus_binding, opus_state)) if p]
+    return finish("ask", None, ", ".join(parts) if parts else "no open host", bot)
 
 
 def format_lineup(row):

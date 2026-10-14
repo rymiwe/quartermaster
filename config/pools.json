@@ -73,7 +73,7 @@
       "serves": ["opus", "fable"],
       "only": [],
       "cost_tier": 4,
-      "pace": false,
+      "pace": true,
       "lose_it": false,
       "variant": "-",
       "usage": {
@@ -143,6 +143,27 @@
         "bounded-question": {"provider": 0.90, "prior": 0.90}
       }
     },
+    "codex_5h": {
+      "enabled": true,
+      "seat": "chatgpt",
+      "label": "codex 5h",
+      "ask_label": "ChatGPT 5h",
+      "family": "astra",
+      "models": [],
+      "serves": [],
+      "only": [],
+      "cost_tier": 3,
+      "pace": true,
+      "lose_it": false,
+      "variant": "-",
+      "usage": {
+        "used": "codex_5h",
+        "reset": "codex_5h_reset_ts",
+        "window_s": 18000,
+        "as_of": "chatgpt"
+      },
+      "facts": {"context": 200000, "limits": "ChatGPT session window", "window": "5h"}
+    },
     "codex": {
       "enabled": true,
       "seat": "chatgpt",
@@ -156,6 +177,7 @@
       "pace": true,
       "lose_it": true,
       "burn": "weekly",
+      "blocked_by": ["codex_5h"],
       "family_by_pace": {"under": "astra", "on": "astra", "ahead": "sol", "open": "astra", "near_cap": "astra"},
       "variant": "-",
       "effort": "low",

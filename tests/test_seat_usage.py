@@ -501,10 +501,13 @@ def f4_zero_5h_without_reset_is_open():
     assert r["mode"] == "suggest", r
     assert r["seat"] == "claude" and r["family"] == "opus" and r["effort"] == "low", r
     assert r["reason"] == "claude weekly all under pace: score 0.36 (fit 0.40, headroom 1.00, cost 4, lose-it 0.00)", r
+    # A passed 5h clock, or a used% under 100 with no clock, does not block Max.
     past = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_5h=0, claude_5h_reset_ts=NOW - 1), NOW)
-    assert past["mode"] == "ask" and "Max 5h reading unknown" in past["reason"], past
+    assert past["mode"] == "suggest" and past["family"] == "opus", past
     used = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_5h=1, claude_5h_reset_ts=None), NOW)
-    assert used["mode"] == "ask" and "Max 5h reading unknown" in used["reason"], used
+    assert used["mode"] == "suggest" and used["family"] == "opus", used
+    full = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_5h=100, claude_5h_reset_ts=None), NOW)
+    assert full["mode"] == "ask" and "Max 5h" in full["reason"], full
 
 
 @test
@@ -1577,13 +1580,108 @@ def supergrok_burn_is_spent_before_cursor():
     assert chair["seat"] == "grok" and chair["effort"] == "xhigh", chair
 
 
+def _assert_host_reason(r):
+    reason = r.get("reason") or ""
+    assert "(" not in reason and ")" not in reason, reason
+    low = reason.lower()
+    assert "xhigh" not in low and "at high" not in low and "at low" not in low, reason
+    if "reading" not in reason and "old" not in reason:
+        assert "Opus" not in reason and "Grok Bot" not in reason, reason
+    assert r["selects"] is False and isinstance(r.get("lean"), list), r
+
+
 @test
 def host_both_ahead_suggests_the_bot_and_names_over_pace():
     r = su.route_host(snap(bot_pct=80, claude_week=80), NOW)
     assert r["mode"] == "suggest" and r["suggestion"] == "grokbot", r
-    assert "over pace" in r["reason"], r
+    assert r["reason"] == "both over pace", r
     assert r["selects"] is False and "never" not in r, r
     assert [h["id"] for h in r["hosts"]] == ["grokbot", "opus"], r
+    _assert_host_reason(r)
+
+
+@test
+def host_burn_reason_names_the_pool_and_not_the_host():
+    soon = NOW + 12 * 3600
+    r = su.route_host(snap(claude_week=5, claude_week_reset_ts=soon, fable=5, fable_reset_ts=soon), NOW)
+    assert r["suggestion"] == "opus" and r["mode"] == "burn", r
+    assert r["reason"] == "weekly all-models pool burning", r
+    assert r["hosts"][1]["binding"] == "claude_week" and r["hosts"][1]["used_pct"] == 5, r
+    _assert_host_reason(r)
+
+
+@test
+def host_short_window_ahead_drops_max_and_keeps_default_effort():
+    soon = NOW + 12 * 3600
+    r = su.route_host(snap(
+        claude_5h=91, claude_week=5, claude_week_reset_ts=soon, fable=5, fable_reset_ts=soon,
+    ), NOW)
+    assert r["suggestion"] == "grokbot" and r["mode"] == "suggest", r
+    assert r["hosts"][1]["state"] == "ahead" and r["hosts"][1]["binding"] == "claude_5h", r
+    assert r["hosts"][1]["used_pct"] == 91 and r["hosts"][1]["windows"]["claude_week"] == 5, r
+    assert r["hosts"][1]["effort"] == "high" and r["effort"] == "-", r
+    _assert_host_reason(r)
+
+
+@test
+def host_ask_names_the_binding_window_and_leans():
+    r = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34), NOW)
+    assert r["mode"] == "ask" and r["suggestion"] is None, r
+    assert r["reason"] == "Bot over pace, Max 5h full", r
+    assert r["lean"] == ["cursor_models", "grok"], r
+    assert r["hosts"][1]["binding"] == "claude_5h" and r["hosts"][1]["used_pct"] == 100, r
+    assert r["hosts"][1]["windows"]["claude_week"] == 34, r
+    _assert_host_reason(r)
+
+
+@test
+def host_lean_puts_supergrok_first_only_when_it_would_expire():
+    soon = NOW + 12 * 3600
+    burning = su.route_host(snap(
+        bot_pct=100, claude_5h=100, grok_pct=10, grok_reset_ts=soon,
+    ), NOW)
+    assert burning["lean"][0] == "grok", burning["lean"]
+    empty = su.route_host(snap(
+        bot_pct=100, claude_week=100, cursor_auto_pct=100, grok_pct=100,
+    ), NOW)
+    assert empty["lean"] == [], empty
+    _assert_host_reason(burning)
+    _assert_host_reason(empty)
+
+
+@test
+def codex_5h_ahead_does_not_burn_the_weekly_pool():
+    soon = NOW + 12 * 3600
+    blocked = snap(codex=5, codex_reset_ts=soon, codex_5h=91, codex_5h_reset_ts=NOW + 4 * 3600)
+    assert su.pool_status("codex_5h", blocked, NOW)[0] == "ahead"
+    assert su._pool_burning("codex", blocked, NOW) is False
+    assert su.pool_status("codex_5h", snap(), NOW)[0] == "open"
+
+
+@test
+def claude_renewal_date_only_keeps_the_calendar_day():
+    old = su.RENEWALS_FILE
+    saved = dict(su.SUMMARY)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "renewals.json")
+            with open(path, "w") as f:
+                json.dump({"claude": {"at": "2026-10-14", "renews": None}}, f)
+            su.RENEWALS_FILE = path
+            su.claude_renewal()
+            assert su.SUMMARY["claude_renews_date_only"] is True
+            assert su.SUMMARY["claude_renews_on"] == "2026-10-14"
+            assert su.SUMMARY["claude_renews"] is None
+            with open(path, "w") as f:
+                json.dump({"claude": {"at": "2026-10-14T15:00:00-07:00", "renews": False}}, f)
+            su.claude_renewal()
+            assert su.SUMMARY["claude_renews_date_only"] is False
+            assert su.SUMMARY["claude_renews_on"] is None
+            assert su.SUMMARY["claude_renews"] is False
+    finally:
+        su.RENEWALS_FILE = old
+        su.SUMMARY.clear()
+        su.SUMMARY.update(saved)
 
 
 UNDER_HARD_BUG = (

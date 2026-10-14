@@ -419,7 +419,10 @@ def cached_host_json_suggests_grokbot_and_does_not_select():
     assert row["role"] == "host" and row["suggestion"] == "grokbot" and row["selects"] is False, row
     assert row["seat"] == "grokbot" and row["family"] == "grokbot" and row["effort"] == "-", row
     assert row["variant"] == "-" and row["mode"] == "suggest", row
-    assert row["reason"] == "Grok Bot first, then Opus at high on Max", row["reason"]
+    assert row["reason"] == "", row["reason"]
+    assert row["lean"] == ["cursor_models", "grok"], row["lean"]
+    assert row["hosts"][1]["binding"] == "claude_week", row["hosts"][1]
+    assert "(" not in row["reason"] and ")" not in row["reason"]
     hosts = [(h["id"], h["seat"], h["family"], h["effort"], h["state"], h["available"], h["used_pct"]) for h in row["hosts"]]
     assert hosts == [
         ("grokbot", "grokbot", "grokbot", "-", "under", True, 10),
