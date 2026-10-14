@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Seats</string>
+    <string name="widget_description">Subscription seat usage, drawn like the status line's seat bars</string>
+</resources>

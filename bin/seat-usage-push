@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Push the seat-usage cache to a secret gist for the phone widget. Report-only.
+
+The payload is an allowlist: per-seat percent, reset time, window, exhausted
+flag and reading time, grouped into the status line's pools with their hues.
+No token, cookie, email, plan line or `lines` text leaves the machine. The gist
+is secret (unlisted), so anyone holding its id can read these numbers.
+
+  seat-usage-push --setup     create the secret gist, print its id
+  seat-usage-push             refresh a stale cache, then push if it changed
+  seat-usage-push --dry-run   print the payload, push nothing
+
+A systemd --user timer runs it every 5 minutes (systemd/ in quartermaster).
+The widget is quartermaster's android/ and reads the gist through api.github.com.
+"""
+import hashlib, json, os, subprocess, sys, time
+
+H = os.path.expanduser("~")
+CACHE_DIR = os.environ.get("SEAT_USAGE_CACHE_DIR") or f"{H}/.cache/seat-usage"
+CACHE = f"{CACHE_DIR}/latest.json"
+LOCK = f"{CACHE_DIR}/.lock"
+SEAT_USAGE = f"{H}/.local/bin/seat-usage"
+CONFIG = f"{H}/.config/seat-usage/gist.json"
+STATE = f"{H}/.local/state/seat-usage/push.json"
+FILE = "seats.json"
+STALE_S = 600          # same threshold as the status line
+HEARTBEAT_S = 1800     # push an unchanged payload this often so the widget's age stays honest
+WEEK = 7 * 86400
+
+# The status line's pools, in its order: id, name, hue (an xterm-256 index), the as_of
+# key, then each seat's cache keys. The widget draws its rows from this.
+POOLS = [
+    ("cl", "Claude", 208, "claude", [
+        dict(id="claude_5h", short="5h", label="Claude · 5h", pct="claude_5h",
+             reset="claude_5h_reset_ts", window=5 * 3600, optional=True),
+        dict(id="claude_week", short="wk", label="Claude · weekly", pct="claude_week",
+             reset="claude_week_reset_ts", window=WEEK, pace="claude_week_pace", optional=True),
+        dict(id="claude_fable", short="fable", label="Claude · Fable slice", pct="fable",
+             reset="fable_reset_ts", window=WEEK, pace="fable_pace", optional=True),
+    ]),
+    ("cx", "Codex", 141, "chatgpt", [
+        dict(id="codex", short="wk", label="Codex · weekly", pct="codex",
+             reset="codex_reset_ts", window="codex_window_s", pace="codex_pace"),
+    ]),
+    ("cu", "Cursor", 43, "cursor", [
+        dict(id="cursor_models", short="models", label="Cursor · Cursor Models", pct="cursor_auto_pct",
+             reset="cursor_reset_ts", window="cursor_window_s", pace="cursor_auto_pace"),
+        dict(id="cursor_other", short="other", label="Cursor · Other Models", pct="cursor_api_pct",
+             reset="cursor_reset_ts", window="cursor_window_s", pace="cursor_api_pace"),
+        dict(id="grokbot", short="bot", label="Grok Bot · weekly", pct="bot_pct",
+             reset="bot_reset_ts", window="bot_window_s", pace="bot_pace",
+             exhausted="bot_exhausted", optional=True, as_of="grokbot"),
+    ]),
+    ("gk", "SuperGrok", 75, "grok", [
+        dict(id="supergrok", short="wk", label="SuperGrok · weekly", pct="grok_pct",
+             reset="grok_reset_ts", window="grok_window_s", pace="grok_pace",
+             exhausted="grok_exhausted"),
+    ]),
+]
+
+
+def num(v):
+    if isinstance(v, bool) or v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def build_payload(cache):
+    """The widget's view of the cache. Pure: the same cache gives the same payload."""
+    as_of = cache.get("as_of") if isinstance(cache.get("as_of"), dict) else {}
+    pools = []
+    for pid, name, hue, as_of_key, specs in POOLS:
+        seats = []
+        for sp in specs:
+            pct = num(cache.get(sp["pct"]))
+            exhausted = bool(sp.get("exhausted") and cache.get(sp["exhausted"]) is True)
+            if pct is None and not exhausted and sp.get("optional"):
+                continue   # the status line drops these rather than showing "?"
+            w = sp["window"]
+            window = w if isinstance(w, int) else num(cache.get(w))
+            pace = cache.get(sp["pace"]) if sp.get("pace") else None
+            seats.append({
+                "id": sp["id"], "short": sp["short"], "label": sp["label"],
+                "pct": 100.0 if exhausted else pct,
+                "reset_ts": num(cache.get(sp["reset"])),
+                "window_s": window if window and window > 0 else None,
+                "pace": pace if pace in ("under", "on", "ahead") else "",
+                "exhausted": exhausted,
+                "as_of": num(as_of.get(sp.get("as_of", as_of_key))),
+            })
+        if seats:
+            pools.append({"id": pid, "name": name, "hue": hue, "seats": seats})
+    return {"v": 1, "ts": num(cache.get("ts")), "pools": pools}
+
+
+def read_json(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def write_json(path, d):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f)
+    os.replace(tmp, path)
+
+
+def refresh_if_stale():
+    """Run seat-usage under the status line's lock when the cache is old. Waits for it."""
+    try:
+        age = time.time() - os.stat(CACHE).st_mtime
+    except OSError:
+        age = None
+    if age is not None and age <= STALE_S or not os.access(SEAT_USAGE, os.X_OK):
+        return
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    subprocess.run(["flock", "-n", LOCK, "timeout", "90", SEAT_USAGE, "--quiet"],
+                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def gh_api(method, path, body):
+    r = subprocess.run(["gh", "api", "-X", method, path, "--input", "-"],
+                       input=json.dumps(body), capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip().splitlines()
+        raise RuntimeError(msg[-1] if msg else f"gh exited {r.returncode}")
+    return json.loads(r.stdout or "{}")
+
+
+def content(payload):
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+
+
+def setup():
+    cfg = read_json(CONFIG)
+    if cfg and cfg.get("id"):
+        print(f"gist already set up: {cfg['id']}")
+        return 0
+    cache = read_json(CACHE) or {}
+    try:
+        g = gh_api("POST", "gists", {"public": False, "description": "seat-usage for the phone widget",
+                                     "files": {FILE: {"content": content(build_payload(cache))}}})
+    except Exception as e:
+        print(f"seat-usage-push: gist create failed: {e}\n  the gh token needs the gist scope: gh auth refresh -s gist",
+              file=sys.stderr)
+        return 1
+    write_json(CONFIG, {"id": g["id"]})
+    print(f"secret gist created: {g['id']}\nenter this id (or {g.get('html_url')}) in the widget")
+    return 0
+
+
+def push():
+    cfg = read_json(CONFIG)
+    if not cfg or not cfg.get("id"):
+        print("seat-usage-push: no gist yet; run seat-usage-push --setup", file=sys.stderr)
+        return 1
+    refresh_if_stale()
+    cache = read_json(CACHE)
+    if cache is None:
+        print("seat-usage-push: no seat-usage cache", file=sys.stderr)
+        return 1
+    body = content(build_payload(cache))
+    digest = hashlib.sha256(body.encode()).hexdigest()
+    state = read_json(STATE) or {}
+    now = time.time()
+    if state.get("sha") == digest and now - (state.get("pushed_at") or 0) < HEARTBEAT_S:
+        return 0
+    payload = json.loads(body)
+    payload["pushed_at"] = now
+    try:
+        gh_api("PATCH", f"gists/{cfg['id']}", {"files": {FILE: {"content": content(payload)}}})
+    except Exception as e:
+        print(f"seat-usage-push: push failed: {e}", file=sys.stderr)
+        return 1
+    write_json(STATE, {"sha": digest, "pushed_at": now})
+    return 0
+
+
+def main():
+    if "--setup" in sys.argv:
+        return setup()
+    if "--dry-run" in sys.argv:
+        print(json.dumps(build_payload(read_json(CACHE) or {}), indent=2))
+        return 0
+    return push()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
