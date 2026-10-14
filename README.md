@@ -13,6 +13,9 @@ Snapshot of Ryan's "router core": `seat-usage` (reads per-seat/pool usage for Cl
 | `tests/test_seat_usage.py` | test suite (only the two path constants changed, see Tests) |
 | `renewals.example.json` | placeholder for `~/.config/seat-usage/renewals.json` (same schema, placeholder values) |
 | `install.sh` | links or copies the two commands into the frozen paths |
+| `bin/seat-usage-push` | optional: copies an allowlist of the cache to a secret gist for the phone widget |
+| `systemd/` | the `seat-usage-push` timer (every 5 minutes) |
+| `android/` | Seats, the Android home-screen widget that reads that gist |
 
 ## Installed-path contract
 
@@ -70,6 +73,27 @@ On Windows, run the script from Git Bash. Command Prompt and PowerShell cannot r
 A run from a clean checkout of `main` fetches and fast-forwards at most once every 24 hours, then starts again so the new code runs. The timestamp is `~/.cache/quartermaster/seat-usage-update`, beside Conclave's `muse-usage.json`. The command prints `[seat-usage] updated` when the checkout moves.
 
 The check does not stash, reset, or overwrite local changes. A dirty tree, a branch other than `main`, a detached HEAD, a missing network, or any git error skips it and prints nothing. `--route`, `--quiet`, `--cached`, `COUNCIL_VOTER=1`, and `CONCLAVE_VOTER=1` skip it. `QUARTERMASTER_NO_UPDATE=1` turns it off. There is no background task.
+
+## Phone widget (optional)
+
+`bin/seat-usage-push` copies an allowlist of `~/.cache/seat-usage/latest.json` into a secret gist: percent, reset time, window, exhausted flag and reading time per seat, in the status line's pool order and hues. No token, cookie, plan text or `lines` leaves the machine. Anyone holding the gist id can read those numbers. It refreshes a cache older than 10 minutes under the status line's lock, then pushes when the payload changed, and at least every 30 minutes as a heartbeat.
+
+`android/` is Seats, a home-screen widget that draws one row per seat in the status line's order. The phone never reaches the desktop: it reads the gist from `api.github.com` when Android's 30-minute update fires or when you tap it, and keeps the last good copy for when there is no network. `Seats.kt` holds the rules and is unit tested (`cd android && ./gradlew testDebugUnitTest`).
+
+Desktop setup. `install.sh` does not install these; link them by hand:
+
+    ln -s "$PWD/bin/seat-usage-push" ~/.local/bin/seat-usage-push
+    gh auth refresh -s gist                   # the gh token needs the gist scope
+    seat-usage-push --setup                   # creates the gist, prints its id
+    systemctl --user link "$PWD/systemd/seat-usage-push.service" "$PWD/systemd/seat-usage-push.timer"
+    systemctl --user enable --now seat-usage-push.timer
+    seat-usage-push --dry-run                 # print the payload, push nothing
+
+Phone setup: install `seats.apk` from the `seats-latest` release, add the Seats widget, and paste the gist id or URL. CI (`.github/workflows/seats-widget.yml`) rebuilds that release on every push to `main` that touches `android/`.
+
+Signing: this repo is public, so the key is not checked in. CI decodes it from the `SEATS_KEYSTORE_B64` secret, with its password in `SEATS_KEYSTORE_PASSWORD`, so each build installs over the last. Without those secrets (a fork, or a local build) the APK gets the Android debug key, and `main` publishes no release.
+
+Tests: `python3 tests/test_seat_usage_push.py`.
 
 ## Known limits (shipped unfixed)
 

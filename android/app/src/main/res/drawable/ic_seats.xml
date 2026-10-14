@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Four pool bands with a meter each, their pace ticks on one "now" line, as the rail. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <path android:fillColor="#1b2027" android:pathData="M6,0h36a6,6 0 0 1 6,6v36a6,6 0 0 1 -6,6h-36a6,6 0 0 1 -6,-6v-36a6,6 0 0 1 6,-6z" />
+    <path android:fillColor="#ff8700" android:pathData="M6,7h2v7h-2z" />
+    <path android:fillColor="#af87ff" android:pathData="M6,17h2v7h-2z" />
+    <path android:fillColor="#00d7af" android:pathData="M6,27h2v7h-2z" />
+    <path android:fillColor="#5fafff" android:pathData="M6,37h2v5h-2z" />
+    <path android:fillColor="#5b8fd6" android:pathData="M12,9.5h12v2h-12z" />
+    <path android:fillColor="#c43c3c" android:pathData="M24,9.5h6v2h-6z" />
+    <path android:fillColor="#5b8fd6" android:pathData="M18,19.5h4v2h-4z" />
+    <path android:fillColor="#5b8fd6" android:pathData="M16,29.5h8v2h-8z" />
+    <path android:fillColor="#c43c3c" android:pathData="M24,29.5h10v2h-10z" />
+    <path android:fillColor="#c43c3c" android:pathData="M10,38.5h14v2h-14z" />
+    <path android:fillColor="#e4e8ee" android:pathData="M23.25,6h1.5v37h-1.5z" />
+</vector>
