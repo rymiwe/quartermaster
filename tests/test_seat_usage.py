@@ -1639,6 +1639,126 @@ def both_grok_pools_over_pace_seats_opus_and_grok_at_low():
     grok = next(v for v in r["lineup"]["voters"] if v["family"] == "grok")
     assert grok["effort"] == "low", grok
     assert "weaker:" in r["reason"], r
+    assert "kind" not in r and "excluded" not in r, r
+    # An explicit Grok builder still falls back while both pools are ahead.
+    # The pre-launch call has no kind, so the pair stays one vendor.
+    kept = su.route_lineup(s, NOW, builder=grok_builder())
+    assert kept["lineup"]["chair"]["family"] == "opus", kept
+    assert kept["lineup"]["builder"]["family"] == "opus", kept
+    assert [v["family"] for v in kept["lineup"]["voters"]] == ["astra", "grok", "muse"], kept
+
+
+def _voter_families(row):
+    return [v["family"] for v in row["lineup"]["voters"]]
+
+
+@test
+def lineup_kind_excludes_the_author_not_the_chair():
+    # Claude chairs. Grok built the diff. Fable votes. Grok sits out.
+    ahead = snap(cursor_auto_pct=80, grok_pct=80)
+    review = su.route_lineup(ahead, NOW, builder=grok_builder(), kind="review")
+    assert review["mode"] != "ask" and review["lineup"] is not None, review
+    assert review["lineup"]["chair"]["seat"] == "claude", review["lineup"]["chair"]
+    assert review["lineup"]["chair"]["family"] == "opus", review["lineup"]["chair"]
+    assert review["lineup"]["builder"]["family"] == "grok", review["lineup"]["builder"]
+    assert review["lineup"]["builder"]["effort"] == "low", review["lineup"]["builder"]
+    assert _voter_families(review) == ["fable", "astra", "muse"], review
+    assert review["author"] == "grok", review
+    assert review["excluded"]["vendor"] == "xai", review["excluded"]
+    assert review["excluded"]["why"] == "Grok built the diff", review["excluded"]
+    assert review["rule"].startswith("review excludes xAI:"), review["rule"]
+    assert "Fable" in review["rule"], review["rule"]
+    text = su.format_lineup(review)
+    assert "excluded: xAI | grok | Grok built the diff" in text, text
+
+    mixed = su.route_lineup(ahead, NOW, builder=grok_builder(), kind="mixed")
+    assert _voter_families(mixed) == ["fable", "astra", "muse"], mixed
+    assert mixed["excluded"]["why"] == "Grok built the diff", mixed["excluded"]
+    assert mixed["rule"].startswith("mixed excludes xAI:"), mixed["rule"]
+
+    # The brief's author wins over the lineup builder.
+    named = su.route_lineup(ahead, NOW, builder=grok_builder(), kind="review", author="fable")
+    assert named["lineup"]["builder"]["family"] == "grok", named
+    assert named["author"] == "fable" and named["excluded"]["vendor"] == "anthropic", named
+    assert _voter_families(named) == ["astra", "grok", "muse"], named
+    assert named["excluded"]["why"] == "Fable built the diff", named["excluded"]
+
+    # Design seats the chair's vendor. Audit seats everybody until an author is named.
+    design = su.route_lineup(snap(), NOW, kind="design")
+    assert design["lineup"]["chair"]["vendor"] == "xai", design
+    assert _voter_families(design) == ["fable", "astra", "grok", "muse"], design
+    named_design = su.route_lineup(snap(), NOW, kind="design", author="grok")
+    assert named_design["excluded"]["vendor"] is None, named_design
+    assert _voter_families(named_design) == _voter_families(design), named_design
+    assert design["excluded"]["vendor"] is None, design["excluded"]
+    assert design["excluded"]["why"] == "design judges a packet the chair framed", design
+    assert "excluded: none | design judges a packet the chair framed" in su.format_lineup(design)
+
+    audit = su.route_lineup(ahead, NOW, kind="audit")
+    assert audit["lineup"]["chair"]["family"] == "opus", audit
+    assert audit["lineup"]["builder"]["family"] == "opus", audit
+    assert _voter_families(audit) == ["fable", "astra", "grok", "muse"], audit
+    assert audit["author"] is None and audit["excluded"]["why"] == "audit author unknown", audit
+    wrote = su.route_lineup(ahead, NOW, kind="audit", author="grok")
+    assert wrote["lineup"]["builder"]["family"] == "opus", wrote
+    assert wrote["author"] == "grok" and wrote["excluded"]["vendor"] == "xai", wrote
+    assert _voter_families(wrote) == ["fable", "astra", "muse"], wrote
+    assert wrote["excluded"]["why"] == "Grok wrote it", wrote["excluded"]
+
+    # Fable is required when xAI is excluded, not when xAI chairs.
+    blocked = snap(claude_5h=100, cursor_api_pct=100)
+    design_skip = su.route_lineup(blocked, NOW, kind="design")
+    assert design_skip["mode"] != "ask" and design_skip["lineup"] is not None, design_skip
+    assert "fable" not in _voter_families(design_skip), design_skip
+    review_ask = su.route_lineup(blocked, NOW, kind="review")
+    assert review_ask["mode"] == "ask" and review_ask["lineup"] is None, review_ask
+    assert "claude 5h full" in review_ask["reason"], review_ask
+
+    missing = su.route_lineup(snap(), NOW, kind="review", author="composer")
+    assert missing["mode"] == "ask" and "no vendor" in missing["reason"], missing
+    design_typo = su.route_lineup(snap(), NOW, kind="design", author="composer")
+    assert design_typo["mode"] == "ask" and "no vendor" in design_typo["reason"], design_typo
+    bad = su.route_lineup(snap(), NOW, kind="host")
+    assert bad["mode"] == "ask" and "unknown kind" in bad["reason"], bad
+
+
+@test
+def lineup_kind_flags_reject_a_bad_kind_before_a_refresh():
+    now = time.time()
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "latest.json"), "w") as f:
+            json.dump(_shift_snap(now, cursor_auto_pct=80, grok_pct=80), f)
+        home = os.path.join(d, "home")
+        os.makedirs(home)
+        env = os.environ.copy()
+        env["HOME"] = home
+        env["SEAT_USAGE_CACHE_DIR"] = d
+        env["SEAT_USAGE_ASKS"] = os.path.join(d, "asks.jsonl")
+        env["QUARTERMASTER_NO_UPDATE"] = "1"
+
+        def run(args):
+            return subprocess.run(
+                [sys.executable, str(BIN), *args],
+                capture_output=True, text=True, env=env, timeout=15,
+            )
+
+        bad = run(["--route", "lineup", "--cached", "--kind", "host"])
+        assert bad.returncode == 2, (bad.returncode, bad.stderr, bad.stdout)
+        assert "unknown kind" in bad.stderr, bad.stderr
+        lone = run(["--route", "lineup", "--cached", "--author", "grok"])
+        assert lone.returncode == 2 and "--author needs --kind" in lone.stderr, lone.stderr
+        other = run(["--route", "chair", "--cached", "--kind", "review"])
+        assert other.returncode == 2 and "apply to lineup" in other.stderr, other.stderr
+        ok = run([
+            "--route", "lineup", "--cached", "--json",
+            "--kind", "review", "--builder-family", "grok",
+        ])
+        assert ok.returncode == 0, (ok.returncode, ok.stderr, ok.stdout)
+        row = json.loads(ok.stdout)[0]
+        assert row["lineup"]["chair"]["family"] == "opus", row
+        assert row["lineup"]["builder"]["family"] == "grok", row
+        assert [v["family"] for v in row["lineup"]["voters"]] == ["fable", "astra", "muse"], row
+        assert row["excluded"]["vendor"] == "xai", row
 
 
 @test

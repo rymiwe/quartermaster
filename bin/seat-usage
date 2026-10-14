@@ -1724,11 +1724,13 @@ FAMILY_VENDOR = {}
 _FAMILY_NAME = {}
 load_config()
 
-# Voter effort follows the same burn rule as chair and builder. Grok is on the
-# roster and is excluded when its vendor chairs or builds. A capped pool drops
-# the leg. A pool that is ahead of pace still votes, at low. Muse is Meta,
-# which never chairs or builds, so the vendor rule does not exclude it. A
-# capped Muse window drops it. An unknown reading asks.
+# Voter effort follows the same burn rule as chair and builder. With no kind,
+# the chair's vendor is excluded. Chair and builder are one vendor then, so
+# the builder sits out too. With a kind, exclusion follows what is judged:
+# nobody for design, the author's vendor for review and mixed, and the named
+# author for audit. A capped pool drops the leg. A pool that is ahead of
+# pace still votes, at low. A capped Muse window drops it. An unknown
+# reading asks.
 VOTER_ROSTER = (
     {"family": "fable", "seat": "claude", "pools": ("fable", "claude_week", "claude_5h")},
     {"family": "astra", "seat": "chatgpt", "pools": ("codex",)},
@@ -1965,11 +1967,19 @@ def _opus_row(role, s, now, states, prefix):
     return row
 
 
-def _xai_worker(role, s, now, states):
-    """A Grok chair or builder, an ask row, or None when xAI has no usable pool."""
+def _xai_worker(role, s, now, states, keep_ahead=False):
+    """A Grok chair or builder, an ask row, or None when xAI has no usable pool.
+
+    keep_ahead holds an explicit builder on an ahead pool. The pool can still
+    take the work. A capped pool still returns None.
+    """
     kind, band = _grok_pools(states)
     if kind == "pool":
         return _grok_row(role, _spend_first(band, s, now), s, now, states)
+    if kind == "over" and keep_ahead:
+        ahead = [pid for pid in _serving("grok") if states[pid][0] == "ahead"]
+        if ahead:
+            return _grok_row(role, _spend_first(ahead, s, now), s, now, states)
     if kind == "ask":
         parts, failed = [], False
         for pid in band:
@@ -1989,14 +1999,15 @@ def _route_worker(role, s, now, states=None):
     return score_route(role, s, now, states)
 
 
-def _constrained_worker(family, role, s, now, states):
+def _constrained_worker(family, role, s, now, states, keep_ahead=False):
     """The caller's family, or None when that family's pool is capped.
 
     An unknown reading is an ask. A family that is not a capable chair or builder
     is an ask. None means the caller should use the unconstrained route.
+    keep_ahead holds a Grok builder whose pools are ahead of pace.
     """
     if family == "grok":
-        return _xai_worker(role, s, now, states)
+        return _xai_worker(role, s, now, states, keep_ahead=keep_ahead)
     if family == "opus":
         state = _join_open(states["claude_week"][0], states["claude_5h"][0])
         if state == "unknown":
@@ -2007,13 +2018,13 @@ def _constrained_worker(family, role, s, now, states):
     return _ask_row(role, s, now, f"builder family {family} is not a capable builder: {_ASK}")
 
 
-def _resolve_builder(family, s, now, states):
+def _resolve_builder(family, s, now, states, keep_ahead=False):
     routed = _route_worker("builder", s, now, states)
     if family is None:
         return routed
     if family not in FAMILY_VENDOR:
         return _ask_row("builder", s, now, f"builder family {family} has no vendor: {_ASK}")
-    matched = _constrained_worker(family, "builder", s, now, states)
+    matched = _constrained_worker(family, "builder", s, now, states, keep_ahead=keep_ahead)
     if matched is not None:
         return matched
     return routed
@@ -2075,8 +2086,8 @@ def _muse_voter(states, s, now, skip_ahead=True):
 
     The lineup passes skip_ahead false: an ahead window still votes, at the
     low effort the weekly pool gives. Ask mode passes true and leaves an
-    ahead window out. An unknown reading asks. Meta never chairs, so the
-    vendor rule does not remove this voter.
+    ahead window out. An unknown reading asks. Meta does not chair, so the
+    no-kind rule does not remove this voter. A kind that excludes Meta does.
     """
     watched = ("muse_5h", "muse_week")
     if any(states[pid][0] == "unknown" for pid in watched):
@@ -2111,14 +2122,15 @@ def _lineup_mode(chair, builder, voters, weaker):
     return "default"
 
 
-def _collect_voters(chair, states, s, now):
-    """Voters whose vendor is not the chair's. One voter is a degraded lineup.
+def _collect_voters(states, s, now, excluded_vendor):
+    """Voters outside one excluded vendor. None excludes nobody.
 
-    An unknown reading the lineup depends on asks. Fable is required while xAI
-    chairs: a full 5h window with no Other Models room asks and names the reopen.
+    One voter is a degraded lineup. An unknown reading the lineup depends on
+    asks. Fable is required when the excluded vendor is xAI: a full 5h window
+    with no Other Models room asks and names the reopen.
     """
-    excluded = {chair["vendor"]}
-    required = chair["vendor"] == "xai"
+    excluded = {excluded_vendor} if excluded_vendor else set()
+    required = excluded_vendor == "xai"
     voters = []
     for spec in VOTER_ROSTER:
         if FAMILY_VENDOR[spec["family"]] in excluded:
@@ -2140,38 +2152,50 @@ def _collect_voters(chair, states, s, now):
     return "ok", voters
 
 
-def route_lineup(s, now, builder=None):
-    """One lineup, or ask.
+LINEUP_KINDS = ("design", "review", "mixed", "audit")
 
-    Chair and builder come from one vendor. Grok while either Grok pool is under
-    or on pace. Opus only when both are over pace, or when both are capped.
-    A builder family the caller already used is kept when that pool can take it,
-    and dropped when the pool is capped. A voter is dropped only when its pool
-    is capped. Ahead of pace still votes, at low. An unknown reading asks.
-    Voter effort follows burn. One voter is a weaker lineup, not an ask.
+
+def _kind_rule(kind, excluded_vendor, voters):
+    names = _name_list(voters)
+    if not excluded_vendor:
+        return f"{kind} excludes nobody: {names} vote"
+    shown = _VENDOR_NAME.get(excluded_vendor, excluded_vendor)
+    return f"{kind} excludes {shown}: {names} vote"
+
+
+def _lineup_exclusion(kind, author, builder_row):
+    """Who sits out, and why. author is a family or None.
+
+    Review and mixed default the author to the builder. Audit does not.
+    Design excludes nobody. An unknown author family is an ask.
     """
-    states = {pid: pool_status(pid, s, now) for pid in POOLS}
-    family = None if builder is None else builder.get("family")
-    builder_row = _resolve_builder(family, s, now, states)
-    if builder_row.get("mode") == "ask":
-        return _lineup_ask(s, now, states, builder_row.get("reason") or _ASK, [])
-    builder_row = _with_vendor(builder_row)
-    if builder_row.get("family") == "opus":
-        prefix = builder_row["reason"].split(":", 1)[0]
-        chair_row = _opus_row("chair", s, now, states, prefix)
+    if kind == "design":
+        if author and author not in FAMILY_VENDOR:
+            return {"ask": f"author family {author} has no vendor: {_ASK}"}
+        return {"vendor": None, "name": None, "family": None,
+                "why": "design judges a packet the chair framed", "author": author}
+    if kind in ("review", "mixed"):
+        family = author or builder_row.get("family")
+    elif kind == "audit":
+        if not author:
+            return {"vendor": None, "name": None, "family": None,
+                    "why": "audit author unknown", "author": None}
+        family = author
     else:
-        chair_row = _route_worker("chair", s, now, states)
-    if chair_row.get("mode") == "ask":
-        return _lineup_ask(s, now, states, chair_row.get("reason") or _ASK, [])
-    chair_row = _with_vendor(chair_row)
-    if chair_row.get("vendor") != builder_row.get("vendor"):
-        return _lineup_ask(s, now, states, "chair and builder vendors differ: " + _ASK, [])
+        return {"ask": f"unknown kind {kind}: {_ASK}"}
+    vendor = FAMILY_VENDOR.get(family)
+    if not vendor:
+        return {"ask": f"author family {family} has no vendor: {_ASK}"}
+    fam_name = _FAMILY_NAME.get(family, family)
+    if kind == "audit":
+        why = f"{fam_name} wrote it"
+    else:
+        why = f"{fam_name} built the diff"
+    return {"vendor": vendor, "name": _VENDOR_NAME.get(vendor, vendor),
+            "family": family, "why": why, "author": family}
 
-    status, payload = _collect_voters(chair_row, states, s, now)
-    if status == "ask":
-        return _lineup_ask(s, now, states, payload, [])
-    voters = payload
-    rule = _rule_text(chair_row, builder_row, voters)
+
+def _emit_lineup(s, now, states, chair_row, builder_row, voters, rule):
     weaker = None
     if len(voters) < 2:
         names = _name_list(voters)
@@ -2193,6 +2217,82 @@ def route_lineup(s, now, builder=None):
                                   "voters": [_party(v) for v in voters], "rule": rule}],
             "alternatives": [], "reading_age_s": seated,
             "usage": _usage_snapshot(states, s), "usage_age_s": _snapshot_age(s, now)}
+
+
+def route_lineup(s, now, builder=None, kind=None, author=None):
+    """One lineup, or ask.
+
+    With no kind, chair and builder come from one vendor and that vendor does
+    not vote. Grok while either Grok pool is under or on pace. Opus only when
+    both are over pace, or when both are capped. That is the pre-launch call.
+
+    With a kind, the chair is routed on its own and may differ from the builder.
+    Design excludes nobody. Review and mixed exclude the author, defaulting to
+    the builder. Audit excludes the author when one is named. Fable is required
+    when the excluded vendor is xAI.
+
+    A builder family the caller already used is kept when that pool can take it,
+    and dropped when the pool is capped. With a kind, an ahead pool can still
+    take that family. A voter is dropped only when its pool is capped. Ahead of
+    pace still votes, at low. An unknown reading asks. Voter effort follows burn.
+    One voter is a weaker lineup, not an ask.
+    """
+    states = {pid: pool_status(pid, s, now) for pid in POOLS}
+    family = None if builder is None else builder.get("family")
+    if kind is not None:
+        if not isinstance(kind, str):
+            return _lineup_ask(s, now, states, f"unknown kind: {_ASK}", [])
+        kind = kind.strip().lower()
+        if kind not in LINEUP_KINDS:
+            return _lineup_ask(s, now, states, f"unknown kind {kind}: {_ASK}", [])
+        if isinstance(family, str):
+            family = family.strip().lower()
+        if isinstance(author, str):
+            author = author.strip().lower() or None
+        elif author is not None:
+            return _lineup_ask(s, now, states, f"author family {author} has no vendor: {_ASK}", [])
+    builder_row = _resolve_builder(family, s, now, states, keep_ahead=kind is not None and family is not None)
+    if builder_row.get("mode") == "ask":
+        return _lineup_ask(s, now, states, builder_row.get("reason") or _ASK, [])
+    builder_row = _with_vendor(builder_row)
+    if kind is None:
+        if builder_row.get("family") == "opus":
+            prefix = builder_row["reason"].split(":", 1)[0]
+            chair_row = _opus_row("chair", s, now, states, prefix)
+        else:
+            chair_row = _route_worker("chair", s, now, states)
+    else:
+        chair_row = _route_worker("chair", s, now, states)
+    if chair_row.get("mode") == "ask":
+        return _lineup_ask(s, now, states, chair_row.get("reason") or _ASK, [])
+    chair_row = _with_vendor(chair_row)
+    if kind is None and chair_row.get("vendor") != builder_row.get("vendor"):
+        return _lineup_ask(s, now, states, "chair and builder vendors differ: " + _ASK, [])
+
+    if kind is None:
+        excluded_vendor = chair_row["vendor"]
+        excl = None
+    else:
+        excl = _lineup_exclusion(kind, author, builder_row)
+        if excl.get("ask"):
+            return _lineup_ask(s, now, states, excl["ask"], [])
+        excluded_vendor = excl["vendor"]
+
+    status, payload = _collect_voters(states, s, now, excluded_vendor)
+    if status == "ask":
+        return _lineup_ask(s, now, states, payload, [])
+    voters = payload
+    if kind is None:
+        rule = _rule_text(chair_row, builder_row, voters)
+    else:
+        rule = _kind_rule(kind, excluded_vendor, voters)
+    row = _emit_lineup(s, now, states, chair_row, builder_row, voters, rule)
+    if excl is not None:
+        row["kind"] = kind
+        row["author"] = excl["author"]
+        row["excluded"] = {"vendor": excl["vendor"], "name": excl["name"],
+                           "family": excl["family"], "why": excl["why"]}
+    return row
 
 
 def _host_entry(id_, seat, family, effort, state, used, age, binding, windows):
@@ -2434,6 +2534,13 @@ def format_lineup(row):
     for voter in row["lineup"]["voters"]:
         lines.append(f"  voter: {voter['seat']} | {voter['family']} | {voter['effort']} | "
                      f"{voter['variant']} | {voter['vendor']}")
+    excl = row.get("excluded")
+    if isinstance(excl, dict):
+        if excl.get("vendor"):
+            lines.append(f"  excluded: {excl.get('name') or excl['vendor']} | "
+                         f"{excl.get('family') or '-'} | {excl.get('why') or ''}")
+        else:
+            lines.append(f"  excluded: none | {excl.get('why') or ''}")
     return "\n".join(lines)
 
 
@@ -2476,6 +2583,22 @@ def cmd_route():
         print(f"unknown role {role}; roles: {', '.join(known)}", file=sys.stderr)
         raise SystemExit(2)
     builder = None
+    kind = None
+    author = None
+    if "--kind" in argv or "--author" in argv:
+        if role != "lineup":
+            print("--kind and --author apply to lineup", file=sys.stderr)
+            raise SystemExit(2)
+        if "--kind" in argv:
+            kind = _opt(argv, "--kind").strip().lower()
+            if kind not in LINEUP_KINDS:
+                print(f"unknown kind {kind}; kinds: {', '.join(LINEUP_KINDS)}", file=sys.stderr)
+                raise SystemExit(2)
+        if "--author" in argv:
+            if kind is None:
+                print("--author needs --kind", file=sys.stderr)
+                raise SystemExit(2)
+            author = _opt(argv, "--author").strip().lower()
     if role == "lineup" and "--builder-family" in argv:
         # Family only. Seat and effort are resolved once the summary is loaded.
         builder = {"role": "builder", "family": _opt(argv, "--builder-family")}
@@ -2497,7 +2620,7 @@ def cmd_route():
         summary = refresh(seats)
     now = time.time()
     if role == "lineup":
-        rows = [route_lineup(summary, now, builder=builder)]
+        rows = [route_lineup(summary, now, builder=builder, kind=kind, author=author)]
     elif role == "host":
         rows = [route_host(summary, now)]
     elif role == "ask":
