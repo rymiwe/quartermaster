@@ -2229,6 +2229,10 @@ def route_host(s, now):
         return finish(mode, _id, reason, top)
     if bot_state == "ahead" and opus_state == "ahead":
         return finish("suggest", "grokbot", "both over pace", bot)
+    # A failed Max read must not hide a Bot that can still take the session.
+    if opus_state == "unknown" and bot["available"]:
+        reason = "over pace" if bot_state == "ahead" else ""
+        return finish("suggest", "grokbot", reason, bot)
     if opus_state == "unknown":
         return finish("ask", None, _max_unknown_reason(states), bot)
     parts = [p for p in (_host_phrase("grokbot", bot_state), _host_phrase(opus_binding, opus_state)) if p]

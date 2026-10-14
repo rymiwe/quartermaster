@@ -1334,6 +1334,16 @@ def host_unknown_opus_does_not_hide_an_open_bot():
 
 
 @test
+def host_unknown_max_does_not_hide_an_ahead_bot():
+    r = su.route_host(without_as_of(snap(bot_pct=93), "claude"), NOW)
+    assert r["suggestion"] == "grokbot" and r["mode"] == "suggest", r
+    assert r["reason"] == "over pace", r
+    assert "reading unknown" not in r["reason"], r
+    assert r["hosts"][1]["state"] == "unknown", r
+    _assert_host_reason(r)
+
+
+@test
 def host_burn_spends_opus_before_the_bot():
     soon = NOW + 12 * 3600
     r = su.route_host(snap(claude_week=5, claude_week_reset_ts=soon, fable=5, fable_reset_ts=soon), NOW)
