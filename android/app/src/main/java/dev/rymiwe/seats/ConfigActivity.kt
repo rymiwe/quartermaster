@@ -3,6 +3,7 @@ package dev.rymiwe.seats
 import android.app.Activity
 import android.appwidget.AppWidgetManager
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
@@ -10,6 +11,7 @@ import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.view.WindowInsets
 import android.widget.TextView
 import kotlin.concurrent.thread
 
@@ -58,6 +60,19 @@ class ConfigActivity : Activity() {
         setContentView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(pad, pad, pad, pad)
+            // targetSdk 35 lays the window out edge to edge on Android 15, so the
+            // content starts under the status bar. Pad by the system bars and the IME.
+            setOnApplyWindowInsetsListener { v, insets ->
+                if (Build.VERSION.SDK_INT >= 30) {
+                    val bars = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
+                    v.setPadding(pad + bars.left, pad + bars.top, pad + bars.right, pad + bars.bottom)
+                } else {
+                    @Suppress("DEPRECATION")
+                    v.setPadding(pad + insets.systemWindowInsetLeft, pad + insets.systemWindowInsetTop,
+                        pad + insets.systemWindowInsetRight, pad + insets.systemWindowInsetBottom)
+                }
+                insets
+            }
             addView(help, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(input, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(save, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
