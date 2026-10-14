@@ -39,6 +39,15 @@ RENEWALS_FILE = os.environ.get("SEAT_USAGE_RENEWALS") or f"{H}/.config/seat-usag
 SUMMARY = {"ts": NOW, "as_of": {}, "v": 1}   # compact fields for the status line; no tokens, no PII
 STALE_HOURS = 3       # a seat reading older than this gets no burn line and is marked stale
 ROUTE_FRESH_S = 600   # a reading older than this is unknown to the router (status line refreshes at 10 min)
+# The usage endpoint publishes no limit and answers 429 with Retry-After: 0
+# (anthropics/claude-code#30930, still open 2026-10-14). So the floor is ours:
+# one call per USAGE_MIN_INTERVAL_S after a good read, and a 429 without a
+# usable Retry-After waits USAGE_BACKOFF_S, doubling per 429 in a row up to
+# USAGE_BACKOFF_MAX_S. The floor stays under ROUTE_FRESH_S so a route still
+# sees a fresh reading.
+USAGE_MIN_INTERVAL_S = float(os.environ.get("SEAT_USAGE_MIN_INTERVAL_S") or 300)   # tests set 0
+USAGE_BACKOFF_S = 300
+USAGE_BACKOFF_MAX_S = 1800
 
 def get(url, headers, timeout=8):
     req = urllib.request.Request(url, headers={"User-Agent": "seat-usage", **headers})
@@ -109,6 +118,17 @@ def _remember_deadline(url, deadline, limits):
     limits[url] = deadline
     _store_rate_limits(limits)
 
+def _streak_key(url):
+    return f"{url}#429s"
+
+def _backoff_deadline(retry_after, limits, now):
+    """Deadline after a 429: the larger of Retry-After and our doubling backoff."""
+    streak = limits.get(_streak_key(ANTHROPIC_USAGE_URL))
+    streak = streak if isinstance(streak, int) and not isinstance(streak, bool) and streak > 0 else 0
+    limits[_streak_key(ANTHROPIC_USAGE_URL)] = streak + 1
+    ours = now + min(USAGE_BACKOFF_S * (2 ** min(streak, 16)), USAGE_BACKOFF_MAX_S)
+    return ours if retry_after is None else max(retry_after, ours)
+
 def _acquire_rate_lock(timeout=None):
     """Exclusive lock for the usage call. Not the cache .lock: full_run holds that one."""
     if timeout is None:
@@ -145,13 +165,13 @@ def _release_rate_lock(fh):
         pass
 
 def _usage_get(headers, timeout=8):
-    """GET the usage URL unless this cache dir is inside a Retry-After window.
+    """GET the usage URL unless this cache dir is inside a wait window.
 
     The deadline is on disk, so a burst in this process or another one (the
     status line's spawn, --route, a full run) shares it. The lock is held
     across the HTTP call: the next caller waits, sees the deadline, and
-    does not send. A 401 is not recorded. No quota is invented when
-    Retry-After is absent.
+    does not send. A good read sets the USAGE_MIN_INTERVAL_S floor. A 429
+    sets the backoff in _backoff_deadline. A 401 is not recorded.
     """
     url = ANTHROPIC_USAGE_URL
     lock = _acquire_rate_lock()
@@ -164,14 +184,19 @@ def _usage_get(headers, timeout=8):
             body = get(url, headers, timeout)
         except urllib.error.HTTPError as e:
             if getattr(e, "code", None) == 429:
-                deadline = _retry_after_deadline(
-                    e.headers.get("Retry-After") if e.headers is not None else None, time.time())
-                if deadline is not None and deadline > time.time():
-                    _remember_deadline(url, deadline, limits)
-                    raise _RateLimited() from e
+                now = time.time()
+                retry_after = _retry_after_deadline(
+                    e.headers.get("Retry-After") if e.headers is not None else None, now)
+                _remember_deadline(url, _backoff_deadline(retry_after, limits, now), limits)
+                raise _RateLimited() from e
             raise
-        if url in limits:
+        had = dict(limits)
+        limits.pop(_streak_key(url), None)
+        if USAGE_MIN_INTERVAL_S > 0:
+            limits[url] = time.time() + USAGE_MIN_INTERVAL_S
+        else:
             limits.pop(url, None)
+        if limits != had:
             _store_rate_limits(limits)
         return body
     finally:
@@ -2772,8 +2797,8 @@ def full_run(quiet=False, timeout=LOCK_TIMEOUT):
     """Reread every seat, merge into the cache, and stamp ts to this run.
 
     Takes the same lock as refresh. A failed seat keeps its last numbers and
-    loses as_of. A usage 429 with Retry-After keeps that seat's as_of and
-    does not call again until the deadline. On lock timeout the cache is not
+    loses as_of. A usage 429 keeps that seat's as_of and does not call
+    again until the backoff deadline. On lock timeout the cache is not
     written; the lines are still printed when not quiet. An inherited lock
     fd is not unlocked.
     """

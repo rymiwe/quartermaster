@@ -921,6 +921,7 @@ def seat_http_sandbox(profile_url, usage_url):
         "H": su.H, "HISTORY": su.HISTORY,
         "ANTHROPIC_PROFILE_URL": su.ANTHROPIC_PROFILE_URL,
         "ANTHROPIC_USAGE_URL": su.ANTHROPIC_USAGE_URL,
+        "USAGE_MIN_INTERVAL_S": su.USAGE_MIN_INTERVAL_S,
     }
     fns = {name: getattr(su, name) for name in ("codex", "cursor", "grok")}
     old_env = {key: os.environ.get(key) for key in ("NO_PROXY", "no_proxy")}
@@ -938,6 +939,8 @@ def seat_http_sandbox(profile_url, usage_url):
             su.ANTHROPIC_PROFILE_URL = profile_url
             su.ANTHROPIC_USAGE_URL = usage_url
             su.NOW = time.time()
+            # Tests that count calls opt into the floor themselves.
+            su.USAGE_MIN_INTERVAL_S = 0
             su.codex = lambda: []
             su.cursor = lambda: []
             su.grok = lambda: []
@@ -1017,7 +1020,7 @@ def usage_429_keeps_as_of_until_retry_after():
             assert "claude" not in missed["as_of"], missed["as_of"]
             assert any("usage failed: HTTPError" in ln for ln in missed["lines"]), missed["lines"]
             stored = json.load(open(su._rate_limit_path()))
-            assert list(stored) == [usage], stored
+            assert stored[f"{usage}#429s"] == 1, stored
             delta = stored[usage] - t0
             assert 1700 <= delta <= 1720, delta
             again = _quiet_cache()
@@ -1133,23 +1136,67 @@ def profile_401_expired_token_is_not_a_rate_limit():
 
 
 @test
-def usage_429_without_retry_after_does_not_invent_a_window():
+def usage_429_without_retry_after_backs_off_and_doubles():
+    # anthropics/claude-code#30930: the live endpoint sends 429 with no usable
+    # Retry-After. Fake server only.
     with anthropic_server() as server:
         profile, usage = server_urls(server)
         with seat_http_sandbox(profile, usage):
             server.usage_mode = "ok"
             fresh = _quiet_cache()
-            assert fresh["as_of"]["claude"] == su.NOW, fresh["as_of"]
+            good_as_of = fresh["as_of"]["claude"]
             assert server.usage_hits == 1, server.usage_hits
             server.usage_mode = "bare429"
-            failed = _quiet_cache()
+            t0 = time.time()
+            limited = _quiet_cache()
             assert server.usage_hits == 2, server.usage_hits
-            assert server.retry_sent == [], server.retry_sent
-            assert "claude" not in failed["as_of"], failed["as_of"]
-            assert any("usage failed: HTTPError" in ln for ln in failed["lines"]), failed["lines"]
-            assert not os.path.exists(su._rate_limit_path()) or usage not in json.load(open(su._rate_limit_path()))
+            assert limited["as_of"]["claude"] == good_as_of, limited["as_of"]
+            assert limited["fable"] == 33, limited
+            assert not any("usage failed" in ln for ln in limited["lines"]), limited["lines"]
+            stored = json.load(open(su._rate_limit_path()))
+            assert 295 <= stored[usage] - t0 <= 310, stored[usage] - t0
             _quiet_cache()
-            assert server.usage_hits == 3, server.usage_hits
+            assert server.usage_hits == 2, server.usage_hits
+
+            waits = []
+            for _ in range(4):
+                stored = json.load(open(su._rate_limit_path()))
+                stored[usage] = time.time() - 1
+                with open(su._rate_limit_path(), "w") as f:
+                    json.dump(stored, f)
+                t = time.time()
+                _quiet_cache()
+                waits.append(round((json.load(open(su._rate_limit_path()))[usage] - t) / 100) * 100)
+            assert waits == [600, 1200, 1800, 1800], waits
+            assert server.usage_hits == 6, server.usage_hits
+
+            stored = json.load(open(su._rate_limit_path()))
+            stored[usage] = time.time() - 1
+            with open(su._rate_limit_path(), "w") as f:
+                json.dump(stored, f)
+            server.usage_mode = "ok"
+            su.NOW = time.time()
+            renewed = _quiet_cache()
+            assert renewed["as_of"]["claude"] == su.NOW, renewed["as_of"]
+            assert json.load(open(su._rate_limit_path())) == {}
+
+
+@test
+def usage_good_read_sets_a_floor():
+    with anthropic_server() as server:
+        profile, usage = server_urls(server)
+        with seat_http_sandbox(profile, usage):
+            su.USAGE_MIN_INTERVAL_S = 300
+            server.usage_mode = "ok"
+            first = _quiet_cache()
+            assert server.usage_hits == 1, server.usage_hits
+            su.NOW = time.time() + 5
+            second = _quiet_cache()
+            assert server.usage_hits == 1, server.usage_hits
+            assert second["as_of"]["claude"] == first["as_of"]["claude"], second["as_of"]
+            assert second["fable"] == 33, second
+            stored = json.load(open(su._rate_limit_path()))
+            assert 295 <= stored[usage] - time.time() <= 300, stored
 
 
 def grok_builder():

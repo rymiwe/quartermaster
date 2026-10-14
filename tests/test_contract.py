@@ -196,6 +196,8 @@ def claude_env(home, profile, usage, extra=None):
         "PYTHONDONTWRITEBYTECODE": "1",
         "SEAT_USAGE_ANTHROPIC_PROFILE": profile,
         "SEAT_USAGE_ANTHROPIC_USAGE": usage,
+        # Runs back to back against one cache; the call floor would serve the first reading.
+        "SEAT_USAGE_MIN_INTERVAL_S": "0",
         "NO_PROXY": "*",
         "no_proxy": "*",
     }
