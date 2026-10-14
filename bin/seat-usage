@@ -6,18 +6,22 @@ prints a token. Every source is best-effort with a short timeout; a failure
 prints a one-line reason and never exits non-zero. A synchronous
 SessionStart hook prints the cached lines (--cached) so the numbers land in
 context when routing is decided.
-A Muse line is read from ~/.cache/quartermaster/muse-usage.json, which
-Conclave writes. A parsed snapshot is copied into this cache (muse_5h,
-muse_week, and their resets, stamped as_of["muse"]), including one whose
-5h window has already reset. It is display-only and is not a routing
-input. A missing or unreadable file drops that stamp and records the reason.
+A Muse line is read from ~/.cache/quartermaster/muse-usage.json. Conclave
+writes that file, and a live run asks `muse serve` for a new reading when
+the file is missing, older than about 10 minutes, or its 5h reset is not a
+current window. That ask is one short reply. A parsed snapshot is copied
+into this cache (muse_5h, muse_week, and their resets, stamped
+as_of["muse"]), including one whose 5h window has already reset. It is
+display-only and is not a routing input. A missing or unreadable file
+drops that stamp and records the reason. SEAT_USAGE_SKIP_MUSE=1 skips the
+ask. --cached never asks.
 A run from a clean checkout of main fetches and fast-forwards at most
 once a day, prints one updated line, and starts again on the new code.
 --route, --quiet, --cached, COUNCIL_VOTER=1, and CONCLAVE_VOTER=1 skip that check.
 QUARTERMASTER_NO_UPDATE=1 turns it off. The check never stashes or resets.
 Sources are documented in the Delegation Routing section of ~/.claude/CLAUDE.md.
 """
-import base64, fcntl, glob, json, os, re, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+import base64, fcntl, glob, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 
 H = os.path.expanduser("~")
@@ -2472,6 +2476,229 @@ def muse_line(now=None, path=None):
         return f"{'muse':9}| no data yet"
     return line or f"{'muse':9}| no data yet"
 
+# A status-line refresh is every 10 minutes. Ask Muse on that same cadence.
+MUSE_REFRESH_S = 540
+# A 5h window whose reset is this far before the snapshot was taken is not
+# the current window. The test sample that landed in the live file is a year off.
+MUSE_RESET_SKEW_S = 6 * 60 * 60
+
+def muse_reading_is_current(data, now):
+    """True when the file is a recent snapshot of a plausible 5h window."""
+    snap = _muse_snapshot(data)
+    if snap is None:
+        return False
+    if now - snap["captured"] >= MUSE_REFRESH_S:
+        return False
+    if snap["window_reset"] < snap["captured"] - MUSE_RESET_SKEW_S:
+        return False
+    return True
+
+def _muse_ms(value):
+    """Epoch seconds. Muse's protocol sends milliseconds."""
+    if not _muse_number(value):
+        return None
+    value = float(value)
+    if value > 1_000_000_000_000:
+        value = value / 1000.0
+    return value
+
+def muse_document_from_protocol(usage):
+    """The cache file shape, or None when the protocol object is incomplete."""
+    if not isinstance(usage, dict):
+        return None
+    window, weekly = usage.get("window"), usage.get("weekly")
+    if not isinstance(window, dict) or not isinstance(weekly, dict):
+        return None
+    captured = _muse_ms(usage.get("observedAtMs"))
+    window_reset = _muse_ms(window.get("resetsAtMs"))
+    weekly_reset = _muse_ms(weekly.get("resetsAtMs"))
+    current, weekly_pct = window.get("usedPercent"), weekly.get("usedPercent")
+    minutes = window.get("windowDurationMins")
+    if None in (captured, window_reset, weekly_reset):
+        return None
+    if not _muse_number(current) or not _muse_number(weekly_pct) or not _muse_number(minutes) or minutes <= 0:
+        return None
+    return {
+        "captured_at": datetime.fromtimestamp(captured, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "window": {
+            "used_percent": current,
+            "window_duration_mins": minutes,
+            "resets_at": window_reset,
+        },
+        "weekly": {
+            "used_percent": weekly_pct,
+            "resets_at": weekly_reset,
+        },
+    }
+
+def _write_muse_file(path, doc):
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    tmp = os.path.join(parent, f".{os.path.basename(path)}.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(doc, handle, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+def _uuid7():
+    """UUIDv7. The system Python here is 3.10, which has no uuid.uuid7."""
+    ms = int(time.time() * 1000) & ((1 << 48) - 1)
+    rand = int.from_bytes(os.urandom(10), "big")
+    value = (ms << 80) | (0x7 << 76) | ((rand & 0xFFF) << 64) | (0b10 << 62) | ((rand >> 12) & ((1 << 62) - 1))
+    text = f"{value:032x}"
+    return f"{text[:8]}-{text[8:12]}-{text[12:16]}-{text[16:20]}-{text[20:]}"
+
+def _msp_send(proc, obj):
+    proc.stdin.write((json.dumps(obj) + "\n").encode())
+    proc.stdin.flush()
+
+def _msp_read(proc, buf, deadline):
+    """One JSON line from a Muse host, or None when time runs out."""
+    while time.time() < deadline:
+        if b"\n" in buf[0]:
+            line, rest = buf[0].split(b"\n", 1)
+            buf[0] = rest
+            if line.strip():
+                try:
+                    return json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+            continue
+        if proc.poll() is not None:
+            return None
+        import select
+        ready, _, _ = select.select([proc.stdout], [], [], 0.3)
+        if not ready:
+            continue
+        chunk = os.read(proc.stdout.fileno(), 65536)
+        if not chunk:
+            return None
+        buf[0] += chunk
+    return None
+
+def _muse_protocol_usage(binary, timeout):
+    """Last subscription usage from a short Muse host, or None.
+
+    A new host has nothing stored. usage/read is empty until a reply arrives,
+    so an empty read is followed by one one-word turn. The host is closed
+    either way.
+    """
+    proc = subprocess.Popen(
+        [binary, "serve", "--provider", "meta", "--no-session-log", "--disable-shell", "--disable-write"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        cwd="/tmp", start_new_session=True,
+    )
+    buf = [b""]
+    deadline = time.time() + timeout
+    usage = None
+    try:
+        _msp_send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                         "params": {"clientInfo": {"name": "seat_usage", "version": "0"}}})
+        init = None
+        while time.time() < deadline and init is None:
+            msg = _msp_read(proc, buf, deadline)
+            if msg is None:
+                break
+            if msg.get("id") == 1:
+                init = msg
+        if not init or "result" not in init:
+            return None
+        _msp_send(proc, {"jsonrpc": "2.0", "method": "initialized"})
+        _msp_send(proc, {"jsonrpc": "2.0", "id": 2, "method": "usage/read", "params": {}})
+        while time.time() < deadline and usage is None:
+            msg = _msp_read(proc, buf, deadline)
+            if msg is None:
+                break
+            if msg.get("method") == "usage/changed":
+                usage = msg.get("params")
+                break
+            if msg.get("id") != 2:
+                continue
+            if "error" in msg:
+                return None
+            found = (msg.get("result") or {}).get("usage")
+            if found:
+                usage = found
+                break
+            _msp_send(proc, {"jsonrpc": "2.0", "id": 3, "method": "session/start", "params": {
+                "commandId": _uuid7(),
+                "workspaceRoot": "/tmp",
+                "approvalMode": "denyUnmatched",
+            }})
+            session_id = None
+            while time.time() < deadline and session_id is None and usage is None:
+                msg = _msp_read(proc, buf, deadline)
+                if msg is None:
+                    break
+                if msg.get("method") == "usage/changed":
+                    usage = msg.get("params")
+                    break
+                if msg.get("id") != 3:
+                    continue
+                if "error" in msg:
+                    return None
+                session_id = ((msg.get("result") or {}).get("session") or {}).get("sessionId")
+            if usage is not None or not session_id:
+                break
+            _msp_send(proc, {"jsonrpc": "2.0", "id": 4, "method": "turn/start", "params": {
+                "commandId": _uuid7(),
+                "sessionId": session_id,
+                "reasoningEffort": "none",
+                "input": [{"type": "text", "text": "Reply with the single word ok."}],
+            }})
+            while time.time() < deadline and usage is None:
+                msg = _msp_read(proc, buf, deadline)
+                if msg is None:
+                    break
+                if msg.get("method") == "usage/changed":
+                    usage = msg.get("params")
+                    break
+                if msg.get("id") == 4 and "error" in msg:
+                    return None
+        return usage
+    finally:
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except Exception:
+                proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            proc.kill()
+
+def refresh_muse_usage(now=None, path=None, binary=None, timeout=40):
+    """Write a live Muse snapshot when the file is old or not a current window.
+
+    Returns True when a new file was written. A current file, a missing muse
+    binary, or a failed ask leaves the file as it was and returns False.
+    """
+    if now is None:
+        now = time.time()
+    if path is None:
+        path = muse_usage_path()
+    try:
+        with open(path) as handle:
+            current = json.load(handle)
+    except Exception:
+        current = None
+    if muse_reading_is_current(current, now):
+        return False
+    binary = binary or os.environ.get("SEAT_USAGE_MUSE") or shutil.which("muse")
+    if not binary:
+        return False
+    try:
+        usage = _muse_protocol_usage(binary, timeout)
+    except Exception:
+        return False
+    doc = muse_document_from_protocol(usage)
+    if doc is None:
+        return False
+    _write_muse_file(path, doc)
+    return True
+
 def apply_muse(summary, now, path=None):
     """Copy a parsed Muse snapshot into summary. Display only.
 
@@ -2715,6 +2942,11 @@ def main():
         if os.environ.get("COUNCIL_VOTER") == "1":
             return
         return print_cached()
+    if os.environ.get("SEAT_USAGE_SKIP_MUSE") != "1" and os.environ.get("COUNCIL_VOTER") != "1" and os.environ.get("CONCLAVE_VOTER") != "1":
+        try:
+            refresh_muse_usage(time.time())
+        except Exception:
+            pass
     full_run(quiet="--quiet" in sys.argv)
 
 if __name__ == "__main__":

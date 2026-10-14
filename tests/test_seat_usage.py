@@ -1943,6 +1943,99 @@ def muse_cache_stores_a_parsed_snapshot_even_after_the_window_reset():
     assert missing["muse_week"] == 4, missing
 
 
+def _muse_stub(path, body):
+    path.write_text("#!/usr/bin/env python3\n" + body)
+    path.chmod(0o755)
+
+
+@test
+def muse_refresh_leaves_a_current_file_alone():
+    now = time.time()
+    captured = now - 60
+    window_reset = now + 4 * 3600
+    doc = {
+        "captured_at": su.datetime.fromtimestamp(captured, su.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "window": {"used_percent": 4, "window_duration_mins": 300, "resets_at": window_reset},
+        "weekly": {"used_percent": 11, "resets_at": now + 3 * 86400},
+    }
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        dest = d / "muse-usage.json"
+        dest.write_text(json.dumps(doc))
+        before = dest.read_text()
+        assert su.refresh_muse_usage(now, path=str(dest), binary=str(d / "no-muse")) is False
+        assert dest.read_text() == before
+
+
+@test
+def muse_refresh_replaces_an_ancient_window_from_usage_read():
+    observed = 1_791_994_305_857
+    stub = r'''
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("method") == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"ok": True}}), flush=True)
+    elif msg.get("method") == "usage/read":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"usage": {
+            "observedAtMs": %d,
+            "tier": "t",
+            "window": {"usedPercent": 0, "windowDurationMins": 300, "resetsAtMs": 1792012300000},
+            "weekly": {"usedPercent": 10, "resetsAtMs": 1792368000000},
+        }}}), flush=True)
+        break
+''' % observed
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        binary = d / "muse"
+        _muse_stub(binary, stub)
+        dest = d / "muse-usage.json"
+        dest.write_text(json.dumps({
+            "captured_at": "2026-10-14T04:04:45Z",
+            "window": {"used_percent": 80, "window_duration_mins": 300, "resets_at": 1759910000},
+            "weekly": {"used_percent": 3, "resets_at": "2026-10-19T00:00:00Z"},
+        }))
+        assert su.refresh_muse_usage(time.time(), path=str(dest), binary=str(binary), timeout=5) is True
+        got = json.loads(dest.read_text())
+        assert got["window"]["used_percent"] == 0, got
+        assert got["weekly"]["used_percent"] == 10, got
+        assert got["window"]["resets_at"] == 1792012300, got
+        assert got["captured_at"] == "2026-10-14T16:11:45Z", got
+
+
+@test
+def muse_refresh_uses_the_changed_event_when_the_read_is_empty():
+    stub = r'''
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"ok": True}}), flush=True)
+    elif method == "usage/read":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {}}), flush=True)
+    elif method == "session/start":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"session": {"sessionId": "s1"}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"jsonrpc": "2.0", "method": "usage/changed", "params": {
+            "observedAtMs": 1791994305857,
+            "tier": "t",
+            "window": {"usedPercent": 1, "windowDurationMins": 300, "resetsAtMs": 1792012300000},
+            "weekly": {"usedPercent": 12, "resetsAtMs": 1792368000000},
+        }}), flush=True)
+        break
+'''
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        binary = d / "muse"
+        _muse_stub(binary, stub)
+        dest = d / "muse-usage.json"
+        assert su.refresh_muse_usage(time.time(), path=str(dest), binary=str(binary), timeout=5) is True
+        got = json.loads(dest.read_text())
+        assert got["window"]["used_percent"] == 1, got
+        assert got["weekly"]["used_percent"] == 12, got
+
+
 def _seed_route_cache(path, now):
     path.write_text(json.dumps({
         "v": 1,
