@@ -187,6 +187,11 @@ def _reuse_cached_seat(seat):
             SUMMARY.pop(k, None)
     return [ln for ln in (cached.get("lines") or []) if line_seat(ln) == seat]
 
+def _err(e):
+    """Exception class plus HTTP status, e.g. "HTTPError 401"."""
+    code = getattr(e, "code", None)
+    return f"{e.__class__.__name__} {code}" if code else e.__class__.__name__
+
 def iso_to_ts(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
 
@@ -294,7 +299,7 @@ def claude():
         plan = org.get("rate_limit_tier", "?").replace("default_", "")
         status = org.get("subscription_status", "?")
     except Exception as e:
-        plan, status = "?", f"profile failed: {e.__class__.__name__}"
+        plan, status = "?", f"profile failed: {_err(e)}"
     try:
         u = _usage_get(hdr)
         parts = []
@@ -321,9 +326,9 @@ def claude():
         reused = _reuse_cached_seat("claude")
         if reused is not None:
             return reused
-        out.append(f"claude   | {plan} {status} | usage failed: HTTPError")
+        out.append(f"claude   | {plan} {status} | usage failed: HTTPError 429")
     except Exception as e:
-        out.append(f"claude   | {plan} {status} | usage failed: {e.__class__.__name__}")
+        out.append(f"claude   | {plan} {status} | usage failed: {_err(e)}")
     return out
 
 def claude_renewal():
@@ -456,7 +461,7 @@ def cursor():
         # The plan renews at the billing cycle end (cursor_reset_ts) unless a cancellation is pending.
         SUMMARY["cursor_renews"] = not m.get("pendingCancellationDate")
     except Exception as e:
-        member, status = "?", f"membership failed: {e.__class__.__name__}"
+        member, status = "?", f"membership failed: {_err(e)}"
     SUMMARY["cursor"] = member.replace("pro_plus", "pro+")
     try:
         req = urllib.request.Request("https://cursor.com/api/dashboard/get-current-period-usage", data=b"{}", method="POST",
@@ -484,7 +489,7 @@ def cursor():
         out = [f"cursor   | {member} {status} | cursor models {auto or 0:.0f}%, other models {api or 0:.0f}% (${spent/100:.2f} spent incl. bonus): {pace(pct, end, end - start)}, {when(end)}{odtxt}"]
         SUMMARY["as_of"]["cursor"] = NOW
     except Exception as e:
-        out = [f"cursor   | {member} {status} | usage failed: {e.__class__.__name__}"]
+        out = [f"cursor   | {member} {status} | usage failed: {_err(e)}"]
     return out + [grok_bot(tok)]
 
 def grok_bot(tok):
@@ -506,7 +511,7 @@ def grok_bot(tok):
         state = "" if b.get("hasAvailableUsage", True) else " | ALLOWANCE USED" + (", on-demand" if od else ", blocked")
         return f"grokbot  | {b.get('cursorPlanName', '?')} | week {pct:.1f}%: {pace(pct, end, end - start)}, {when(end)}{state}"
     except Exception as e:
-        return f"grokbot  | usage failed: {e.__class__.__name__}"
+        return f"grokbot  | usage failed: {_err(e)}"
 
 DEFAULT_OP_REF = "op://claude/grok web cookie/credential"
 COOKIE_TRIED = []   # why each cookie source failed, for the grok line
@@ -1469,6 +1474,17 @@ def merge_summary(base, fresh, seats, now=None):
         if seat not in seen:
             merged.extend(lns)
     out["lines"] = merged
+    # Why each failed seat failed, from its own line, so a display can say more
+    # than "read failed". A seat that read cleanly this run drops its entry.
+    errors = dict(base.get("errors") or {})
+    for seat in seat_set:
+        if seat in fresh_as_of:
+            errors.pop(seat, None)
+            continue
+        why = [ln.split("|", 1)[1].strip() for ln in fresh_lines.get(seat, []) if "failed" in ln or "no stored" in ln]
+        if why:
+            errors[seat] = re.sub(r"\s+", " ", why[0])[:120]
+    out["errors"] = errors
     out["burn"] = burn_entries(out, now)
     base_ts = base.get("ts")
     out["ts"] = base_ts if _is_number(base_ts) else fresh.get("ts", now)
