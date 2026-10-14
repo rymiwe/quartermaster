@@ -1322,14 +1322,18 @@ def lineup_unknown_fable_asks():
 
 
 @test
-def lineup_codex_capped_keeps_muse_until_that_pool_is_ahead():
+def lineup_codex_capped_keeps_muse_at_low_when_that_pool_is_ahead():
     r = su.route_lineup(snap(codex=100), NOW)
     assert r["mode"] == "default" and r["lineup"] is not None, r
     assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "muse"], r
     ahead = su.route_lineup(snap(codex=100, muse_week=80), NOW)
     assert ahead["mode"] == "suggest" and ahead["lineup"] is not None, ahead
-    assert [v["family"] for v in ahead["lineup"]["voters"]] == ["fable"], ahead
-    assert "one voter" in ahead["reason"], ahead
+    assert [v["family"] for v in ahead["lineup"]["voters"]] == ["fable", "muse"], ahead
+    muse = next(v for v in ahead["lineup"]["voters"] if v["family"] == "muse")
+    assert muse["effort"] == "low", muse
+    capped = su.route_lineup(snap(codex=100, muse_week=100), NOW)
+    assert [v["family"] for v in capped["lineup"]["voters"]] == ["fable"], capped
+    assert "one voter" in capped["reason"], capped
 
 
 @test
@@ -1622,7 +1626,7 @@ def f2_fable_uses_other_models_when_the_5h_window_is_full():
 
 
 @test
-def both_grok_pools_over_pace_seats_opus_and_no_grok_voter():
+def both_grok_pools_over_pace_seats_opus_and_grok_at_low():
     s = snap(cursor_auto_pct=80, grok_pct=80)
     chair = su.route("chair", s, NOW)
     builder = su.route("builder", s, NOW)
@@ -1631,7 +1635,9 @@ def both_grok_pools_over_pace_seats_opus_and_no_grok_voter():
     r = su.route_lineup(s, NOW)
     assert r["lineup"]["chair"]["effort"] == chair["effort"], r
     assert r["lineup"]["builder"]["effort"] == builder["effort"], r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "muse"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "grok", "muse"], r
+    grok = next(v for v in r["lineup"]["voters"] if v["family"] == "grok")
+    assert grok["effort"] == "low", grok
     assert "weaker:" in r["reason"], r
 
 
@@ -1948,7 +1954,14 @@ def muse_pools_seat_a_voter_and_do_not_change_launch_routes():
     seated = su.route_lineup(snap(), NOW)
     assert [v["family"] for v in seated["lineup"]["voters"]] == ["fable", "astra", "muse"], seated
     ahead = su.route_lineup(snap(muse_5h=80), NOW)
-    assert "muse" not in [v["family"] for v in ahead["lineup"]["voters"]], ahead
+    assert [v["family"] for v in ahead["lineup"]["voters"]] == ["fable", "astra", "muse"], ahead
+    muse = next(v for v in ahead["lineup"]["voters"] if v["family"] == "muse")
+    assert muse["effort"] == "high", muse
+    week = su.route_lineup(snap(muse_week=80), NOW)
+    muse_week = next(v for v in week["lineup"]["voters"] if v["family"] == "muse")
+    assert muse_week["effort"] == "low", muse_week
+    capped = su.route_lineup(snap(muse_5h=100), NOW)
+    assert "muse" not in [v["family"] for v in capped["lineup"]["voters"]], capped
     missing = su.route_lineup(without_as_of(snap(), "muse"), NOW)
     assert missing["mode"] == "ask" and missing["lineup"] is None, missing
     assert "Muse" in missing["reason"], missing

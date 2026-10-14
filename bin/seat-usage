@@ -1725,10 +1725,10 @@ _FAMILY_NAME = {}
 load_config()
 
 # Voter effort follows the same burn rule as chair and builder. Grok is on the
-# roster and is excluded when its vendor chairs or builds, and is not seated
-# on a pool that is over pace. Muse is Meta, which never chairs or builds, so
-# the vendor rule does not exclude it. It is not seated when either Muse
-# window is over pace.
+# roster and is excluded when its vendor chairs or builds. A capped pool drops
+# the leg. A pool that is ahead of pace still votes, at low. Muse is Meta,
+# which never chairs or builds, so the vendor rule does not exclude it. A
+# capped Muse window drops it. An unknown reading asks.
 VOTER_ROSTER = (
     {"family": "fable", "seat": "claude", "pools": ("fable", "claude_week", "claude_5h")},
     {"family": "astra", "seat": "chatgpt", "pools": ("codex",)},
@@ -2073,9 +2073,10 @@ def _fable_voter(states, s, now, required):
 def _muse_voter(states, s, now, skip_ahead=True):
     """Muse on the weekly pool, when neither window is capped.
 
-    skip_ahead drops the voter when either window is over pace. An unknown
-    reading asks, the same as Grok. Meta never chairs, so this voter is not
-    removed by the vendor rule.
+    The lineup passes skip_ahead false: an ahead window still votes, at the
+    low effort the weekly pool gives. Ask mode passes true and leaves an
+    ahead window out. An unknown reading asks. Meta never chairs, so the
+    vendor rule does not remove this voter.
     """
     watched = ("muse_5h", "muse_week")
     if any(states[pid][0] == "unknown" for pid in watched):
@@ -2125,9 +2126,9 @@ def _collect_voters(chair, states, s, now):
         if spec["family"] == "fable":
             status, payload = _fable_voter(states, s, now, required)
         elif spec["family"] == "grok":
-            status, payload = _other_voter("grok", "grok", states, s, now, skip_ahead=True)
+            status, payload = _other_voter("grok", "grok", states, s, now)
         elif spec["family"] == "muse":
-            status, payload = _muse_voter(states, s, now, skip_ahead=True)
+            status, payload = _muse_voter(states, s, now, skip_ahead=False)
         else:
             status, payload = _other_voter(spec["family"], spec["pools"][0], states, s, now)
         if status == "ask":
@@ -2145,9 +2146,9 @@ def route_lineup(s, now, builder=None):
     Chair and builder come from one vendor. Grok while either Grok pool is under
     or on pace. Opus only when both are over pace, or when both are capped.
     A builder family the caller already used is kept when that pool can take it,
-    and dropped when the pool is capped. Muse is seated unless either of its
-    windows is over pace or capped. Voter effort follows burn. One voter
-    is a weaker lineup, not an ask.
+    and dropped when the pool is capped. A voter is dropped only when its pool
+    is capped. Ahead of pace still votes, at low. An unknown reading asks.
+    Voter effort follows burn. One voter is a weaker lineup, not an ask.
     """
     states = {pid: pool_status(pid, s, now) for pid in POOLS}
     family = None if builder is None else builder.get("family")

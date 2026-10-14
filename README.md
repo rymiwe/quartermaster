@@ -161,7 +161,7 @@ route: <role> | <seat> | <family> | <effort> | <variant> | <mode> | <reason> | r
 
 The reason names the winning pool and the score. JSON rows keep the same keys.
 
-Pools, the models they serve, cost tier, and how headroom is read (`usage.used`, `usage.reset`, `usage.window_s` or `usage.window_key`) live in `config/pools.json`. A pool with `"enabled": false` is not routed. Muse has a 5h pool and a weekly pool. Both read the fields `apply_muse` copies out of `muse-usage.json`. A missing reading is unknown. `--route lineup` seats Muse unless either window is over pace or capped. Meta never chairs or builds, so the vendor rule does not drop it. `--route ask` returns two voters on two vendors, the ones with the most headroom. It does not drop a vendor for chairing. Each row has family, effort, and pace.
+Pools, the models they serve, cost tier, and how headroom is read (`usage.used`, `usage.reset`, `usage.window_s` or `usage.window_key`) live in `config/pools.json`. A pool with `"enabled": false` is not routed. Muse has a 5h pool and a weekly pool. Both read the fields `apply_muse` copies out of `muse-usage.json`. A missing reading is unknown. `--route lineup` drops a voter only when its pool is capped. A pool ahead of pace still votes, at low. Muse is dropped only when a Muse window is capped. Meta never chairs or builds, so the vendor rule does not drop it. `--route ask` returns two voters on two vendors, the ones with the most headroom. It leaves Muse out when either window is over pace. It does not drop a vendor for chairing. Each row has family, effort, and pace.
 
 For each enabled pool and role the score is:
 
