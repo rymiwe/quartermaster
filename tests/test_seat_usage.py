@@ -1918,7 +1918,7 @@ def muse_numeric_reset_prints_and_a_past_window_is_stale():
 
 
 @test
-def muse_cache_stamps_a_current_window_and_drops_a_stale_one():
+def muse_cache_stores_a_parsed_snapshot_even_after_the_window_reset():
     captured = datetime.fromisoformat("2026-10-12T15:04:00+00:00").timestamp()
     current = {"v": 1, "as_of": {}, "errors": {"muse": "no data yet"}, "muse_week": 9}
     su.apply_muse(current, NOW, path=str(MUSE_FIXTURES / "fresh.json"))
@@ -1928,11 +1928,13 @@ def muse_cache_stamps_a_current_window_and_drops_a_stale_one():
     assert abs(current["muse_5h_reset_ts"] - datetime.fromisoformat("2099-01-01T00:00:00+00:00").timestamp()) < 1
     assert "muse" not in current["errors"], current
 
-    stale = {"v": 1, "as_of": {"muse": NOW}, "errors": {}, "muse_week": 9, "muse_5h": 1}
+    stale_file = load_muse_fixture("stale-window.json")
+    stale = {"v": 1, "as_of": {}, "errors": {"muse": "no data yet"}, "muse_week": 9, "muse_5h": 1}
     su.apply_muse(stale, NOW, path=str(MUSE_FIXTURES / "stale-window.json"))
-    assert "muse" not in stale["as_of"], stale
-    assert stale["errors"]["muse"] == "stale (window reset)", stale
-    assert stale["muse_week"] == 9 and stale["muse_5h"] == 1, stale
+    assert stale["muse_5h"] == stale_file["window"]["used_percent"], stale
+    assert stale["muse_week"] == stale_file["weekly"]["used_percent"], stale
+    assert stale["as_of"]["muse"] == su._muse_epoch(stale_file["captured_at"]), stale["as_of"]
+    assert "muse" not in stale["errors"], stale
 
     missing = {"v": 1, "as_of": {"muse": NOW}, "muse_week": 4}
     su.apply_muse(missing, NOW, path=str(MUSE_FIXTURES / "no-such.json"))

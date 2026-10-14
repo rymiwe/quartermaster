@@ -7,10 +7,10 @@ prints a one-line reason and never exits non-zero. A synchronous
 SessionStart hook prints the cached lines (--cached) so the numbers land in
 context when routing is decided.
 A Muse line is read from ~/.cache/quartermaster/muse-usage.json, which
-Conclave writes. A current snapshot is copied into this cache (muse_5h,
-muse_week, and their resets, stamped as_of["muse"]). It is display-only
-and is not a routing input. A missing file, or a 5h window whose reset
-has passed, drops that stamp and records the reason.
+Conclave writes. A parsed snapshot is copied into this cache (muse_5h,
+muse_week, and their resets, stamped as_of["muse"]), including one whose
+5h window has already reset. It is display-only and is not a routing
+input. A missing or unreadable file drops that stamp and records the reason.
 A run from a clean checkout of main fetches and fast-forwards at most
 once a day, prints one updated line, and starts again on the new code.
 --route, --quiet, --cached, COUNCIL_VOTER=1, and CONCLAVE_VOTER=1 skip that check.
@@ -2473,11 +2473,11 @@ def muse_line(now=None, path=None):
     return line or f"{'muse':9}| no data yet"
 
 def apply_muse(summary, now, path=None):
-    """Copy a current Muse snapshot into summary. Display only.
+    """Copy a parsed Muse snapshot into summary. Display only.
 
-    A missing file, a shape that does not match, or a 5h window whose reset
-    has passed drops as_of["muse"] and records errors["muse"]. Numbers already
-    in summary stay, the same way a failed seat read keeps its last values.
+    A 5h window whose reset has passed is still stored. The printed line says
+    so. A missing file or a shape that does not match drops as_of["muse"],
+    records errors["muse"], and leaves numbers already in summary alone.
     """
     if not isinstance(summary, dict):
         return summary
@@ -2491,7 +2491,7 @@ def apply_muse(summary, now, path=None):
             snap = _muse_snapshot(json.load(f))
     except Exception:
         snap = None
-    if snap is not None and snap["window_reset"] > now:
+    if snap is not None:
         summary["muse_5h"] = snap["current"]
         summary["muse_5h_reset_ts"] = snap["window_reset"]
         summary["muse_week"] = snap["weekly"]
@@ -2500,7 +2500,7 @@ def apply_muse(summary, now, path=None):
         errors.pop("muse", None)
     else:
         as_of.pop("muse", None)
-        errors["muse"] = "stale (window reset)" if snap is not None else "no data yet"
+        errors["muse"] = "no data yet"
     summary["as_of"] = as_of
     summary["errors"] = errors
     return summary
