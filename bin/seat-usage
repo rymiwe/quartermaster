@@ -3334,8 +3334,77 @@ def maybe_self_update():
     except Exception:
         return
 
+# Which history pool a council leg draws. Muse has no history pool yet.
+DRAW_LEG_POOLS = {"claude": "claude weekly Fable", "opus": "claude weekly all",
+                  "codex": "chatgpt weekly", "grok": "grok week"}
+
+def _leg_pool(voter):
+    model = voter.get("model") or ""
+    if voter.get("name") == "claude" and "thinking" in model:
+        return "cursor other models"   # Cursor Fable IDs carry the thinking suffix
+    return DRAW_LEG_POOLS.get(voter.get("name"))
+
+def run_draws(runs, history):
+    """Percent each pool moved over each finished run, from the history log.
+
+    A run spans ts - elapsed_s to ts. The draw is the first reading at or after
+    the end minus the last reading at or before the start, on the same reset.
+    Other sessions share the pools, so one draw is an upper bound.
+    """
+    by_pool = {}
+    for h in history:
+        if h.get("used_pct") is None or h.get("read_ts") is None:
+            continue
+        by_pool.setdefault(h["pool"], []).append(h)
+    for rows in by_pool.values():
+        rows.sort(key=lambda h: h["read_ts"])
+    out = []
+    for r in runs:
+        if r.get("phase") != "after" or not isinstance(r.get("elapsed_s"), (int, float)):
+            continue
+        end = r["ts"]
+        start = end - r["elapsed_s"]
+        for v in (r.get("ran") or {}).get("voters") or []:
+            pool = _leg_pool(v)
+            rows = by_pool.get(pool) or []
+            before = [h for h in rows if h["read_ts"] <= start]
+            after = [h for h in rows if h["read_ts"] >= end]
+            if not before or not after:
+                continue
+            b, a = before[-1], after[0]
+            if abs((a.get("reset_ts") or 0) - (b.get("reset_ts") or 0)) > 3600:
+                continue   # the window reset mid-run
+            out.append({"run_id": r["run_id"], "kind": r.get("kind"), "leg": v.get("name"),
+                        "pool": pool, "draw": round(a["used_pct"] - b["used_pct"], 2),
+                        "span_s": round(a["read_ts"] - b["read_ts"])})
+    return out
+
+def cmd_draw():
+    runs_path = outcomes_files()[1]
+    def jsonl(path):
+        try:
+            with open(path) as f:
+                return [json.loads(l) for l in f if l.strip()]
+        except OSError:
+            return []
+    draws = run_draws(jsonl(runs_path), jsonl(HISTORY))
+    if not draws:
+        print("no measurable draws")
+        return
+    per = {}
+    for d in draws:
+        per.setdefault((d["pool"], d["kind"]), []).append(d["draw"])
+    print(f"{'pool':22} {'kind':7} {'n':>3} {'median':>7} {'max':>6}")
+    for (pool, kind), xs in sorted(per.items()):
+        xs.sort()
+        med = xs[len(xs) // 2] if len(xs) % 2 else (xs[len(xs) // 2 - 1] + xs[len(xs) // 2]) / 2
+        print(f"{pool:22} {kind or '-':7} {len(xs):>3} {med:>7.2f} {xs[-1]:>6.2f}")
+    print("upper bounds: other sessions share these pools")
+
 def main():
     maybe_self_update()
+    if "--draw" in sys.argv:
+        return cmd_draw()
     if "--route" in sys.argv:
         return cmd_route()
     if "--cached" in sys.argv:

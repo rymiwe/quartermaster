@@ -2712,6 +2712,23 @@ def grok_cookie_reads_seat_usage_op_ref():
             os.environ["SEAT_USAGE_OP"] = old_op
 
 
+@test
+def test_run_draws_diffs_history_around_a_run():
+    hist = [
+        {"pool": "chatgpt weekly", "used_pct": 10, "reset_ts": NOW + WEEK, "read_ts": NOW - 400},
+        {"pool": "chatgpt weekly", "used_pct": 13, "reset_ts": NOW + WEEK, "read_ts": NOW + 30},
+        {"pool": "grok week", "used_pct": 50, "reset_ts": NOW, "read_ts": NOW - 400},
+        {"pool": "grok week", "used_pct": 0, "reset_ts": NOW + WEEK, "read_ts": NOW + 30},
+    ]
+    runs = [
+        {"phase": "before", "run_id": "r", "ts": NOW - 300},
+        {"phase": "after", "run_id": "r", "kind": "review", "ts": NOW, "elapsed_s": 300,
+         "ran": {"voters": [{"name": "codex"}, {"name": "grok"}, {"name": "muse"}]}},
+    ]
+    got = su.run_draws(runs, hist)
+    assert [(d["leg"], d["draw"]) for d in got] == [("codex", 3)], got
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:
