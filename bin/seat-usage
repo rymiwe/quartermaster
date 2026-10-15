@@ -15,10 +15,12 @@ as_of["muse"]), including one whose 5h window has already reset. It is
 display-only and is not a routing input. A missing or unreadable file
 drops that stamp and records the reason. SEAT_USAGE_SKIP_MUSE=1 skips the
 ask. --cached never asks.
-A run from a clean checkout of main fetches and fast-forwards at most
-once a day, prints one updated line, and starts again on the new code.
+Self-update is off by default. With QUARTERMASTER_AUTO_UPDATE=1, a run
+from a clean checkout of main fetches and fast-forwards at most once a
+day, prints one updated line, and starts again on the new code.
 --route, --quiet, --cached, COUNCIL_VOTER=1, and CONCLAVE_VOTER=1 skip that check.
-QUARTERMASTER_NO_UPDATE=1 turns it off. The check never stashes or resets.
+QUARTERMASTER_NO_UPDATE=1 turns it off and wins over the opt-in.
+The check never stashes or resets.
 Sources are documented in the Delegation Routing section of ~/.claude/CLAUDE.md.
 """
 import base64, fcntl, glob, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
@@ -3243,6 +3245,8 @@ _GIT_ENV_DROP = (
 
 def _update_skipped():
     if os.environ.get("QUARTERMASTER_NO_UPDATE") == "1":
+        return True
+    if os.environ.get("QUARTERMASTER_AUTO_UPDATE") != "1":
         return True
     if os.environ.get("COUNCIL_VOTER") == "1" or os.environ.get("CONCLAVE_VOTER") == "1":
         return True

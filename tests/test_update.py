@@ -94,6 +94,7 @@ def run_seat(script, home, args, extra=None, timeout=30):
         "HOME": str(home),
         "PYTHONDONTWRITEBYTECODE": "1",
         "TZ": "UTC",
+        "QUARTERMASTER_AUTO_UPDATE": "1",
     }
     if extra:
         env.update(extra)
@@ -259,6 +260,35 @@ def opt_out_skips_until_the_variable_is_unset():
         assert pulled.stdout.startswith("[seat-usage] updated\n"), pulled.stdout
         assert MUSE_NEW in pulled.stdout, pulled.stdout
         assert "updated-from-origin" in script.read_text()
+
+
+@test
+def default_without_opt_in_does_not_fetch():
+    with tempfile.TemporaryDirectory() as tmp:
+        work, script, _base = new_checkout(tmp, push_upstream=True)
+        before = head(work)
+        before_origin = git("rev-parse", "origin/main", repo=work)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        for value in ("", "0"):
+            proc = run_seat(script, home, [], {"QUARTERMASTER_AUTO_UPDATE": value})
+            stayed(proc, work, before)
+            assert git("rev-parse", "origin/main", repo=work) == before_origin
+            assert not stamp_path(home).exists()
+        assert "updated-from-origin" not in script.read_text()
+
+
+@test
+def no_update_wins_over_the_opt_in():
+    with tempfile.TemporaryDirectory() as tmp:
+        work, script, _base = new_checkout(tmp, push_upstream=True)
+        before = head(work)
+        home = Path(tmp) / "home"
+        home.mkdir()
+        proc = run_seat(script, home, [], {"QUARTERMASTER_AUTO_UPDATE": "1", "QUARTERMASTER_NO_UPDATE": "1"})
+        stayed(proc, work, before)
+        assert not stamp_path(home).exists()
+        assert "updated-from-origin" not in script.read_text()
 
 
 @test

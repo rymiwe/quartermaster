@@ -2,6 +2,8 @@
 
 Snapshot of Ryan's "router core": `seat-usage` (reads per-seat/pool usage for Claude, Grok, Cursor and related pools, with a cache) plus the `seat-route-hook` Claude Code hook that uses it to route Agent/Bash launches. Extracted as-is from his dotfiles. Not a polished or portable project.
 
+`seat-usage` can update itself from GitHub. This is off by default; set `QUARTERMASTER_AUTO_UPDATE=1` to turn it on.
+
 ## Layout
 
 | Path | Role |
@@ -70,9 +72,9 @@ On Windows, run the script from Git Bash. Command Prompt and PowerShell cannot r
 
 ## Update on use
 
-A run from a clean checkout of `main` fetches and fast-forwards at most once every 24 hours, then starts again so the new code runs. The timestamp is `~/.cache/quartermaster/seat-usage-update`, beside Conclave's `muse-usage.json`. The command prints `[seat-usage] updated` when the checkout moves.
+Off by default. With `QUARTERMASTER_AUTO_UPDATE=1`, a run from a clean checkout of `main` fetches and fast-forwards at most once every 24 hours, then starts again so the new code runs. The timestamp is `~/.cache/quartermaster/seat-usage-update`, beside Conclave's `muse-usage.json`. The command prints `[seat-usage] updated` when the checkout moves.
 
-The check does not stash, reset, or overwrite local changes. A dirty tree, a branch other than `main`, a detached HEAD, a missing network, or any git error skips it and prints nothing. `--route`, `--quiet`, `--cached`, `COUNCIL_VOTER=1`, and `CONCLAVE_VOTER=1` skip it. `QUARTERMASTER_NO_UPDATE=1` turns it off. There is no background task.
+The check does not stash, reset, or overwrite local changes. A dirty tree, a branch other than `main`, a detached HEAD, a missing network, or any git error skips it and prints nothing. `--route`, `--quiet`, `--cached`, `COUNCIL_VOTER=1`, and `CONCLAVE_VOTER=1` skip it. Without the opt-in, `seat-usage` never fetches. `QUARTERMASTER_NO_UPDATE=1` turns it off and wins over the opt-in. There is no background task.
 
 ## Phone widget (optional)
 
@@ -140,7 +142,7 @@ At snapshot time this printed `69 passed, 0 failed`. The only change from the do
 - `example_renewals_schema_sets_the_term_and_a_placeholder_date_does_not`
 - `missing_renewals_file_still_prints_the_route`
 
-`tests/test_update.py` runs the command in a temporary git checkout. It covers a fast-forward, the 24 hour stamp, a dirty tree, a non-main branch, a detached HEAD, diverged and ahead history, the opt-out, `--route`, `--quiet`, `--cached`, both voter variables, a failed fetch, and a copy that is not a checkout. Run it with the same empty environment:
+`tests/test_update.py` runs the command in a temporary git checkout. It covers a fast-forward, the 24 hour stamp, a dirty tree, a non-main branch, a detached HEAD, diverged and ahead history, the opt-out, `--route`, `--quiet`, `--cached`, both voter variables, a failed fetch, a copy that is not a checkout, and the default with no opt-in. Run it with the same empty environment:
 
     env -i PATH=/usr/bin:/bin HOME=/tmp/emptyhome PYTHONDONTWRITEBYTECODE=1 python3 tests/test_update.py
 
