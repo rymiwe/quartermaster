@@ -728,7 +728,7 @@ def burn_entries(s, now):
 
 def burn_line(e):
     return (f"burn: {e['seat']} {e['pool']} {e['left_pct']}% left, expires in {e['hours']}h"
-            " - raise builder effort or add an opt-in leg (rymiwe/council#16)")
+            " - raise builder effort or add an opt-in leg (rymiwe/conclave-archive#16)")
 
 # Keys each seat owns. merge_summary replaces or keeps a seat as a unit.
 # cursor_pct is the max(auto, api) bar for the status line; route() never reads it.
