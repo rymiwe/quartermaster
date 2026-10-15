@@ -25,14 +25,18 @@
     "fable": "anthropic",
     "astra": "openai",
     "sol": "openai",
-    "muse": "meta"
+    "muse": "meta",
+    "wonder-full": "meta",
+    "wonder": "meta"
   },
   "family_names": {
     "fable": "Fable",
     "astra": "Astra",
     "grok": "Grok",
     "opus": "Opus",
-    "muse": "Muse"
+    "muse": "Muse",
+    "wonder-full": "Wonder full",
+    "wonder": "Wonder"
   },
   "roles": {
     "bounded-question": {
@@ -311,9 +315,9 @@
       "seat": "muse",
       "label": "muse 5h",
       "ask_label": "Muse 5h",
-      "family": "muse",
-      "models": ["muse"],
-      "serves": ["muse"],
+      "family": "wonder-full",
+      "models": [],
+      "serves": [],
       "only": [],
       "cost_tier": 2,
       "pace": true,
@@ -333,15 +337,16 @@
       "seat": "muse",
       "label": "muse weekly",
       "ask_label": "Muse weekly",
-      "family": "muse",
-      "models": ["muse"],
-      "serves": ["muse"],
+      "family": "wonder-full",
+      "models": ["wonder-full", "wonder"],
+      "serves": ["wonder-full", "wonder"],
       "only": [],
       "cost_tier": 2,
       "pace": true,
       "lose_it": true,
       "burn": "weekly",
       "blocked_by": ["muse_5h"],
+      "family_by_pace": {"under": "wonder-full", "on": "wonder-full", "ahead": "wonder", "open": "wonder-full", "near_cap": "wonder-full"},
       "variant": "-",
       "effort": "high",
       "effort_by_pace": {"ahead": "low"},

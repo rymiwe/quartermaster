@@ -1225,7 +1225,7 @@ def lineup_default_is_xai_with_fable_and_astra():
     assert [(v["family"], v["effort"], v["vendor"], v["seat"]) for v in r["lineup"]["voters"]] == [
         ("fable", "high", "anthropic", "claude"),
         ("astra", "high", "openai", "chatgpt"),
-        ("muse", "high", "meta", "muse"),
+        ("wonder-full", "high", "meta", "muse"),
     ], r["lineup"]["voters"]
     assert r["alternatives"] == [], r
     assert "xAI chairs and builds" in r["rule"], r
@@ -1240,7 +1240,7 @@ def lineup_burn_raises_chair_and_builder_effort_not_voters():
     assert r["lineup"]["chair"]["effort"] == "xhigh", r["lineup"]["chair"]
     assert r["lineup"]["builder"]["effort"] == "xhigh", r["lineup"]["builder"]
     assert [v["effort"] for v in r["lineup"]["voters"]] == ["high", "high", "high"], r["lineup"]["voters"]
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra", "muse"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra", "wonder-full"], r
 
 
 @test
@@ -1249,7 +1249,7 @@ def lineup_cursor_ahead_moves_to_supergrok_while_that_pool_is_under():
     assert r["mode"] == "default", r
     assert r["lineup"]["chair"]["seat"] == "grok" and r["lineup"]["chair"]["effort"] == "high", r
     assert r["lineup"]["builder"]["seat"] == "grok" and r["lineup"]["builder"]["effort"] == "high", r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra", "muse"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra", "wonder-full"], r
 
 
 @test
@@ -1276,7 +1276,7 @@ def lineup_opus_builder_uses_opus_chair_and_grok_voter():
     assert r["mode"] != "ask", r
     assert r["lineup"]["chair"]["family"] == "opus" and r["lineup"]["chair"]["effort"] == "high", r
     assert r["lineup"]["chair"]["seat"] == "claude" and r["lineup"]["chair"]["vendor"] == "anthropic", r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "grok", "muse"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "grok", "wonder-full"], r
     grok = r["lineup"]["voters"][1]
     assert grok["effort"] == "high" and grok["seat"] == "grok" and grok["vendor"] == "xai", grok
     assert r["alternatives"] == [], r
@@ -1288,7 +1288,7 @@ def lineup_cursor_capped_stays_on_supergrok_with_fable_and_astra():
     assert r["mode"] == "default", r
     assert r["lineup"]["chair"]["family"] == "grok" and r["lineup"]["chair"]["seat"] == "grok", r
     assert r["lineup"]["builder"]["family"] == "grok" and r["lineup"]["builder"]["seat"] == "grok", r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra", "muse"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra", "wonder-full"], r
     assert all(v["effort"] == "high" for v in r["lineup"]["voters"]), r
 
 
@@ -1297,7 +1297,7 @@ def lineup_both_grok_pools_capped_degrades_to_opus_and_one_voter():
     r = su.route_lineup(snap(cursor_auto_pct=100, grok_exhausted=True), NOW)
     assert r["mode"] == "suggest" and r["lineup"] is not None, r
     assert r["lineup"]["chair"]["family"] == "opus" and r["lineup"]["builder"]["family"] == "opus", r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "muse"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "wonder-full"], r
     assert "weaker:" in r["reason"], r
     assert all(v["family"] != "grok" for v in r["lineup"]["voters"]), r
 
@@ -1325,11 +1325,11 @@ def lineup_unknown_fable_asks():
 def lineup_codex_capped_keeps_muse_at_low_when_that_pool_is_ahead():
     r = su.route_lineup(snap(codex=100), NOW)
     assert r["mode"] == "default" and r["lineup"] is not None, r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "muse"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "wonder-full"], r
     ahead = su.route_lineup(snap(codex=100, muse_week=80), NOW)
     assert ahead["mode"] == "suggest" and ahead["lineup"] is not None, ahead
-    assert [v["family"] for v in ahead["lineup"]["voters"]] == ["fable", "muse"], ahead
-    muse = next(v for v in ahead["lineup"]["voters"] if v["family"] == "muse")
+    assert [v["family"] for v in ahead["lineup"]["voters"]] == ["fable", "wonder-full"], ahead
+    muse = next(v for v in ahead["lineup"]["voters"] if v["family"] == "wonder-full")
     assert muse["effort"] == "low", muse
     capped = su.route_lineup(snap(codex=100, muse_week=100), NOW)
     assert [v["family"] for v in capped["lineup"]["voters"]] == ["fable"], capped
@@ -1538,7 +1538,7 @@ def cached_route_in_process_does_not_refresh_or_log():
                 su.cmd_route()
             row = json.loads(buf.getvalue())[0]
             assert row["mode"] == "default" and row["lineup"] is not None, row
-            assert [v["family"] for v in row["lineup"]["voters"]] == ["fable", "muse"], row
+            assert [v["family"] for v in row["lineup"]["voters"]] == ["fable", "wonder-full"], row
             assert not os.path.exists(su.ASKS)
             assert not os.path.exists(su.HISTORY)
             assert called == [], called
@@ -1635,7 +1635,7 @@ def both_grok_pools_over_pace_seats_opus_and_grok_at_low():
     r = su.route_lineup(s, NOW)
     assert r["lineup"]["chair"]["effort"] == chair["effort"], r
     assert r["lineup"]["builder"]["effort"] == builder["effort"], r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "grok", "muse"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "grok", "wonder-full"], r
     grok = next(v for v in r["lineup"]["voters"] if v["family"] == "grok")
     assert grok["effort"] == "low", grok
     assert "weaker:" in r["reason"], r
@@ -1645,7 +1645,7 @@ def both_grok_pools_over_pace_seats_opus_and_grok_at_low():
     kept = su.route_lineup(s, NOW, builder=grok_builder())
     assert kept["lineup"]["chair"]["family"] == "opus", kept
     assert kept["lineup"]["builder"]["family"] == "opus", kept
-    assert [v["family"] for v in kept["lineup"]["voters"]] == ["astra", "grok", "muse"], kept
+    assert [v["family"] for v in kept["lineup"]["voters"]] == ["astra", "grok", "wonder-full"], kept
 
 
 def _voter_families(row):
@@ -1662,7 +1662,7 @@ def lineup_kind_excludes_the_author_not_the_chair():
     assert review["lineup"]["chair"]["family"] == "opus", review["lineup"]["chair"]
     assert review["lineup"]["builder"]["family"] == "grok", review["lineup"]["builder"]
     assert review["lineup"]["builder"]["effort"] == "low", review["lineup"]["builder"]
-    assert _voter_families(review) == ["fable", "astra", "muse"], review
+    assert _voter_families(review) == ["fable", "astra", "wonder-full"], review
     assert review["author"] == "grok", review
     assert review["excluded"]["vendor"] == "xai", review["excluded"]
     assert review["excluded"]["why"] == "Grok built the diff", review["excluded"]
@@ -1672,7 +1672,7 @@ def lineup_kind_excludes_the_author_not_the_chair():
     assert "excluded: xAI | grok | Grok built the diff" in text, text
 
     mixed = su.route_lineup(ahead, NOW, builder=grok_builder(), kind="mixed")
-    assert _voter_families(mixed) == ["fable", "astra", "muse"], mixed
+    assert _voter_families(mixed) == ["fable", "astra", "wonder-full"], mixed
     assert mixed["excluded"]["why"] == "Grok built the diff", mixed["excluded"]
     assert mixed["rule"].startswith("mixed excludes xAI:"), mixed["rule"]
 
@@ -1680,13 +1680,13 @@ def lineup_kind_excludes_the_author_not_the_chair():
     named = su.route_lineup(ahead, NOW, builder=grok_builder(), kind="review", author="fable")
     assert named["lineup"]["builder"]["family"] == "grok", named
     assert named["author"] == "fable" and named["excluded"]["vendor"] == "anthropic", named
-    assert _voter_families(named) == ["astra", "grok", "muse"], named
+    assert _voter_families(named) == ["astra", "grok", "wonder-full"], named
     assert named["excluded"]["why"] == "Fable built the diff", named["excluded"]
 
     # Design seats the chair's vendor. Audit seats everybody until an author is named.
     design = su.route_lineup(snap(), NOW, kind="design")
     assert design["lineup"]["chair"]["vendor"] == "xai", design
-    assert _voter_families(design) == ["fable", "astra", "grok", "muse"], design
+    assert _voter_families(design) == ["fable", "astra", "grok", "wonder-full"], design
     named_design = su.route_lineup(snap(), NOW, kind="design", author="grok")
     assert named_design["excluded"]["vendor"] is None, named_design
     assert _voter_families(named_design) == _voter_families(design), named_design
@@ -1697,12 +1697,12 @@ def lineup_kind_excludes_the_author_not_the_chair():
     audit = su.route_lineup(ahead, NOW, kind="audit")
     assert audit["lineup"]["chair"]["family"] == "opus", audit
     assert audit["lineup"]["builder"]["family"] == "opus", audit
-    assert _voter_families(audit) == ["fable", "astra", "grok", "muse"], audit
+    assert _voter_families(audit) == ["fable", "astra", "grok", "wonder-full"], audit
     assert audit["author"] is None and audit["excluded"]["why"] == "audit author unknown", audit
     wrote = su.route_lineup(ahead, NOW, kind="audit", author="grok")
     assert wrote["lineup"]["builder"]["family"] == "opus", wrote
     assert wrote["author"] == "grok" and wrote["excluded"]["vendor"] == "xai", wrote
-    assert _voter_families(wrote) == ["fable", "astra", "muse"], wrote
+    assert _voter_families(wrote) == ["fable", "astra", "wonder-full"], wrote
     assert wrote["excluded"]["why"] == "Grok wrote it", wrote["excluded"]
 
     # Fable is required when xAI is excluded, not when xAI chairs.
@@ -1757,7 +1757,7 @@ def lineup_kind_flags_reject_a_bad_kind_before_a_refresh():
         row = json.loads(ok.stdout)[0]
         assert row["lineup"]["chair"]["family"] == "opus", row
         assert row["lineup"]["builder"]["family"] == "grok", row
-        assert [v["family"] for v in row["lineup"]["voters"]] == ["fable", "astra", "muse"], row
+        assert [v["family"] for v in row["lineup"]["voters"]] == ["fable", "astra", "wonder-full"], row
         assert row["excluded"]["vendor"] == "xai", row
 
 
@@ -2065,23 +2065,32 @@ def muse_pools_seat_a_voter_and_do_not_change_launch_routes():
     assert su.SEAT_KEYS["muse"] == ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts")
     assert "muse_5h" in su.POOLS and "muse_week" in su.POOLS
     assert su.FAMILY_VENDOR["muse"] == "meta"
+    assert su.FAMILY_VENDOR["wonder-full"] == "meta"
+    assert su.FAMILY_VENDOR["wonder"] == "meta"
     assert su._FAMILY_NAME["muse"] == "Muse"
-    assert any(spec["family"] == "muse" for spec in su.VOTER_ROSTER)
+    assert su._FAMILY_NAME["wonder-full"] == "Wonder full"
+    assert su._FAMILY_NAME["wonder"] == "Wonder"
+    week_meta = su.POOLS["muse_week"]
+    assert week_meta["family"] == "wonder-full"
+    assert list(week_meta["serves"]) == ["wonder-full", "wonder"]
+    assert su._family_for(week_meta, "ahead") == "wonder"
+    assert su._family_for(week_meta, "under") == "wonder-full"
+    assert any(spec["family"] == "wonder-full" for spec in su.VOTER_ROSTER)
     assert "muse" not in su.ROLES
     for role in ("bounded-question", "hard-bug", "builder", "chair"):
         assert su.POOLS["muse_week"].get("strengths", {}).get(role) is None
-        assert su.route(role, snap(), NOW)["family"] != "muse"
+        assert su.route(role, snap(), NOW)["family"] not in ("wonder-full", "wonder")
     seated = su.route_lineup(snap(), NOW)
-    assert [v["family"] for v in seated["lineup"]["voters"]] == ["fable", "astra", "muse"], seated
+    assert [v["family"] for v in seated["lineup"]["voters"]] == ["fable", "astra", "wonder-full"], seated
     ahead = su.route_lineup(snap(muse_5h=80), NOW)
-    assert [v["family"] for v in ahead["lineup"]["voters"]] == ["fable", "astra", "muse"], ahead
-    muse = next(v for v in ahead["lineup"]["voters"] if v["family"] == "muse")
+    assert [v["family"] for v in ahead["lineup"]["voters"]] == ["fable", "astra", "wonder-full"], ahead
+    muse = next(v for v in ahead["lineup"]["voters"] if v["family"] == "wonder-full")
     assert muse["effort"] == "high", muse
     week = su.route_lineup(snap(muse_week=80), NOW)
-    muse_week = next(v for v in week["lineup"]["voters"] if v["family"] == "muse")
+    muse_week = next(v for v in week["lineup"]["voters"] if v["family"] == "wonder-full")
     assert muse_week["effort"] == "low", muse_week
     capped = su.route_lineup(snap(muse_5h=100), NOW)
-    assert "muse" not in [v["family"] for v in capped["lineup"]["voters"]], capped
+    assert "wonder-full" not in [v["family"] for v in capped["lineup"]["voters"]], capped
     missing = su.route_lineup(without_as_of(snap(), "muse"), NOW)
     assert missing["mode"] == "ask" and missing["lineup"] is None, missing
     assert "Muse" in missing["reason"], missing
@@ -2104,16 +2113,16 @@ def route_ask_picks_two_vendors_by_headroom():
         ("fable", "high", "anthropic"),
         ("astra", "high", "openai"),
     ], r
-    assert [v["family"] for v in r["candidates"]] == ["fable", "astra", "grok", "muse"], r
+    assert [v["family"] for v in r["candidates"]] == ["fable", "astra", "grok", "wonder-full"], r
     # Grok stays a candidate. Ask mode does not drop the chair's vendor.
     assert any(v["family"] == "grok" for v in r["candidates"]), r
     full = su.route_ask(snap(fable=100, claude_week=100, claude_5h=100, cursor_api_pct=100, codex=100), NOW)
-    assert [v["family"] for v in full["voters"]] == ["grok", "muse"], full
+    assert [v["family"] for v in full["voters"]] == ["grok", "wonder-full"], full
     assert len({v["vendor"] for v in full["voters"]}) == 2, full
     over = su.route_ask(snap(muse_week=90), NOW)
-    assert "muse" not in [v["family"] for v in over["candidates"]], over
+    assert "wonder-full" not in [v["family"] for v in over["candidates"]], over
     burning = su.route_ask(snap(muse_week=10, muse_week_reset_ts=NOW + 12 * 3600), NOW)
-    muse = next(v for v in burning["candidates"] if v["family"] == "muse")
+    muse = next(v for v in burning["candidates"] if v["family"] == "wonder-full")
     assert muse["effort"] == "xhigh" and muse["mode"] == "burn" and muse["pace"] == "under", muse
 
 

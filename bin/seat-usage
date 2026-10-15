@@ -1735,7 +1735,7 @@ VOTER_ROSTER = (
     {"family": "fable", "seat": "claude", "pools": ("fable", "claude_week", "claude_5h")},
     {"family": "astra", "seat": "chatgpt", "pools": ("codex",)},
     {"family": "grok", "seat": "grok", "pools": ("grok",)},
-    {"family": "muse", "seat": "muse", "pools": ("muse_week", "muse_5h")},
+    {"family": "wonder-full", "seat": "muse", "pools": ("muse_week", "muse_5h")},
 )
 # lineup, host, and ask are not in ROLES: `--route` with no role stays the four
 # launch roles the hook already prints.
@@ -2098,7 +2098,7 @@ def _muse_voter(states, s, now, skip_ahead=True):
     if skip_ahead and any(states[pid][0] == "ahead" for pid in watched):
         return "skip", None
     effort, mode, reason = _voter_effort("muse_week", s, now, states)
-    return "row", _voter("muse", "muse", "muse_week", s, now, effort, mode, reason)
+    return "row", _voter("wonder-full", "muse", "muse_week", s, now, effort, mode, reason)
 
 
 def _other_voter(family, pool_id, states, s, now, skip_ahead=False):
@@ -2139,7 +2139,7 @@ def _collect_voters(states, s, now, excluded_vendor):
             status, payload = _fable_voter(states, s, now, required)
         elif spec["family"] == "grok":
             status, payload = _other_voter("grok", "grok", states, s, now)
-        elif spec["family"] == "muse":
+        elif spec["family"] == "wonder-full":
             status, payload = _muse_voter(states, s, now, skip_ahead=False)
         else:
             status, payload = _other_voter(spec["family"], spec["pools"][0], states, s, now)
@@ -2446,7 +2446,7 @@ def _ask_one(spec, states, s, now):
     elif family == "grok":
         status, payload = _other_voter("grok", "grok", states, s, now, skip_ahead=False)
         pool = "grok"
-    elif family == "muse":
+    elif family == "wonder-full":
         status, payload = _muse_voter(states, s, now, skip_ahead=True)
         pool = "muse_week"
     else:
