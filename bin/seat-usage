@@ -2053,32 +2053,128 @@ def _fable_substitute():
     return None
 
 
-def _fable_voter(states, s, now, required):
-    """Fable on Max, or on the pool that also serves Fable when Max cannot.
+def _fable_slice_absent(states, s):
+    """A finished non-Max Claude read with no weekly Fable slice.
 
-    required: the strongest lineup needs this voter, so a full 5h window with
-    no other seat asks and names when that window reopens.
+    The same shape ops-tab calls absent. A missing percent on Max, a missing
+    stamp, or a stale stamp stays a failed reading.
+    """
+    st, why = states["fable"]
+    if st != "unknown" or why != "no used %":
+        return False
+    as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
+    if not as_of.get("claude"):
+        return False
+    plan = s.get("claude_plan")
+    if not isinstance(plan, str) or not plan.strip() or plan.strip() == "?":
+        return False
+    if "max" in plan.lower():
+        return False
+    if not _is_number(s.get("claude_week")) or not _is_number(s.get("claude_5h")):
+        return False
+    return True
+
+
+def _fable_frontier_ids(absent):
+    """The slice, unless it is absent, and every non-Claude pool that serves Fable.
+
+    Weekly and 5h gates serve Fable too. They are not seats.
+    """
+    ids = []
+    for pid, meta in POOLS.items():
+        if "fable" not in (meta.get("serves") or ()):
+            continue
+        if meta.get("seat") == "claude" and pid != "fable":
+            continue
+        if pid == "fable" and absent:
+            continue
+        ids.append(pid)
+    return ids
+
+
+# under, then open, then on, then ahead. Open sits above on because its
+# headroom already does. A tie keeps the earlier pool in config order.
+_PACE_ORDER = {"under": 0, "open": 1, "on": 2, "ahead": 3}
+
+
+def downgrade_effort(state):
+    """An approved downgrade stays between high and max. More headroom is higher."""
+    return {"under": "max", "on": "xhigh", "ahead": "high", "open": "xhigh"}.get(state, "high")
+
+
+def _pick_optimal(ready, states, s):
+    def key(pid):
+        used = s.get(POOLS[pid]["used"])
+        if not _is_number(used):
+            used = 101
+        order = POOL_ORDER.index(pid) if pid in POOL_ORDER else len(POOL_ORDER)
+        return (_PACE_ORDER.get(states[pid][0], 9), used, order)
+    return min(ready, key=key)
+
+
+def _frontier_ready(ids, states, s):
+    ready, unknown = [], []
+    for pid in ids:
+        if pid == "fable":
+            block = _blockage(pid, states)
+            if block and block[0] == "capped":
+                continue
+            if block and block[0] == "unknown":
+                unknown.append((pid, block[2] or "unknown"))
+                continue
+        st, why = states[pid]
+        if st == "unknown":
+            unknown.append((pid, why))
+            continue
+        if _has_room(pid, states, s):
+            ready.append(pid)
+    return ready, unknown
+
+
+def _downgrade_row(pool_id, states, s, now):
+    effort = downgrade_effort(states[pool_id][0])
+    row = _voter("fable", POOLS[pool_id]["seat"], pool_id, s, now, effort, "suggest",
+                 f"downgraded leg effort {effort}")
+    row["downgraded"] = True
+    return row
+
+
+def _downgrade_prompt(states, s, now):
+    """Known frontier pools, none with room. Not a failed reading."""
+    if states["claude_5h"][0] == "capped":
+        when = _reopen(s.get("claude_5h_reset_ts"), now)
+        return f"claude 5h full, Other Models has no room, {when}: approve a downgraded leg"
+    return "no frontier pool with room: approve a downgraded leg"
+
+
+def _fable_voter(states, s, now, required):
+    """Frontier Fable on the optimal pool that has room.
+
+    An absent non-Max slice is not a candidate and not a failed reading.
+    When every frontier pool is known and none has room, prompt for a
+    downgraded leg and let the other voters be named. A failed reading asks
+    before later families are scored. required is unused: a full window is
+    not a failed reading.
     """
     watched = ("fable", "claude_week", "claude_5h")
-    if any(states[pid][0] == "unknown" for pid in watched):
+    absent = _fable_slice_absent(states, s)
+    if not absent and any(states[pid][0] == "unknown" for pid in watched):
         pid = next(pid for pid in watched if states[pid][0] == "unknown")
         label = "Fable" if pid == "fable" else POOLS[pid]["label"]
         return "ask", _unknown_text(label, states[pid][1])
-    if all(states[pid][0] != "capped" for pid in watched):
-        effort, mode, reason = _voter_effort("fable", s, now, states)
-        return "row", _voter("fable", "claude", "fable", s, now, effort, mode, reason)
-    sub = _fable_substitute()
-    if sub and _has_room(sub, states, s):
-        effort, mode, reason = _voter_effort(sub, s, now, states)
-        return "row", _voter("fable", POOLS[sub]["seat"], sub, s, now, effort, mode, reason)
-    if sub and states[sub][0] == "unknown":
-        return "ask", _unknown_text(POOLS[sub]["label"], states[sub][1])
-    if required:
-        if states["claude_5h"][0] == "capped":
-            when = _reopen(s.get("claude_5h_reset_ts"), now)
-            return "ask", f"claude 5h full, Other Models has no room, {when}: {_ASK}"
-        return "ask", f"Fable capped and Other Models has no room: {_ASK}"
-    return "skip", None
+    ready, unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
+    if ready:
+        pid = _pick_optimal(ready, states, s)
+        effort, mode, reason = _voter_effort(pid, s, now, states)
+        return "row", _voter("fable", POOLS[pid]["seat"], pid, s, now, effort, mode, reason)
+    if unknown:
+        pid, why = unknown[0]
+        label = "Fable" if pid == "fable" else POOLS[pid]["label"]
+        return "ask", _unknown_text(label, why)
+    approved = s.get("downgrade_approved")
+    if isinstance(approved, str) and approved in POOLS:
+        return "row", _downgrade_row(approved, states, s, now)
+    return "downgrade", {"family": "fable", "reason": _downgrade_prompt(states, s, now)}
 
 
 def _muse_voter(states, s, now, skip_ahead=True):
@@ -2132,6 +2228,7 @@ def _collect_voters(states, s, now, excluded_vendor):
     excluded = {excluded_vendor} if excluded_vendor else set()
     required = excluded_vendor == "xai"
     voters = []
+    downgrade = None
     for spec in VOTER_ROSTER:
         if FAMILY_VENDOR[spec["family"]] in excluded:
             continue
@@ -2145,10 +2242,15 @@ def _collect_voters(states, s, now, excluded_vendor):
             status, payload = _other_voter(spec["family"], spec["pools"][0], states, s, now)
         if status == "ask":
             return "ask", payload
+        if status == "downgrade":
+            downgrade = payload
+            continue
         if status == "row":
             voters.append(payload)
-    if not voters:
+    if not voters and not downgrade:
         return "ask", f"nothing usable left: {_ASK}"
+    if downgrade:
+        return "downgrade", (voters, downgrade)
     return "ok", voters
 
 
@@ -2281,7 +2383,11 @@ def route_lineup(s, now, builder=None, kind=None, author=None):
     status, payload = _collect_voters(states, s, now, excluded_vendor)
     if status == "ask":
         return _lineup_ask(s, now, states, payload, [])
-    voters = payload
+    downgrade = None
+    if status == "downgrade":
+        voters, downgrade = payload
+    else:
+        voters = payload
     if kind is None:
         rule = _rule_text(chair_row, builder_row, voters)
     else:
@@ -2292,6 +2398,8 @@ def route_lineup(s, now, builder=None, kind=None, author=None):
         row["author"] = excl["author"]
         row["excluded"] = {"vendor": excl["vendor"], "name": excl["name"],
                            "family": excl["family"], "why": excl["why"]}
+    if downgrade:
+        row["downgrade"] = downgrade
     return row
 
 
@@ -2440,7 +2548,7 @@ def _ask_one(spec, states, s, now):
     family = spec["family"]
     if family == "fable":
         status, payload = _fable_voter(states, s, now, required=False)
-        if status != "row":
+        if status != "row" or payload.get("downgraded"):
             return None
         pool = "fable" if payload["seat"] == "claude" else "cursor_other"
     elif family == "grok":
@@ -2541,6 +2649,9 @@ def format_lineup(row):
                          f"{excl.get('family') or '-'} | {excl.get('why') or ''}")
         else:
             lines.append(f"  excluded: none | {excl.get('why') or ''}")
+    down = row.get("downgrade")
+    if isinstance(down, dict) and down.get("reason"):
+        lines.append(f"  downgrade: {down.get('family') or '-'} | {down['reason']}")
     return "\n".join(lines)
 
 

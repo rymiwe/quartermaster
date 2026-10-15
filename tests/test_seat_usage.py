@@ -1620,9 +1620,13 @@ def f2_fable_uses_other_models_when_the_5h_window_is_full():
     fable_burn = next(v for v in burning["lineup"]["voters"] if v["family"] == "fable")
     assert fable_burn["seat"] == "cursor" and fable_burn["effort"] == "xhigh", burning
     blocked = su.route_lineup(snap(claude_5h=100, cursor_api_pct=100), NOW)
-    assert blocked["mode"] == "ask" and blocked["lineup"] is None, blocked
-    assert "resets in 4.0h" in blocked["reason"], blocked
-    assert "claude 5h full" in blocked["reason"], blocked
+    assert blocked["mode"] != "ask" and blocked["lineup"] is not None, blocked
+    assert "fable" not in [v["family"] for v in blocked["lineup"]["voters"]], blocked
+    assert "astra" in [v["family"] for v in blocked["lineup"]["voters"]], blocked
+    assert "resets in 4.0h" in blocked["downgrade"]["reason"], blocked
+    assert "claude 5h full" in blocked["downgrade"]["reason"], blocked
+    assert "approve a downgraded leg" in blocked["downgrade"]["reason"], blocked
+    assert "fix the failed reading" not in blocked["downgrade"]["reason"], blocked
 
 
 @test
@@ -1710,9 +1714,13 @@ def lineup_kind_excludes_the_author_not_the_chair():
     design_skip = su.route_lineup(blocked, NOW, kind="design")
     assert design_skip["mode"] != "ask" and design_skip["lineup"] is not None, design_skip
     assert "fable" not in _voter_families(design_skip), design_skip
+    assert "approve a downgraded leg" in design_skip["downgrade"]["reason"], design_skip
     review_ask = su.route_lineup(blocked, NOW, kind="review")
-    assert review_ask["mode"] == "ask" and review_ask["lineup"] is None, review_ask
-    assert "claude 5h full" in review_ask["reason"], review_ask
+    assert review_ask["mode"] != "ask" and review_ask["lineup"] is not None, review_ask
+    assert "fable" not in _voter_families(review_ask), review_ask
+    assert "astra" in _voter_families(review_ask), review_ask
+    assert "claude 5h full" in review_ask["downgrade"]["reason"], review_ask
+    assert "fix the failed reading" not in review_ask["downgrade"]["reason"], review_ask
 
     missing = su.route_lineup(snap(), NOW, kind="review", author="composer")
     assert missing["mode"] == "ask" and "no vendor" in missing["reason"], missing
@@ -1720,6 +1728,77 @@ def lineup_kind_excludes_the_author_not_the_chair():
     assert design_typo["mode"] == "ask" and "no vendor" in design_typo["reason"], design_typo
     bad = su.route_lineup(snap(), NOW, kind="host")
     assert bad["mode"] == "ask" and "unknown kind" in bad["reason"], bad
+
+
+def _absent_fable(cursor=10, **kw):
+    s = snap(cursor_api_pct=cursor, claude_plan="claude_ai", **kw)
+    s.pop("fable", None)
+    s.pop("fable_reset_ts", None)
+    return s
+
+
+@test
+def absent_fable_slice_seats_the_optimal_frontier_pool():
+    seated = su.route_lineup(_absent_fable(), NOW, kind="design")
+    assert seated["mode"] != "ask" and seated["lineup"] is not None, seated
+    assert "downgrade" not in seated, seated
+    fable = next(v for v in seated["lineup"]["voters"] if v["family"] == "fable")
+    assert fable["seat"] == "cursor", fable
+    assert _voter_families(seated) == ["fable", "astra", "grok", "wonder-full"], seated
+    native = su.route_lineup(snap(fable=10, cursor_api_pct=80, claude_plan="claude_ai"), NOW, kind="design")
+    native_fable = next(v for v in native["lineup"]["voters"] if v["family"] == "fable")
+    assert native_fable["seat"] == "claude", native_fable
+    other = su.route_lineup(snap(fable=80, cursor_api_pct=10, claude_plan="claude_ai"), NOW, kind="design")
+    other_fable = next(v for v in other["lineup"]["voters"] if v["family"] == "fable")
+    assert other_fable["seat"] == "cursor", other_fable
+
+
+@test
+def absent_fable_slice_prompts_instead_of_a_failed_reading():
+    prompted = su.route_lineup(_absent_fable(cursor=100), NOW, kind="design")
+    assert prompted["mode"] != "ask" and prompted["lineup"] is not None, prompted
+    assert _voter_families(prompted) == ["astra", "grok", "wonder-full"], prompted
+    assert prompted["downgrade"]["family"] == "fable", prompted
+    assert "approve a downgraded leg" in prompted["downgrade"]["reason"], prompted
+    assert "fix the failed reading" not in prompted["downgrade"]["reason"], prompted
+    more = _absent_fable(cursor=100)
+    more["downgrade_approved"] = "grok"
+    more["grok_pct"] = 10
+    less = _absent_fable(cursor=100)
+    less["downgrade_approved"] = "grok"
+    less["grok_pct"] = 80
+    more_row = su.route_lineup(more, NOW, kind="design")
+    less_row = su.route_lineup(less, NOW, kind="design")
+    more_effort = next(v for v in more_row["lineup"]["voters"] if v.get("downgraded"))["effort"]
+    less_effort = next(v for v in less_row["lineup"]["voters"] if v.get("downgraded"))["effort"]
+    rank = {"high": 0, "xhigh": 1, "max": 2}
+    assert more_effort in rank and less_effort in rank, (more_effort, less_effort)
+    assert rank[more_effort] >= rank[less_effort], (more_effort, less_effort)
+    assert su.downgrade_effort("under") == "max"
+    assert su.downgrade_effort("ahead") == "high"
+    max_plan = _absent_fable()
+    max_plan["claude_plan"] = "default_claude_max"
+    asked = su.route_lineup(max_plan, NOW, kind="design")
+    assert asked["mode"] == "ask" and asked["lineup"] is None, asked
+    assert "fix the failed reading" in asked["reason"], asked
+    stale = _absent_fable()
+    stale["as_of"] = dict(stale["as_of"])
+    stale["as_of"]["claude"] = NOW - 11 * 60
+    stale_row = su.route_lineup(stale, NOW, kind="design")
+    assert stale_row["mode"] == "ask" and "reading" in stale_row["reason"], stale_row
+    missing = without_as_of(_absent_fable(), "claude")
+    missing_row = su.route_lineup(missing, NOW, kind="design")
+    assert missing_row["mode"] == "ask" and "fix the failed reading" in missing_row["reason"], missing_row
+    cursor_stale = _absent_fable()
+    cursor_stale["as_of"] = dict(cursor_stale["as_of"])
+    cursor_stale["as_of"]["cursor"] = NOW - 11 * 60
+    cursor_row = su.route_lineup(cursor_stale, NOW, kind="design")
+    assert cursor_row["mode"] == "ask" and cursor_row["lineup"] is None, cursor_row
+    sibling = without_as_of(snap(fable=10, claude_plan="claude_ai"), "cursor")
+    sibling_row = su.route_lineup(sibling, NOW, kind="design")
+    assert sibling_row["mode"] != "ask" and sibling_row["lineup"] is not None, sibling_row
+    sibling_fable = next(v for v in sibling_row["lineup"]["voters"] if v["family"] == "fable")
+    assert sibling_fable["seat"] == "claude", sibling_fable
 
 
 @test
