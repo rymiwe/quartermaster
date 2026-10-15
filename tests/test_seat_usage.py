@@ -2691,15 +2691,35 @@ def grok_cookie_reads_seat_usage_op_ref():
     import subprocess as sp
     old_which, old_run = shutil.which, sp.run
     old_tried = list(su.COOKIE_TRIED)
+    old_cache_dir = su.CACHE_DIR
     os.environ["SEAT_USAGE_OP_REF"] = "op://other/item/credential"
     os.environ.pop("SEAT_USAGE_OP", None)
     shutil.which, sp.run = which, run
     su.COOKIE_TRIED = []
+    tmp = tempfile.TemporaryDirectory()
+    su.CACHE_DIR = tmp.name
     try:
         assert su.op_ref() == "op://other/item/credential"
         assert su.grok_cookie() == "sso-cookie"
         assert seen["cmd"] == ["/tmp/fake-op", "read", "op://other/item/credential"], seen
+        cache = Path(su.cookie_cache_path())
+        assert cache.read_text() == "sso-cookie"
+        assert cache.stat().st_mode & 0o777 == 0o600, oct(cache.stat().st_mode)
+
+        # A fresh cache answers without a 1Password read.
+        seen.clear()
+        assert su.grok_cookie() == "sso-cookie"
+        assert "cmd" not in seen, seen
+
+        # A stale cache triggers a read; a failed read still returns the stale copy.
+        old = time.time() - su.COOKIE_TTL_S - 60
+        os.utime(cache, (old, old))
+        Result.returncode, Result.stdout = 1, ""
+        assert su.grok_cookie() == "sso-cookie"
+        assert seen["cmd"][1] == "read", seen
     finally:
+        su.CACHE_DIR = old_cache_dir
+        tmp.cleanup()
         shutil.which, sp.run = old_which, old_run
         su.COOKIE_TRIED[:] = old_tried
         if old_ref is None:

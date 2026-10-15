@@ -100,6 +100,7 @@ Tests: `python3 tests/test_seat_usage_push.py`.
 - Hardcoded paths (see contract above).
 - WSL/Windows assumptions, including the `op.exe` WinGet path (`$SEAT_USAGE_OP` overrides).
 - 1Password item path defaults to `op://claude/grok web cookie/credential` (`$SEAT_USAGE_OP_REF` overrides).
+- A successful read is cached in `~/.cache/seat-usage/grok-cookie` (mode 0600) for 6 hours, and the stale copy is used when 1Password fails. The service account's daily read cap is shared by every machine, so live runs must not each read it.
 - Fixed Thursday 5:38 PM PT fallback for the Grok reset.
 - Council lineup and host order still name families in code. Launch routing does not.
 - The hook's role mapping depends on specific command shapes.

@@ -548,18 +548,49 @@ def grok_bot(tok):
 DEFAULT_OP_REF = "op://claude/grok web cookie/credential"
 COOKIE_TRIED = []   # why each cookie source failed, for the grok line
 
+COOKIE_TTL_S = 6 * 3600
+
 def op_ref():
     return os.environ.get("SEAT_USAGE_OP_REF") or DEFAULT_OP_REF
 
+def cookie_cache_path():
+    return f"{CACHE_DIR}/grok-cookie"
+
+def read_cookie_cache():
+    """(value, age in seconds) from the 0600 cookie cache, or (None, None)."""
+    p = cookie_cache_path()
+    try:
+        v = open(p).read().strip()
+        return (v, time.time() - os.path.getmtime(p)) if v else (None, None)
+    except Exception:
+        return (None, None)
+
+def write_cookie_cache(v):
+    p = cookie_cache_path()
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        fd = os.open(p + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(v)
+        os.replace(p + ".tmp", p)
+    except Exception:
+        pass
+
 def grok_cookie():
-    """The grok.com browser 'sso' cookie. 1Password first (`op read` of
-    $SEAT_USAGE_OP_REF, default op://claude/grok web cookie/credential),
-    then ~/.grok/web-cookie.
+    """The grok.com browser 'sso' cookie. A cached copy younger than
+    COOKIE_TTL_S first, so live runs do not each spend a 1Password read: the
+    service account's daily read cap is shared by every machine and tool.
+    Then 1Password (`op read` of op_ref(): $SEAT_USAGE_OP_REF, else
+    DEFAULT_OP_REF), then the stale cached copy, then
+    ~/.grok/web-cookie.
     The op binary is found by name: $SEAT_USAGE_OP if set, else op.exe (Windows
     1Password from WSL), else op. The first one that returns a value wins.
     Hooks and the status line's background refresh can run without the Windows
     dirs on PATH, so op.exe falls back to its WinGet install path."""
     import glob, shutil, subprocess
+    cached, age = read_cookie_cache()
+    if cached and age < COOKIE_TTL_S:
+        return cached
     override = os.environ.get("SEAT_USAGE_OP")
     winget = sorted(glob.glob("/mnt/c/Users/*/AppData/Local/Microsoft/WinGet/Packages/AgileBits.1Password.CLI_*/op.exe"))
     for name in ([override] if override else ["op.exe", "op"]):
@@ -569,10 +600,14 @@ def grok_cookie():
         try:
             r = subprocess.run([path, "read", op_ref()], capture_output=True, text=True, timeout=20)
             v = r.stdout.replace("\r", "").strip()
-            if r.returncode == 0 and v: return v
+            if r.returncode == 0 and v:
+                write_cookie_cache(v)
+                return v
             COOKIE_TRIED.append(f"{name} read failed")
         except Exception as e:
             COOKIE_TRIED.append(f"{name} {e.__class__.__name__}")
+    if cached:
+        return cached
     try:
         v = open(f"{H}/.grok/web-cookie").read().strip()
         if v: return v
