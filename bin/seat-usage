@@ -502,7 +502,8 @@ def cursor():
                                      headers={"User-Agent": "seat-usage", "Content-Type": "application/json", **hdr})
         with urllib.request.urlopen(req, timeout=8) as r: u = json.loads(r.read().decode())
         pu = u.get("planUsage", {})
-        spent, limit = pu.get("totalSpend"), pu.get("limit")
+        # A fresh billing cycle omits totalSpend (seen 2026-10-15), so default it to 0.
+        spent, limit = pu.get("totalSpend") or 0, pu.get("limit")
         start = int(u.get("billingCycleStart", 0)) / 1000; end = int(u.get("billingCycleEnd", 0)) / 1000
         # The dashboard bars are autoPercentUsed (Cursor Models) and apiPercentUsed (Other Models).
         # totalSpend/limit includes provider bonus and overstates usage, so it is not a percentage of anything.

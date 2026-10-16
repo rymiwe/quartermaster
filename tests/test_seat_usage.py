@@ -2749,6 +2749,35 @@ def test_run_draws_diffs_history_around_a_run():
     assert [(d["leg"], d["draw"]) for d in got] == [("codex", 3)], got
 
 
+@test
+def cursor_fresh_cycle_without_total_spend():
+    # A fresh billing cycle omits planUsage.totalSpend (2026-10-15); it raised TypeError.
+    import base64
+    body = {"billingCycleStart": str((NOW - 3600) * 1000), "billingCycleEnd": str((NOW + MONTH) * 1000),
+            "planUsage": {"limit": 7000, "remaining": 7000, "autoPercentUsed": 0, "apiPercentUsed": 0},
+            "spendLimitUsage": {"individualLimit": 15000, "individualRemaining": 15000}}
+
+    class Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    claims = base64.urlsafe_b64encode(json.dumps({"sub": "auth0|user_x"}).encode()).decode().rstrip("=")
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / ".config" / "cursor").mkdir(parents=True)
+        (Path(d) / ".config" / "cursor" / "auth.json").write_text(json.dumps({"accessToken": f"h.{claims}.s"}))
+        saved = su.H, su.get, su.grok_bot, su.urllib.request.urlopen
+        su.H = d
+        su.get = lambda url, hdr=None, **kw: {"membershipType": "pro_plus", "subscriptionStatus": "active"}
+        su.grok_bot = lambda tok: "grokbot  | stub"
+        su.urllib.request.urlopen = lambda req, timeout=None: Resp(json.dumps(body).encode())
+        try:
+            out = su.cursor()
+        finally:
+            su.H, su.get, su.grok_bot, su.urllib.request.urlopen = saved
+    assert "usage failed" not in out[0], out
+    assert "$0.00 spent" in out[0], out
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:
