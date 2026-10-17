@@ -2,6 +2,7 @@
 """Draw seat-usage meters as a PNG from the cached summary, laid out like orderly:
 one shared time scale, every row's pace tick on a single "now" line. No network calls."""
 import json, os, sys, time
+from datetime import datetime
 try:
     from PIL import Image, ImageDraw, ImageFont
 except ImportError:
@@ -28,8 +29,26 @@ add("Cursor other", seat(d.get("cursor_api_pct"), d.get("cursor_reset_ts"), d.ge
 add("Cursor models", seat(d.get("cursor_auto_pct"), d.get("cursor_reset_ts"), d.get("cursor_window_s")))
 add("Grok Bot", seat(d.get("bot_pct"), d.get("bot_reset_ts"), d.get("bot_window_s") or WK))
 add("SuperGrok", seat(d.get("grok_week"), d.get("grok_week_reset_ts"), WK))
-add("Muse", seat(d.get("muse_week"), d.get("muse_week_reset_ts"), WK))
-errs = d.get("errors") or {}
+
+# Muse is not in the main cache: read seat-usage's own Muse file. A missing,
+# unreadable or stale file (a reset already passed) draws a "no reading" row.
+MUSE = os.environ.get("SEAT_USAGE_MUSE_FILE", os.path.expanduser("~/.cache/quartermaster/muse-usage.json"))
+def epoch(v):
+    if isinstance(v, (int, float)) and not isinstance(v, bool): return float(v)
+    try: return datetime.fromisoformat(str(v).strip().replace("Z", "+00:00")).timestamp()
+    except ValueError: return None
+def muse():
+    try:
+        m = json.load(open(MUSE)); w, k = m["window"], m["weekly"]
+        wr, kr, mins = epoch(w["resets_at"]), epoch(k["resets_at"]), float(w["window_duration_mins"])
+        wp, kp = float(w["used_percent"]), float(k["used_percent"])
+    except Exception:
+        return None
+    if None in (wr, kr) or mins <= 0 or wr <= now or kr <= now: return None
+    return seat(kp, kr, WK), seat(wp, wr, mins * 60)
+mu = muse()
+rows.append(("Muse",) + mu if mu else ("Muse", None, None))
+errs = {k: v for k, v in (d.get("errors") or {}).items() if k != "muse"}  # the Muse row says it
 
 # Shared scale: the now line sits where the longest past and longest future just fit.
 mains = [m for _, m, _ in rows if m]
@@ -84,6 +103,8 @@ for label, m, f in rows:
         track(m, cy - 3, 6, wf)
     if f:
         track(f, cy + 8, 4, wf if m else 0.5)
+    if not m and not f:
+        g.text((P(X0 + MW + 12), P(cy)), "no reading", font=FS, fill=DIM, anchor="lm")
     val = f"{m['pct']:.0f}%" if m else ""
     g.text((P(X0 + MW + 12), P(cy)), val, font=FB, fill=INK, anchor="lm")
     if m: g.text((P(W - PAD), P(cy)), left_txt(m["left"]), font=FS, fill=DIM, anchor="rm")
