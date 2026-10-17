@@ -2800,9 +2800,9 @@ def grok_cookie_reads_seat_usage_op_ref():
     old_ref = os.environ.get("SEAT_USAGE_OP_REF")
     old_op = os.environ.get("SEAT_USAGE_OP")
     os.environ.pop("SEAT_USAGE_OP_REF", None)
-    assert su.op_ref() == "op://claude/grok web cookie/credential"
+    assert su.op_ref() == "op://grok/grok web cookie/credential"
     os.environ["SEAT_USAGE_OP_REF"] = ""
-    assert su.op_ref() == "op://claude/grok web cookie/credential"
+    assert su.op_ref() == "op://grok/grok web cookie/credential"
     seen = {}
 
     def which(name):

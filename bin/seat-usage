@@ -733,7 +733,7 @@ def grok_bot(tok):
     except Exception as e:
         return f"grokbot  | usage failed: {_err(e)}"
 
-DEFAULT_OP_REF = "op://claude/grok web cookie/credential"
+DEFAULT_OP_REF = "op://grok/grok web cookie/credential"
 COOKIE_TRIED = []   # why each cookie source failed, for the grok line
 
 COOKIE_TTL_S = 6 * 3600
