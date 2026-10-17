@@ -28,7 +28,7 @@ add("ChatGPT", seat(d.get("codex"), d.get("codex_reset_ts"), d.get("codex_window
 add("Cursor other", seat(d.get("cursor_api_pct"), d.get("cursor_reset_ts"), d.get("cursor_window_s")))
 add("Cursor models", seat(d.get("cursor_auto_pct"), d.get("cursor_reset_ts"), d.get("cursor_window_s")))
 add("Grok Bot", seat(d.get("bot_pct"), d.get("bot_reset_ts"), d.get("bot_window_s") or WK))
-add("SuperGrok", seat(d.get("grok_week"), d.get("grok_week_reset_ts"), WK))
+add("SuperGrok", seat(d.get("grok_pct"), d.get("grok_reset_ts"), d.get("grok_window_s") or WK))
 
 # Muse is not in the main cache: read seat-usage's own Muse file. A missing,
 # unreadable or stale file (a reset already passed) draws a "no reading" row.
