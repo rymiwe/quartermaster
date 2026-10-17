@@ -1120,23 +1120,118 @@ def usage_429_keeps_as_of_until_retry_after():
             assert server.bad_auth == 0, server.bad_auth
 
 
+def _assert_no_secret(text):
+    assert "fixture-token" not in text and "fixture-refresh" not in text, "token leaked"
+
+
 @test
-def profile_401_expired_token_is_not_a_rate_limit():
+def expired_claude_token_makes_no_http_call():
+    with anthropic_server() as server:
+        profile, usage = server_urls(server)
+        with seat_http_sandbox(profile, usage) as (home, _cache):
+            cred = os.path.join(home, ".claude", ".credentials.json")
+            future = int((time.time() + 3600) * 1000)
+            with open(cred, "w") as f:
+                json.dump({"claudeAiOauth": {"accessToken": "fixture-token", "expiresAt": future}}, f)
+            fresh = _quiet_cache()
+            assert server.profile_hits == 1 and server.usage_hits == 1, (server.profile_hits, server.usage_hits)
+            cached = json.load(open(su.CACHE))
+            cached["as_of"]["claude"] = su.NOW - 2 * 3600
+            with open(su.CACHE, "w") as f:
+                json.dump(cached, f)
+            past = int((time.time() - 6 * 3600) * 1000)
+            with open(cred, "w") as f:
+                json.dump({
+                    "claudeAiOauth": {
+                        "accessToken": "fixture-token",
+                        "refreshToken": "fixture-refresh",
+                        "expiresAt": past,
+                    },
+                }, f)
+            expired = _quiet_cache()
+            assert server.profile_hits == 1 and server.usage_hits == 1, (server.profile_hits, server.usage_hits)
+            line = expired["lines"][0]
+            _assert_no_secret(line)
+            assert line.startswith("claude   | token expired 6.0h ago; run `claude` once to refresh | "), line
+            assert "weekly Fable 33%" in line, line
+            assert line.endswith(" | stale (reading 2.0h old)"), line
+            assert expired["as_of"]["claude"] == su.NOW - 2 * 3600, expired["as_of"]
+            again = _quiet_cache()
+            assert server.profile_hits == 1 and server.usage_hits == 1, (server.profile_hits, server.usage_hits)
+            os.remove(su.CACHE)
+            bare = _quiet_cache()
+            assert server.profile_hits == 1 and server.usage_hits == 1, (server.profile_hits, server.usage_hits)
+            assert bare["lines"] == ["claude   | token expired 6.0h ago; run `claude` once to refresh"], bare["lines"]
+            assert "claude" not in bare["as_of"], bare["as_of"]
+            _assert_no_secret(json.dumps(bare))
+
+
+@test
+def claude_401_sets_backoff_and_the_next_run_does_not_call():
     with anthropic_server() as server:
         profile, usage = server_urls(server)
         with seat_http_sandbox(profile, usage):
             server.profile_mode = "expired"
             server.usage_mode = "ok"
+            t0 = time.time()
             first = _quiet_cache()
+            assert server.profile_hits == 1, server.profile_hits
+            assert server.usage_hits == 0, server.usage_hits
+            assert any("profile failed: HTTPError 401" in ln for ln in first["lines"]), first["lines"]
+            _assert_no_secret(json.dumps(first))
+            stored = json.load(open(su._rate_limit_path()))
+            assert stored[f"{usage}#401s"] == 1, stored
+            assert f"{usage}#429s" not in stored, stored
+            assert 295 <= stored[usage] - t0 <= 310, stored[usage] - t0
+            _assert_no_secret(json.dumps(stored))
             second = _quiet_cache()
+            assert server.profile_hits == 1, server.profile_hits
+            assert server.usage_hits == 0, server.usage_hits
+            _assert_no_secret(json.dumps(second))
+
+            with open(su._rate_limit_path(), "w") as f:
+                json.dump({}, f)
+            server.profile_mode = "ok"
+            server.usage_mode = "denied"
+            t1 = time.time()
+            denied = _quiet_cache()
             assert server.profile_hits == 2, server.profile_hits
-            assert server.usage_hits == 2, server.usage_hits
-            assert server.retry_sent == [], server.retry_sent
-            assert not os.path.exists(su._rate_limit_path()), "401 wrote a rate-limit deadline"
-            assert first["as_of"]["claude"] == su.NOW and second["as_of"]["claude"] == su.NOW, (first, second)
-            assert any("profile failed: HTTPError" in ln for ln in second["lines"]), second["lines"]
-            assert any("weekly Fable 33%" in ln for ln in second["lines"]), second["lines"]
+            assert server.usage_hits == 1, server.usage_hits
+            assert any("usage failed: HTTPError 401" in ln for ln in denied["lines"]), denied["lines"]
+            stored = json.load(open(su._rate_limit_path()))
+            assert stored[f"{usage}#401s"] == 1, stored
+            assert f"{usage}#429s" not in stored, stored
+            assert 295 <= stored[usage] - t1 <= 310, stored[usage] - t1
+            held = _quiet_cache()
+            assert server.profile_hits == 2, server.profile_hits
+            assert server.usage_hits == 1, server.usage_hits
+            _assert_no_secret(json.dumps(held))
             assert server.bad_auth == 0, server.bad_auth
+
+
+@test
+def usage_429_with_cache_shows_stale_reading():
+    with anthropic_server() as server:
+        profile, usage = server_urls(server)
+        with seat_http_sandbox(profile, usage):
+            server.usage_mode = "ok"
+            fresh = _quiet_cache()
+            assert server.usage_hits == 1, server.usage_hits
+            assert "weekly Fable 33%" in fresh["lines"][0], fresh["lines"]
+            cached = json.load(open(su.CACHE))
+            cached["as_of"]["claude"] = su.NOW - 2 * 3600
+            with open(su.CACHE, "w") as f:
+                json.dump(cached, f)
+            server.usage_mode = "bare429"
+            limited = _quiet_cache()
+            assert server.usage_hits == 2, server.usage_hits
+            line = next(ln for ln in limited["lines"] if su.line_seat(ln) == "claude")
+            _assert_no_secret(line)
+            assert "usage failed" not in line, line
+            assert "weekly Fable 33%" in line, line
+            assert line.endswith(" | stale (reading 2.0h old)"), line
+            assert limited["as_of"]["claude"] == su.NOW - 2 * 3600, limited["as_of"]
+            assert limited["fable"] == 33, limited
 
 
 @test
@@ -1163,7 +1258,7 @@ def usage_429_without_retry_after_backs_off_and_doubles():
             assert server.usage_hits == 2, server.usage_hits
 
             waits = []
-            for _ in range(4):
+            for _ in range(6):
                 stored = json.load(open(su._rate_limit_path()))
                 stored[usage] = time.time() - 1
                 with open(su._rate_limit_path(), "w") as f:
@@ -1171,8 +1266,8 @@ def usage_429_without_retry_after_backs_off_and_doubles():
                 t = time.time()
                 _quiet_cache()
                 waits.append(round((json.load(open(su._rate_limit_path()))[usage] - t) / 100) * 100)
-            assert waits == [600, 1200, 1800, 1800], waits
-            assert server.usage_hits == 6, server.usage_hits
+            assert waits == [600, 1200, 2400, 4800, 7200, 7200], waits
+            assert server.usage_hits == 8, server.usage_hits
 
             stored = json.load(open(su._rate_limit_path()))
             stored[usage] = time.time() - 1
@@ -1194,13 +1289,47 @@ def usage_good_read_sets_a_floor():
             server.usage_mode = "ok"
             first = _quiet_cache()
             assert server.usage_hits == 1, server.usage_hits
+            assert server.profile_hits == 1, server.profile_hits
             su.NOW = time.time() + 5
             second = _quiet_cache()
             assert server.usage_hits == 1, server.usage_hits
+            assert server.profile_hits == 1, server.profile_hits
             assert second["as_of"]["claude"] == first["as_of"]["claude"], second["as_of"]
             assert second["fable"] == 33, second
+            assert not any("stale (reading" in ln for ln in second["lines"]), second["lines"]
             stored = json.load(open(su._rate_limit_path()))
             assert 295 <= stored[usage] - time.time() <= 300, stored
+            assert stored[profile] > time.time(), stored
+            # Usage window has passed; profile is still inside its own floor.
+            stored[usage] = time.time() - 1
+            with open(su._rate_limit_path(), "w") as f:
+                json.dump(stored, f)
+            third = _quiet_cache()
+            assert server.usage_hits == 2, server.usage_hits
+            assert server.profile_hits == 1, server.profile_hits
+            assert third["claude_plan"] == "max" and third["claude_status"] == "active", third
+
+
+@test
+def usage_min_interval_default_is_600():
+    env = os.environ.copy()
+    env.pop("SEAT_USAGE_MIN_INTERVAL_S", None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    script = (
+        "import importlib.machinery, importlib.util, sys\n"
+        "loader = importlib.machinery.SourceFileLoader('seat_usage_default', sys.argv[1])\n"
+        "spec = importlib.util.spec_from_loader(loader.name, loader)\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "loader.exec_module(mod)\n"
+        "assert mod.USAGE_MIN_INTERVAL_S == 600, mod.USAGE_MIN_INTERVAL_S\n"
+        "assert mod.USAGE_MIN_INTERVAL_S <= mod.ROUTE_FRESH_S, (mod.USAGE_MIN_INTERVAL_S, mod.ROUTE_FRESH_S)\n"
+        "assert mod.USAGE_BACKOFF_MAX_S == 7200, mod.USAGE_BACKOFF_MAX_S\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(BIN)],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
 
 
 def grok_builder():

@@ -43,13 +43,14 @@ STALE_HOURS = 3       # a seat reading older than this gets no burn line and is 
 ROUTE_FRESH_S = 600   # a reading older than this is unknown to the router (status line refreshes at 10 min)
 # The usage endpoint publishes no limit and answers 429 with Retry-After: 0
 # (anthropics/claude-code#30930, still open 2026-10-14). So the floor is ours:
-# one call per USAGE_MIN_INTERVAL_S after a good read, and a 429 without a
-# usable Retry-After waits USAGE_BACKOFF_S, doubling per 429 in a row up to
-# USAGE_BACKOFF_MAX_S. The floor stays under ROUTE_FRESH_S so a route still
-# sees a fresh reading.
-USAGE_MIN_INTERVAL_S = float(os.environ.get("SEAT_USAGE_MIN_INTERVAL_S") or 300)   # tests set 0
+# one call per USAGE_MIN_INTERVAL_S after a good read, and the profile
+# endpoint is held to that same floor. A 429 without a usable Retry-After
+# waits USAGE_BACKOFF_S, doubling per 429 in a row up to USAGE_BACKOFF_MAX_S.
+# A 401 (dead token) uses that backoff with its own streak. The floor stays
+# <= ROUTE_FRESH_S so a route still sees a fresh reading.
+USAGE_MIN_INTERVAL_S = float(os.environ.get("SEAT_USAGE_MIN_INTERVAL_S") or 600)   # tests set 0
 USAGE_BACKOFF_S = 300
-USAGE_BACKOFF_MAX_S = 1800
+USAGE_BACKOFF_MAX_S = 7200
 
 def get(url, headers, timeout=8):
     req = urllib.request.Request(url, headers={"User-Agent": "seat-usage", **headers})
@@ -57,7 +58,10 @@ def get(url, headers, timeout=8):
         return json.loads(r.read().decode())
 
 class _RateLimited(Exception):
-    """Usage is inside a Retry-After window. Serve the last reading; do not keep calling."""
+    """Usage or profile is inside a backoff window. Serve the last reading; do not keep calling."""
+
+    def __init__(self, code=429):
+        self.code = code
 
 def _rate_limit_path():
     return f"{CACHE_DIR}/rate-limit.json"
@@ -88,7 +92,8 @@ def _retry_after_deadline(raw, now):
 
     A later probe of the same window counts down (1705s, then 1432s) and
     yields the same timestamp. Anything that is not a non-negative delay,
-    including a 401 "token has expired" body, is not a deadline.
+    including a 401 "token has expired" body, is not a deadline. A 401 is
+    recorded by the auth backoff, not by this parser.
     """
     if raw is None:
         return None
@@ -101,10 +106,7 @@ def _retry_after_deadline(raw, now):
     return now + seconds
 
 def _usage_deadline(limits):
-    raw = limits.get(ANTHROPIC_USAGE_URL)
-    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-        return None
-    return raw
+    return _numeric_deadline(limits, ANTHROPIC_USAGE_URL)
 
 def _usage_rate_limited(now=None):
     if now is None:
@@ -120,16 +122,56 @@ def _remember_deadline(url, deadline, limits):
     limits[url] = deadline
     _store_rate_limits(limits)
 
-def _streak_key(url):
-    return f"{url}#429s"
+def _streak_key(url, kind="429"):
+    return f"{url}#{kind}s"
 
-def _backoff_deadline(retry_after, limits, now):
-    """Deadline after a 429: the larger of Retry-After and our doubling backoff."""
-    streak = limits.get(_streak_key(ANTHROPIC_USAGE_URL))
-    streak = streak if isinstance(streak, int) and not isinstance(streak, bool) and streak > 0 else 0
-    limits[_streak_key(ANTHROPIC_USAGE_URL)] = streak + 1
+def _streak_value(limits, kind):
+    raw = limits.get(_streak_key(ANTHROPIC_USAGE_URL, kind))
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0 else 0
+
+def _backoff_kind(limits):
+    """401 wins over 429 when both streaks are set: a dead token is the reason to stop."""
+    if _streak_value(limits, "401"):
+        return 401
+    if _streak_value(limits, "429"):
+        return 429
+    return None
+
+def _numeric_deadline(limits, url):
+    raw = limits.get(url)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return raw
+
+def _deadline_active(limits, url, now):
+    deadline = _numeric_deadline(limits, url)
+    return deadline is not None and now < deadline
+
+def _backoff_deadline(retry_after, limits, now, kind="429"):
+    """Deadline after a 429 or 401: the larger of Retry-After and our doubling backoff.
+
+    401 and 429 keep separate streaks. A 401 has no Retry-After.
+    """
+    key = _streak_key(ANTHROPIC_USAGE_URL, kind)
+    streak = _streak_value(limits, kind)
+    limits[key] = streak + 1
     ours = now + min(USAGE_BACKOFF_S * (2 ** min(streak, 16)), USAGE_BACKOFF_MAX_S)
     return ours if retry_after is None else max(retry_after, ours)
+
+def _arm_min_interval(limits, url, now):
+    """Hold this endpoint until USAGE_MIN_INTERVAL_S has passed. Tests set that to 0."""
+    if USAGE_MIN_INTERVAL_S > 0:
+        prev = _numeric_deadline(limits, url)
+        nxt = now + USAGE_MIN_INTERVAL_S
+        if prev is not None and prev > nxt:
+            nxt = prev
+        limits[url] = nxt
+    else:
+        limits.pop(url, None)
+
+def _store_if_changed(limits, had):
+    if limits != had:
+        _store_rate_limits(limits)
 
 def _acquire_rate_lock(timeout=None):
     """Exclusive lock for the usage call. Not the cache .lock: full_run holds that one."""
@@ -166,43 +208,176 @@ def _release_rate_lock(fh):
     except Exception:
         pass
 
+def _record_http_backoff(limits, now, code, retry_after=None):
+    """401 and 429 share the usage-url deadline and keep separate streaks."""
+    kind = "401" if code == 401 else "429"
+    _remember_deadline(
+        ANTHROPIC_USAGE_URL,
+        _backoff_deadline(retry_after, limits, now, kind),
+        limits,
+    )
+
 def _usage_get(headers, timeout=8):
     """GET the usage URL unless this cache dir is inside a wait window.
 
     The deadline is on disk, so a burst in this process or another one (the
     status line's spawn, --route, a full run) shares it. The lock is held
     across the HTTP call: the next caller waits, sees the deadline, and
-    does not send. A good read sets the USAGE_MIN_INTERVAL_S floor. A 429
-    sets the backoff in _backoff_deadline. A 401 is not recorded.
+    does not send. A good read sets the USAGE_MIN_INTERVAL_S floor and
+    clears the 401 and 429 streaks. A 429 sets the backoff in
+    _backoff_deadline. A 401 sets that same backoff with its own streak.
     """
     url = ANTHROPIC_USAGE_URL
     lock = _acquire_rate_lock()
     try:
         limits = _load_rate_limits()
-        deadline = _usage_deadline(limits)
-        if deadline is not None and time.time() < deadline:
-            raise _RateLimited()
+        now = time.time()
+        if _deadline_active(limits, url, now):
+            raise _RateLimited(_backoff_kind(limits) or 429)
         try:
             body = get(url, headers, timeout)
         except urllib.error.HTTPError as e:
-            if getattr(e, "code", None) == 429:
+            code = getattr(e, "code", None)
+            if code in (401, 429):
                 now = time.time()
-                retry_after = _retry_after_deadline(
-                    e.headers.get("Retry-After") if e.headers is not None else None, now)
-                _remember_deadline(url, _backoff_deadline(retry_after, limits, now), limits)
-                raise _RateLimited() from e
+                retry_after = None
+                if code == 429:
+                    retry_after = _retry_after_deadline(
+                        e.headers.get("Retry-After") if e.headers is not None else None, now)
+                _record_http_backoff(limits, now, code, retry_after)
+                raise _RateLimited(code) from e
             raise
         had = dict(limits)
         limits.pop(_streak_key(url), None)
-        if USAGE_MIN_INTERVAL_S > 0:
-            limits[url] = time.time() + USAGE_MIN_INTERVAL_S
-        else:
-            limits.pop(url, None)
-        if limits != had:
-            _store_rate_limits(limits)
+        limits.pop(_streak_key(url, "401"), None)
+        _arm_min_interval(limits, url, time.time())
+        _store_if_changed(limits, had)
         return body
     finally:
         _release_rate_lock(lock)
+
+def _cached_plan_status():
+    """Plan and status from the last reading. '?' when that reading has no plan."""
+    cached = _load_cache()
+    plan = cached.get("claude_plan")
+    status = cached.get("claude_status")
+    if isinstance(plan, str) and plan and isinstance(status, str) and status and "failed" not in status:
+        return plan, status
+    return "?", "?"
+
+def _profile_get(headers, timeout=8):
+    """Plan and status. At most one profile call per USAGE_MIN_INTERVAL_S.
+
+    A 401 records the shared auth backoff and raises _RateLimited(401) so
+    the usage call is not sent with the same dead token. While the profile
+    floor is in force, plan and status come from the cached reading.
+    """
+    url = ANTHROPIC_PROFILE_URL
+    lock = _acquire_rate_lock()
+    try:
+        limits = _load_rate_limits()
+        now = time.time()
+        # A 401/429 window blocks every Claude call, including profile.
+        if _deadline_active(limits, ANTHROPIC_USAGE_URL, now) and _backoff_kind(limits):
+            raise _RateLimited(_backoff_kind(limits))
+        if _deadline_active(limits, url, now):
+            return _cached_plan_status()
+        try:
+            p = get(url, headers, timeout)
+        except urllib.error.HTTPError as e:
+            if getattr(e, "code", None) == 401:
+                _record_http_backoff(limits, time.time(), 401)
+                raise _RateLimited(401) from e
+            raise
+        org = p.get("organization", {}) if isinstance(p, dict) else {}
+        plan = org.get("rate_limit_tier", "?").replace("default_", "")
+        status = org.get("subscription_status", "?")
+        had = dict(limits)
+        _arm_min_interval(limits, url, time.time())
+        _store_if_changed(limits, had)
+        return plan, status
+    finally:
+        _release_rate_lock(lock)
+
+_STALE_SUFFIX_RE = re.compile(r" \| stale \(reading [\d.]+h old\)$")
+
+def _reading_body(line):
+    """Seat line with a previous expiry note and stale tag removed."""
+    line = _STALE_SUFFIX_RE.sub("", line)
+    if "|" not in line:
+        return None
+    body = line.split("|", 1)[1].strip()
+    head, _sep, tail = body.partition(" | ")
+    if head.startswith("token expired ") and "refresh" in head:
+        return tail or None
+    return body or None
+
+def _stale_suffix(seat="claude"):
+    as_of = SUMMARY.get("as_of") if isinstance(SUMMARY.get("as_of"), dict) else {}
+    stamp = as_of.get(seat)
+    if not _is_number(stamp):
+        return ""
+    age_h = max(0.0, (NOW - stamp) / 3600.0)
+    return f" | stale (reading {age_h:.1f}h old)"
+
+def _mark_reading_stale(lines):
+    """Append the reading's age. Used when serving a cache instead of a failure."""
+    suffix = _stale_suffix()
+    if not suffix:
+        return lines
+    out = []
+    for ln in lines:
+        body = _reading_body(ln)
+        if not body:
+            out.append(ln)
+            continue
+        prefix = ln.split("|", 1)[0]
+        out.append(f"{prefix}| {body}{suffix}")
+    return out
+
+def _oauth_expired_s(creds, now=None):
+    """Seconds since expiresAt (ms epoch), or None when it is absent or still valid."""
+    if not isinstance(creds, dict):
+        return None
+    raw = creds.get("expiresAt")
+    if raw is None or isinstance(raw, bool):
+        return None
+    try:
+        ms = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if ms != ms or ms == float("inf") or ms == float("-inf"):
+        return None
+    if now is None:
+        now = time.time()
+    age = now - (ms / 1000.0)
+    if age > 0:
+        return age
+    return None
+
+def _expired_token_lines(age_s):
+    hours = max(0.0, age_s) / 3600.0
+    note = f"claude   | token expired {hours:.1f}h ago; run `claude` once to refresh"
+    reused = _reuse_cached_seat("claude")
+    if not reused:
+        return [note]
+    body = _reading_body(reused[0])
+    if not body:
+        return [note]
+    return [f"{note} | {body}{_stale_suffix()}"]
+
+def _rate_limited_lines():
+    """No HTTP. Stale cache when we have one; the failure only when we do not."""
+    limits = _load_rate_limits()
+    reused = _reuse_cached_seat("claude")
+    if reused is not None:
+        if _backoff_kind(limits):
+            return _mark_reading_stale(reused)
+        return reused
+    code = _backoff_kind(limits) or 429
+    if code == 401:
+        return ["claude   | ? profile failed: HTTPError 401"]
+    return [f"claude   | ? | usage failed: HTTPError {code}"]
 
 def _reuse_cached_seat(seat):
     """Copy the last stored reading into SUMMARY, as_of included. None if this seat has none."""
@@ -314,24 +489,31 @@ def when(ts):
     return f"resets in {d/86400:.1f}d"
 
 def claude():
+    # Local expiry and an on-disk backoff both return before any HTTP call.
     # A live usage deadline is served from the last reading, as_of included.
     # Route already treats a stamp older than 10 minutes as unknown.
-    if _usage_rate_limited():
-        reused = _reuse_cached_seat("claude")
-        if reused is not None:
-            return reused
     try:
         d = json.load(open(f"{H}/.claude/.credentials.json")).get("claudeAiOauth") or {}
-        tok = d["accessToken"]
+        if "accessToken" not in d:
+            raise KeyError("accessToken")
     except Exception as e:
         return [f"claude   | no stored token ({e.__class__.__name__})"]
-    hdr = {"Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"}
+    expired = _oauth_expired_s(d)
+    if expired is not None:
+        return _expired_token_lines(expired)
+    if _usage_rate_limited():
+        return _rate_limited_lines()
+    hdr = {"Authorization": f"Bearer {d['accessToken']}", "anthropic-beta": "oauth-2025-04-20"}
     out = []
     try:
-        p = get(ANTHROPIC_PROFILE_URL, hdr)
-        org = p.get("organization", {})
-        plan = org.get("rate_limit_tier", "?").replace("default_", "")
-        status = org.get("subscription_status", "?")
+        plan, status = _profile_get(hdr)
+    except _RateLimited as e:
+        reused = _reuse_cached_seat("claude")
+        if reused is not None:
+            return _mark_reading_stale(reused)
+        if e.code == 401:
+            return ["claude   | ? profile failed: HTTPError 401"]
+        return [f"claude   | ? | usage failed: HTTPError {e.code}"]
     except Exception as e:
         plan, status = "?", f"profile failed: {_err(e)}"
     try:
@@ -356,12 +538,15 @@ def claude():
         claude_renewal()
         SUMMARY["as_of"]["claude"] = NOW
         out.append(f"claude   | {plan} {status} | " + " | ".join(parts))
-    except _RateLimited:
+    except _RateLimited as e:
         reused = _reuse_cached_seat("claude")
         if reused is not None:
-            return reused
-        out.append(f"claude   | {plan} {status} | usage failed: HTTPError 429")
+            return _mark_reading_stale(reused)
+        out.append(f"claude   | {plan} {status} | usage failed: HTTPError {e.code}")
     except Exception as e:
+        reused = _reuse_cached_seat("claude")
+        if reused is not None:
+            return _mark_reading_stale(reused)
         out.append(f"claude   | {plan} {status} | usage failed: {_err(e)}")
     return out
 
@@ -3210,7 +3395,7 @@ def full_run(quiet=False, timeout=LOCK_TIMEOUT):
     """Reread every seat, merge into the cache, and stamp ts to this run.
 
     Takes the same lock as refresh. A failed seat keeps its last numbers and
-    loses as_of. A usage 429 keeps that seat's as_of and does not call
+    loses as_of. A usage 429 or 401 keeps that seat's as_of and does not call
     again until the backoff deadline. On lock timeout the cache is not
     written; the lines are still printed when not quiet. An inherited lock
     fd is not unlocked.
