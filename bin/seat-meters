@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Draw seat-usage meters as a PNG from the cached summary, laid out like orderly:
+one shared time scale, every row's pace tick on a single "now" line. No network calls."""
+import json, os, sys, time
+from datetime import datetime
+try:
+    from PIL import Image, ImageDraw, ImageFont
+except ImportError:
+    sys.exit("seat-meters needs Pillow: python3 -m pip install --user pillow")
+
+CACHE = os.environ.get("SEAT_USAGE_CACHE", os.path.expanduser("~/.cache/seat-usage/latest.json"))
+OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.environ.get("TMPDIR") or "/tmp", "seat-meters.png")
+BG, INK, DIM, TRACK = "#141a22", "#e6ebf2", "#8a96a8", "#2a3340"
+BLUE, RED = "#5b8fd6", "#c43c3c"
+H5, WK = 5 * 3600, 7 * 86400
+d = json.load(open(CACHE)); now = time.time()
+
+def seat(pct, reset, window):
+    if pct is None or not reset or not window: return None
+    e = max(0.0, min(1.0, 1 - (reset - now) / window))
+    return {"pct": float(pct), "e": e, "w": float(window), "left": reset - now}
+
+rows = []  # (label, main, five)
+def add(label, main, five=None):
+    if main or five: rows.append((label, main, five))
+add("Claude", seat(d.get("claude_week"), d.get("claude_week_reset_ts"), WK), seat(d.get("claude_5h"), d.get("claude_5h_reset_ts"), H5))
+add("ChatGPT", seat(d.get("codex"), d.get("codex_reset_ts"), d.get("codex_window_s") or WK), seat(d.get("codex_5h"), d.get("codex_5h_reset_ts"), H5))
+add("Cursor other", seat(d.get("cursor_api_pct"), d.get("cursor_reset_ts"), d.get("cursor_window_s")))
+add("Cursor models", seat(d.get("cursor_auto_pct"), d.get("cursor_reset_ts"), d.get("cursor_window_s")))
+add("Grok Bot", seat(d.get("bot_pct"), d.get("bot_reset_ts"), d.get("bot_window_s") or WK))
+add("SuperGrok", seat(d.get("grok_pct"), d.get("grok_reset_ts"), d.get("grok_window_s") or WK))
+
+# Muse is not in the main cache: read seat-usage's own Muse file. A missing,
+# unreadable or stale file (a reset already passed) draws a "no reading" row.
+MUSE = os.environ.get("SEAT_USAGE_MUSE_FILE", os.path.expanduser("~/.cache/quartermaster/muse-usage.json"))
+def epoch(v):
+    if isinstance(v, (int, float)) and not isinstance(v, bool): return float(v)
+    try: return datetime.fromisoformat(str(v).strip().replace("Z", "+00:00")).timestamp()
+    except ValueError: return None
+def muse():
+    try:
+        m = json.load(open(MUSE)); w, k = m["window"], m["weekly"]
+        wr, kr, mins = epoch(w["resets_at"]), epoch(k["resets_at"]), float(w["window_duration_mins"])
+        wp, kp = float(w["used_percent"]), float(k["used_percent"])
+    except Exception:
+        return None
+    if None in (wr, kr) or mins <= 0 or wr <= now or kr <= now: return None
+    return seat(kp, kr, WK), seat(wp, wr, mins * 60)
+mu = muse()
+rows.append(("Muse",) + mu if mu else ("Muse", None, None))
+errs = {k: v for k, v in (d.get("errors") or {}).items() if k != "muse"}  # the Muse row says it
+
+# Shared scale: the now line sits where the longest past and longest future just fit.
+mains = [m for _, m, _ in rows if m]
+past = max([m["w"] * m["e"] for m in mains] or [1]); fut = max([m["w"] * (1 - m["e"]) for m in mains] or [1])
+span = past + fut; nowfrac = past / span
+
+def font(sz, bold=False):
+    p = "/usr/share/fonts/truetype/dejavu/DejaVuSans%s.ttf" % ("-Bold" if bold else "")
+    return ImageFont.truetype(p, sz) if os.path.exists(p) else ImageFont.load_default()
+S = 2
+F, FB, FS = font(13 * S), font(13 * S, True), font(11 * S)
+W, PAD, LBL, MW, VAL = 600, 14, 112, 330, 120
+X0 = PAD + LBL
+row_h = lambda r: 40 if r[2] else 26
+Ht = PAD * 2 + 26 + sum(row_h(r) for r in rows) + (16 * len(errs) + 8 if errs else 0)
+img = Image.new("RGB", (W * S, Ht * S), BG); g = ImageDraw.Draw(img)
+P = lambda v: int(v * S)
+
+def left_txt(s):
+    return f"{s/3600:.1f}h" if s < 2 * 86400 else f"{s/86400:.1f}d"
+
+def track(st, y, h, width_frac):
+    """Draw one track whose own tick lands on the shared now line."""
+    nx = X0 + MW * nowfrac
+    tw = MW * width_frac
+    tx = nx - tw * st["e"]
+    g.rounded_rectangle((P(tx), P(y), P(tx + tw), P(y + h)), radius=P(h / 2), fill=TRACK)
+    fw = tw * min(st["pct"], 100) / 100
+    if fw > 0:
+        col_split = tw * st["e"]
+        if st["pct"] >= 100:
+            g.rounded_rectangle((P(tx), P(y), P(tx + fw), P(y + h)), radius=P(h / 2), fill=RED)
+        else:
+            g.rounded_rectangle((P(tx), P(y), P(tx + fw), P(y + h)), radius=P(h / 2), fill=BLUE)
+            if fw > col_split:  # the part past the pace tick is red
+                a, b = tx + col_split, tx + fw
+                if b - a >= h:
+                    g.rounded_rectangle((P(a), P(y), P(b), P(y + h)), radius=P(h / 2), fill=RED)
+                    g.rectangle((P(a), P(y), P(a + h / 2), P(y + h)), fill=RED)
+                else:
+                    g.rectangle((P(a), P(y), P(b), P(y + h)), fill=RED)
+    return tw
+
+g.text((P(PAD), P(PAD)), "Seat usage", font=FB, fill=INK)
+g.text((P(W - PAD), P(PAD)), f"as of {int((now - d.get('ts', now)) / 60)} min ago", font=FS, fill=DIM, anchor="ra")
+y = PAD + 30; top = y
+for label, m, f in rows:
+    h = row_h((label, m, f)); cy = y + 10
+    g.text((P(PAD), P(cy)), label, font=F, fill=INK, anchor="lm")
+    wf = m["w"] / span if m else 0.5
+    if m:
+        track(m, cy - 3, 6, wf)
+    if f:
+        track(f, cy + 8, 4, wf if m else 0.5)
+    if not m and not f:
+        g.text((P(X0 + MW + 12), P(cy)), "no reading", font=FS, fill=DIM, anchor="lm")
+    val = f"{m['pct']:.0f}%" if m else ""
+    g.text((P(X0 + MW + 12), P(cy)), val, font=FB, fill=INK, anchor="lm")
+    if m: g.text((P(W - PAD), P(cy)), left_txt(m["left"]), font=FS, fill=DIM, anchor="rm")
+    if f:
+        g.text((P(X0 + MW + 12), P(cy + 14)), f"5h {f['pct']:.0f}%", font=FS, fill=DIM, anchor="lm")
+        g.text((P(W - PAD), P(cy + 14)), left_txt(f["left"]), font=FS, fill=DIM, anchor="rm")
+    y += h
+nx = X0 + MW * nowfrac
+g.line((P(nx), P(top - 4), P(nx), P(y - 6)), fill=INK, width=P(1.5))
+g.text((P(nx), P(top - 6)), "now", font=FS, fill=DIM, anchor="mb")
+if errs:
+    y += 8
+    for k, v in errs.items():
+        g.text((P(PAD), P(y)), f"{k}: {str(v)[:76]}", font=FS, fill=DIM); y += 16
+img.save(OUT); print(OUT)
