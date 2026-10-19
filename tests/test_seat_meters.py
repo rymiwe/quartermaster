@@ -84,6 +84,29 @@ def test_phone_layout_is_tall_and_narrow():
         assert w == 3 * 390, w              # phone width at 3x
         assert w < ww and h > wh, (w, h, ww, wh)   # narrower and taller than the wide layout
 
+def test_nearly_finished_5h_window_stays_on_the_page():
+    BG = (0x14, 0x1a, 0x22)
+    cache = {"ts": NOW, "claude_week": 42, "claude_week_reset_ts": NOW + 4 * 86400,
+             "claude_5h": 90, "claude_5h_reset_ts": NOW + 60,
+             "cursor_api_pct": 20, "cursor_reset_ts": NOW + 29 * 86400, "cursor_window_s": 31 * 86400}
+    for flags, edge in (((), 14 * 2), (("--phone",), 10 * 3)):
+        with tempfile.TemporaryDirectory() as t:
+            r, out = render(t, cache, muse_doc(), *flags)
+            assert r.returncode == 0, r.stderr
+            im = Image.open(out).convert("RGB")
+            spill = [(x, y) for x in range(edge) for y in range(im.size[1]) if im.getpixel((x, y)) != BG]
+            assert not spill, (flags, spill[:3])
+
+def test_expired_5h_window_draws_no_bar():
+    cache = {"ts": NOW - 9 * 3600, "claude_week": 42, "claude_week_reset_ts": NOW + 4 * 86400,
+             "claude_5h": 19, "claude_5h_reset_ts": NOW - 3600}
+    with tempfile.TemporaryDirectory() as t:
+        r, out = render(t, cache, muse_doc())
+        assert r.returncode == 0, r.stderr
+        expired = Image.open(out).size[1]
+        render(t, {**cache, "claude_5h_reset_ts": NOW + 3600}, muse_doc())
+        assert expired < Image.open(out).size[1]   # the 5h line is gone
+
 if __name__ == "__main__":
     if Image is None:
         print("skip: Pillow not installed"); sys.exit(0)

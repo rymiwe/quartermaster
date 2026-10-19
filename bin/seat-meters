@@ -49,6 +49,8 @@ def muse():
     return seat(kp, kr, WK), seat(wp, wr, mins * 60)
 mu = muse()
 rows.append(("Muse",) + mu if mu else ("Muse", None, None))
+# A 5h window whose reset time has passed has rolled over since the reading: drop its bar.
+rows = [(l, m, f if f and f["left"] > 0 else None) for l, m, f in rows]
 errs = {k: v for k, v in (d.get("errors") or {}).items() if k != "muse"}  # the Muse row says it
 
 # Shared scale: the now line sits where the longest past and longest future just fit.
@@ -83,6 +85,9 @@ def track(st, y, h, width_frac):
     """Draw one track whose own tick lands on the shared now line."""
     nx = X0 + MW * nowfrac
     tw = MW * width_frac
+    # Keep the track inside the meter area: shrink it (tick still on now) if it would spill.
+    if st["e"] > 0: tw = min(tw, (nx - X0) / st["e"])
+    if st["e"] < 1: tw = min(tw, (X0 + MW - nx) / (1 - st["e"]))
     tx = nx - tw * st["e"]
     g.rounded_rectangle((P(tx), P(y), P(tx + tw), P(y + h)), radius=P(h / 2), fill=TRACK)
     fw = tw * min(st["pct"], 100) / 100
@@ -174,5 +179,7 @@ if not PHONE: g.text((P(nx), P(top - 6)), "now", font=FS, fill=DIM, anchor="mb")
 if errs:
     y += 8
     for k, v in errs.items():
-        g.text((P(PAD), P(y)), f"{k}: {str(v)[:76]}", font=FS, fill=DIM); y += 16
+        t = f"{k}: {str(v)[:76]}"
+        while len(t) > 4 and g.textlength(t, font=FS) > P(W - 2 * PAD): t = t[:-2].rstrip() + "\u2026"
+        g.text((P(PAD), P(y)), t, font=FS, fill=DIM); y += 16
 img.save(OUT); print(OUT)
