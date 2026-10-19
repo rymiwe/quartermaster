@@ -23,13 +23,13 @@ def muse_doc(now=NOW):
             "window": {"used_percent": 35, "window_duration_mins": 300, "resets_at": iso(now + 2 * 3600)},
             "weekly": {"used_percent": 50, "resets_at": now + 3 * 86400}}
 
-def render(t, cache, muse=None):
+def render(t, cache, muse=None, *flags):
     cp, mp, out = os.path.join(t, "latest.json"), os.path.join(t, "muse-usage.json"), os.path.join(t, "m.png")
     json.dump(cache, open(cp, "w"))
     if muse is not None:
         json.dump(muse, open(mp, "w"))
     env = {**os.environ, "SEAT_USAGE_CACHE": cp, "SEAT_USAGE_MUSE_FILE": mp}
-    r = subprocess.run([sys.executable, BIN, out], env=env, capture_output=True, text=True)
+    r = subprocess.run([sys.executable, BIN, *flags, out], env=env, capture_output=True, text=True)
     return r, out
 
 def muse_band(out):
@@ -70,6 +70,19 @@ def test_missing_or_stale_muse_file_says_no_reading():
             im, band = muse_band(out)
             assert im.size[1] == 2 * (14 * 2 + 26 + 26)   # a Muse row, text only
             assert BLUE not in band and TRACK not in band
+
+def test_phone_layout_is_tall_and_narrow():
+    cache = {"ts": NOW, "claude_week": 42, "claude_week_reset_ts": NOW + 4 * 86400,
+             "bot_pct": 24, "bot_reset_ts": NOW + 5 * 86400, "bot_window_s": 7 * 86400}
+    with tempfile.TemporaryDirectory() as t:
+        r, out = render(t, cache, muse_doc(), "--phone")
+        assert r.returncode == 0, r.stderr
+        assert r.stdout.strip() == out
+        w, h = Image.open(out).size
+        r2, wide = render(t, cache, muse_doc())
+        ww, wh = Image.open(wide).size
+        assert w == 3 * 390, w              # phone width at 3x
+        assert w < ww and h > wh, (w, h, ww, wh)   # narrower and taller than the wide layout
 
 if __name__ == "__main__":
     if Image is None:
