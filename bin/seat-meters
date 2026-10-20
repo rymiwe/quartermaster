@@ -17,7 +17,8 @@ except ImportError:
 CACHE = os.environ.get("SEAT_USAGE_CACHE", os.path.expanduser("~/.cache/seat-usage/latest.json"))
 FLAGS = {"--phone", "--text"}
 ARGS = [a for a in sys.argv[1:] if a not in FLAGS]; PHONE = "--phone" in sys.argv[1:]
-TEXT = "--text" in sys.argv[1:]  # also print the phone layout's text lines as JSON instead of the path
+TEXT = "--text" in sys.argv[1:]  # print the phone layout's words as JSON instead of the path
+if TEXT and not PHONE: sys.exit("seat-meters: --text needs --phone")
 OUT = ARGS[0] if ARGS else os.path.join(os.environ.get("TMPDIR") or "/tmp", "seat-meters.png")
 BG, INK, DIM = "#141a22", "#e6ebf2", "#8a96a8"
 TRACK_A = 0.14  # orderly: color-mix(in srgb, var(--ink) 14%, transparent)
@@ -193,19 +194,21 @@ if PHONE:
 
     def _find_font(names):
         roots = ["/usr/share/fonts", "/usr/local/share/fonts", os.path.expanduser("~/.local/share/fonts"),
-                 os.path.expanduser("~/.fonts"), "/Library/Fonts", os.path.expanduser("~/Library/Fonts")]
+                 os.path.expanduser("~/.fonts"), "/Library/Fonts", os.path.expanduser("~/Library/Fonts"),
+                 "/System/Library/Fonts"]
         for n in names:
             for r in roots:
                 hit = sorted(glob.glob(os.path.join(r, "**", n), recursive=True))
                 if hit: return hit[0]
         return None
     # orderly: --sans "IBM Plex Sans", --mono "JetBrains Mono"; DejaVu when they are not installed
-    SANS = _find_font(["IBMPlexSans-VariableFont*.ttf", "IBMPlexSans-SemiBold.ttf", "DejaVuSans.ttf"])
-    SANS_REG = _find_font(["IBMPlexSans-VariableFont*.ttf", "IBMPlexSans-Regular.ttf", "DejaVuSans.ttf"])
-    MONO = _find_font(["JetBrainsMono-VariableFont_wght.ttf", "JetBrainsMono-Regular.ttf", "DejaVuSansMono.ttf"])
-    MONO_FB = _find_font(["DejaVuSansMono.ttf"])  # for glyphs JetBrains Mono lacks (the star)
+    SANS = _find_font(["IBMPlexSans-VariableFont*.ttf", "IBMPlexSans-SemiBold.ttf", "DejaVuSans.ttf", "Helvetica.ttc"])
+    SANS_REG = _find_font(["IBMPlexSans-VariableFont*.ttf", "IBMPlexSans-Regular.ttf", "DejaVuSans.ttf", "Helvetica.ttc"])
+    MONO = _find_font(["JetBrainsMono-VariableFont_wght.ttf", "JetBrainsMono-Regular.ttf", "DejaVuSansMono.ttf", "Menlo.ttc"])
+    MONO_FB = _find_font(["DejaVuSansMono.ttf", "Menlo.ttc"])  # for glyphs JetBrains Mono lacks (the star)
+    if not (SANS and SANS_REG and MONO):
+        sys.exit("seat-meters --phone needs a TrueType sans and mono face (IBM Plex Sans and JetBrains Mono, or DejaVu)")
     def vfont(path, px, weight=None):
-        if not path: return ImageFont.load_default()
         f = ImageFont.truetype(path, max(1, round(px * S)))
         if weight is not None:
             try:
@@ -221,6 +224,11 @@ if PHONE:
     F_CHIP = vfont(MONO, 9.5 * K, 400)      # .seat .lab .chip
     F_V = vfont(MONO, 11 * K, 400)          # .seat .v
 
+    def rrect(box, radius, fill, corners):
+        try:
+            g.rounded_rectangle(box, radius=radius, fill=fill, corners=corners)
+        except TypeError:  # Pillow before 9.3 has no per-corner radius: square corners
+            g.rectangle(box, fill=fill)
     def mixhex(c, a, under):
         c, b = [int(c[i:i + 2], 16) for i in (1, 3, 5)], [int(under[i:i + 2], 16) for i in (1, 3, 5)]
         return tuple(round(b[i] + (c[i] - b[i]) * a) for i in range(3))
@@ -252,7 +260,7 @@ if PHONE:
         if vendor not in SUBS: return None
         ts, rn = d.get(SUBS[vendor][0]), d.get(SUBS[vendor][1])
         if not isinstance(ts, (int, float)) or isinstance(ts, bool): return None
-        rn = rn if rn in (True, False) else None
+        rn = rn if isinstance(rn, bool) else None
         if ts <= now:
             return ("sub ended" if rn is False else "sub renewal due"), False
         verb = "renews" if rn is True else "sub ends" if rn is False else "term ends"
@@ -304,7 +312,7 @@ if PHONE:
         if f:
             hot = f["pct"] >= 100 or f["pct"] > f["e"] * 100
             parts.append((f"5h {rnd(f['pct'])}%", hot))
-        sid, vendor = POOL[label][0], POOL[label][1]
+        sid, vendor, _t, at_key = POOL.get(label, (label, "", label, None))
         rk = RESET_KEY.get(label)
         reset = d.get(rk) if rk else None
         if not isinstance(reset, (int, float)) and m: reset = now + m["left"]
@@ -315,7 +323,7 @@ if PHONE:
         if lbl and not same:
             after = sub and d.get(sub[1]) is False and isinstance(term, (int, float)) and reset > term
             parts.append(((f"pool reset {lbl} (after term)" if after else f"resets {lbl}"), False))
-        at = as_of.get(POOL[label][3]) if POOL[label][3] else MUSE_AT
+        at = as_of.get(at_key) if at_key else (MUSE_AT if label == "Muse" else None)
         if isinstance(at, (int, float)) and now - at > 15 * 60:
             parts.append((f"stale {fspan(now - at)}", False))
         return parts
@@ -347,17 +355,17 @@ if PHONE:
     def route_host():
         exe = os.path.join(os.path.dirname(os.path.realpath(__file__)), "seat-usage")
         if not os.path.exists(exe): return None
-        env = dict(os.environ)
-        if "SEAT_USAGE_CACHE" in os.environ and "SEAT_USAGE_CACHE_DIR" not in os.environ:
-            if os.path.basename(CACHE) != "latest.json": return None  # seat-usage could not read the same file
-            env["SEAT_USAGE_CACHE_DIR"] = os.path.dirname(os.path.abspath(CACHE))
+        # seat-usage reads <SEAT_USAGE_CACHE_DIR>/latest.json: point it at the file these meters read
+        if os.path.basename(CACHE) != "latest.json": return None
+        env = {**os.environ, "SEAT_USAGE_CACHE_DIR": os.path.dirname(os.path.abspath(CACHE))}
         try:
             r = subprocess.run([sys.executable, exe, "--route", "host", "--cached", "--json"], env=env,
                                capture_output=True, text=True, timeout=15)
             rows_ = json.loads(r.stdout) if r.returncode == 0 else None
         except Exception:
             return None
-        return next((x for x in rows_ or [] if isinstance(x, dict) and x.get("role") == "host"), None)
+        if not isinstance(rows_, list): return None
+        return next((x for x in rows_ if isinstance(x, dict) and x.get("role") == "host"), None)
     def host_lines(s):
         if not isinstance(s, dict): return "Next host: no cached route", ""
         sid, label = s.get("suggestion"), ""
@@ -379,12 +387,15 @@ if PHONE:
                 "claude_week": "the Max weekly pool" if CLAUDE_MAX else "the Claude weekly pool",
                 "claude_5h": "the Max 5h window" if CLAUDE_MAX else "the Claude 5h window"}
         why = []
-        for h in s.get("hosts") or []:
+        hosts = s.get("hosts") if isinstance(s.get("hosts"), list) else []
+        for h in hosts:
+            if not isinstance(h, dict): continue
             n, w = names.get(h.get("id"), h.get("id")), wins.get(h.get("binding"), h.get("binding") or "its pool")
-            used = "" if h.get("used_pct") is None else f" at {rnd(h['used_pct'])}%"
+            u = h.get("used_pct")
+            used = f" at {rnd(u)}%" if isinstance(u, (int, float)) and not isinstance(u, bool) else ""
             st = h.get("state")
             if st == "capped": why.append(f"{n}: {w} is used up{used}.")
-            elif st == "ahead": why.append(f"{n}: {w} is{used}, ahead of the time elapsed, so it may run out before it resets.")
+            elif st == "ahead": why.append(f"{n}: {w} is{used}" + ("," if used else "") + " ahead of the time elapsed, so it may run out before it resets.")
             elif st == "unknown": why.append(f"{n}: no reading.")
         if why and s.get("mode") == "ask" and not label:
             why.append("No host is clear, so the router leaves the choice to you.")
@@ -395,14 +406,6 @@ if PHONE:
     NOTES = []
     if not PLAN:
         NOTES.append("No Fable chip on Claude: the cache has no Claude plan, and only Max includes Fable.")
-
-    if TEXT:
-        print(json.dumps({"host": HOST, "why": WHY, "legend": LEGEND, "notes": NOTES, "errors": list(errs),
-                          "cards": [{"header": c["header"], "header_warn": c["header_warn"], "sub": c["sub"],
-                                     "pools": [{"title": p["title"], "chips": p["chips"],
-                                                "stats": " \u00b7 ".join(t for t, _ in p["stats"]),
-                                                "red": [t for t, r in p["stats"] if r]} for p in c["pools"]]}
-                                    for c in cards]}))
 
     # ---- geometry, in 1x px (orderly CSS px * K) ----
     FRAME_X, FRAME_Y = 6, 8
@@ -433,7 +436,22 @@ if PHONE:
     why_l = wrap(WHY, F_WHY, CX1 - CX0 - 16 * K) if WHY else []
     legend_l = wrap(LEGEND, F_HDR, CX1 - CX0)
     notes_l = [l for n in NOTES for l in wrap(n, F_HDR, CX1 - CX0)]
-    err_l = [f"{k}: {str(v)[:76]}" for k, v in errs.items()]
+    err_l = [l for k, v in errs.items() for l in wrap(f"{k}: {str(v)[:160]}", F_HDR, CX1 - CX0)]
+    for c in cards:  # chips that fit beside the title (orderly's .lab does not wrap)
+        for p in c["pools"]:
+            x, p["fit"] = TX0 + tw(p["title"], F_TITLE) + 6 * K, []
+            for name, style in p["chips"]:
+                w_ = tw(name, F_CHIP) + 8 * K
+                if x + w_ > TX1: break
+                p["fit"].append((name, style)); x += w_ + 3 * K
+    if TEXT:
+        print(json.dumps({"host": HOST, "why": WHY, "legend": LEGEND, "notes": NOTES, "errors": {k: str(v) for k, v in errs.items()},
+                          "cards": [{"header": c["header"], "header_warn": c["header_warn"], "sub": c["sub"],
+                                     "pools": [{"title": p["title"], "chips": p["chips"], "chips_drawn": len(p["fit"]),
+                                                "stats": " \u00b7 ".join(t for t, _ in p["stats"]),
+                                                "red": [t for t, r in p["stats"] if r]} for p in c["pools"]]}
+                                    for c in cards]}))
+
     pool_h = lambda p: PADY + LH(12) + GAP + (12 if p["five"] and p["main"] else 6) * K + GAP + LH(11) + PADY \
         if (p["main"] or p["five"]) else PADY + LH(12) + GAP + LH(11) + PADY
     for c in cards:
@@ -490,11 +508,9 @@ if PHONE:
         hue = c["hue"]; top = y; total = hdr_h(c) + sum(pool_h(p) for p in c["pools"])
         R = P(4 * K)
         # .seat: 9% vendor tint; .band-hdr: 16%; 3px vendor stripe on the left; right corners rounded
-        g.rounded_rectangle((P(CX0), P(top), P(CX1), P(top + total)), radius=R, fill=mixhex(hue, .09, O_PANEL2),
-                            corners=(False, True, True, False))
+        rrect((P(CX0), P(top), P(CX1), P(top + total)), R, mixhex(hue, .09, O_PANEL2), (False, True, True, False))
         if c["header"]:
-            g.rounded_rectangle((P(CX0), P(top), P(CX1), P(top + hdr_h(c))), radius=R,
-                                fill=mixhex(hue, .16, O_PANEL2), corners=(False, True, False, False))
+            rrect((P(CX0), P(top), P(CX1), P(top + hdr_h(c))), R, mixhex(hue, .16, O_PANEL2), (False, True, False, False))
         g.rectangle((P(CX0), P(top), P(CX0 + BORDER) - 1, P(top + total) - 1), fill=hue)
         if c["header"]:
             yy = top + 3 * K
@@ -510,9 +526,8 @@ if PHONE:
             ly = yy + LH(12) / 2
             g.text((P(TX0), P(ly)), p["title"], font=F_TITLE, fill=O_INK, anchor="lm")
             x = TX0 + tw(p["title"], F_TITLE) + 6 * K
-            for name, style in p["chips"]:
+            for name, style in p["fit"]:
                 ch = VHUE["grok"] if p["seat"] == "grokbot" else hue  # orderly: Grok Bot chips in Grok blue
-                if x + tw(name, F_CHIP) + 8 * K > TX1: break
                 x += chip(x, ly, name, style, ch) + 3 * K
             yy += LH(12) + GAP
             m, f = p["main"], p["five"]

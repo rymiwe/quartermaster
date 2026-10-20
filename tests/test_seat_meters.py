@@ -41,7 +41,8 @@ def render(t, cache, muse=None, *flags):
     json.dump(cache, open(cp, "w"))
     if muse is not None:
         json.dump(muse, open(mp, "w"))
-    env = {**os.environ, "SEAT_USAGE_CACHE": cp, "SEAT_USAGE_MUSE_FILE": mp}
+    env = {**{k: v for k, v in os.environ.items() if not k.startswith("SEAT_USAGE_")},
+           "SEAT_USAGE_CACHE": cp, "SEAT_USAGE_MUSE_FILE": mp}
     r = subprocess.run([sys.executable, BIN, *flags, out], env=env, capture_output=True, text=True)
     return r, out
 
@@ -56,7 +57,8 @@ def phone_text(t, cache, muse=None, name="latest.json"):
         json.dump(muse, open(mp, "w"))
     elif os.path.exists(mp):
         os.remove(mp)
-    env = {**os.environ, "SEAT_USAGE_CACHE": cp, "SEAT_USAGE_MUSE_FILE": mp}
+    env = {**{k: v for k, v in os.environ.items() if not k.startswith("SEAT_USAGE_")},
+           "SEAT_USAGE_CACHE": cp, "SEAT_USAGE_MUSE_FILE": mp}
     r = subprocess.run([sys.executable, BIN, "--phone", "--text", out], env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert open(out, "rb").read(8) == b"\x89PNG\r\n\x1a\n"
@@ -294,7 +296,8 @@ def test_phone_hot_5h_is_red_and_there_is_no_caps_projection():
     assert not any("caps" in q["stats"] or "early" in q["stats"] for c in doc["cards"] for q in c["pools"])
 
 def test_phone_stale_reading_says_so():
-    cache = {"ts": NOW, "as_of": {"claude": NOW - 40 * 60}, "claude_week": 10, "claude_week_reset_ts": NOW + 4 * 86400}
+    now = time.time()  # NOW is fixed at import; the stamp must be 40 minutes before this render
+    cache = {"ts": now, "as_of": {"claude": now - 40 * 60 - 5}, "claude_week": 10, "claude_week_reset_ts": now + 4 * 86400}
     with tempfile.TemporaryDirectory() as t:
         doc = phone_text(t, cache)
     assert _pool(doc, "Claude \u00b7 weekly")["stats"].endswith(" \u00b7 stale 40m")
@@ -338,11 +341,20 @@ def test_phone_chips_follow_orderly_and_the_claude_plan():
     assert not any(p["title"] == "Claude \u00b7 Fable slice" for c in pro["cards"] for p in c["pools"])
     assert _pool(mx, "Claude \u00b7 weekly")["chips"] == [["Fable", "solid"], ["Opus", "solid"]]
     assert _pool(mx, "Claude \u00b7 Fable slice")["chips"] == [["Fable", "solid"]]
+    for doc in (unknown, pro, mx):  # every chip the text lists is drawn in the PNG too
+        assert all(p["chips_drawn"] == len(p["chips"]) for c in doc["cards"] for p in c["pools"]), doc
     assert _pool(unknown, "Cursor \u00b7 Other Models")["chips"] == [["Fable", "dashed"], ["Opus", "dashed"], ["Sol", "dashed"]]
     assert _pool(unknown, "SuperGrok \u00b7 weekly")["chips"] == [["Grok", "dotted"]]
     assert _pool(unknown, "Muse \u00b7 weekly")["chips"] == [["Wonder full", "solid"], ["Wonder", "solid"]]
     assert _pool(unknown, "Google AI Pro \u00b7 Argon")["chips"] == []          # no family map for Google
     assert unknown["legend"] == "dashed = metered \u00b7 dotted = builder only \u00b7 \u2605 first usable pool for the family"
+
+def test_phone_errors_wrap_inside_the_frame():
+    with tempfile.TemporaryDirectory() as t:
+        doc = phone_text(t, {"ts": NOW, "errors": {"claude": "HTTPError 401 " + "x " * 60}})
+        r, out = render(t, {"ts": NOW, "errors": {"claude": "HTTPError 401 " + "x " * 60}}, None, "--phone")
+        assert r.returncode == 0, r.stderr
+    assert doc["errors"]["claude"].startswith("HTTPError 401")
 
 def test_phone_header_is_seat_usages_host_pick():
     cache = {"ts": NOW, "as_of": {"claude": NOW, "grokbot": NOW}, "bot_pct": 10, "bot_reset_ts": NOW + 5 * 86400,
@@ -350,8 +362,9 @@ def test_phone_header_is_seat_usages_host_pick():
              "claude_5h": 10, "claude_5h_reset_ts": NOW + 3600}
     with tempfile.TemporaryDirectory() as t:
         doc = phone_text(t, cache)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SEAT_USAGE_")}
         route = json.loads(subprocess.run([sys.executable, os.path.join(ROOT, "bin", "seat-usage"), "--route", "host",
-                                           "--cached", "--json"], env={**os.environ, "SEAT_USAGE_CACHE_DIR": t},
+                                           "--cached", "--json"], env={**env, "SEAT_USAGE_CACHE_DIR": t},
                                           capture_output=True, text=True).stdout)[0]
         ahead = phone_text(t, {**cache, "bot_pct": 90})
         none = phone_text(t, cache, name="elsewhere.json")  # seat-usage cannot read that file: no route
@@ -363,6 +376,8 @@ def test_phone_header_is_seat_usages_host_pick():
 
 def test_text_flag_prints_json_not_the_path():
     with tempfile.TemporaryDirectory() as t:
+        r, _ = render(t, {"ts": NOW}, None, "--text")
+        assert r.returncode != 0 and "--text needs --phone" in r.stderr
         r, out = render(t, {"ts": NOW}, None, "--phone")
         assert r.stdout.strip() == out
         doc = phone_text(t, {"ts": NOW})
