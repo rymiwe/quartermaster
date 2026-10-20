@@ -537,6 +537,7 @@ def claude():
     try:
         u = _usage_get(hdr)
         parts = []
+        scoped = False
         for l in u.get("limits", []):
             kind = l.get("kind"); pct = l.get("percent"); rs = l.get("resets_at")
             rts = iso_to_ts(rs) if rs else None
@@ -551,8 +552,12 @@ def claude():
                 name = ((l.get("scope") or {}).get("model") or {}).get("display_name", "scoped")
                 parts.append(f"weekly {name} {pct}%: {pace(pct, rts, 7*86400)}")
                 SUMMARY["fable"] = pct; SUMMARY["fable_pace"] = pace_code(pct, rts, 7*86400); SUMMARY["fable_reset_ts"] = rts
+                scoped = True
                 record_pool("claude", "claude weekly Fable", pct, rts, 7 * 86400, "live")
         SUMMARY["claude_plan"] = plan; SUMMARY["claude_status"] = status
+        is_max = claude_max_flag(plan, scoped)
+        if is_max is not None:
+            SUMMARY["claude_max"] = is_max
         claude_renewal()
         SUMMARY["as_of"]["claude"] = NOW
         out.append(f"claude   | {plan} {status} | " + " | ".join(parts))
@@ -567,6 +572,41 @@ def claude():
             return _mark_reading_stale(reused)
         out.append(f"claude   | {plan} {status} | usage failed: {_err(e)}")
     return out
+
+def claude_max_flag(plan, scoped):
+    """True on a Max plan, False on Pro, None when unknown.
+
+    A weekly_scoped (Fable) limit in this usage reading says Max outright:
+    only Max has one. Otherwise the OAuth profile's organization.rate_limit_tier
+    decides (claude_plan is that name without "default_"): "max" in it is Max,
+    claude_ai (Pro, seen 2026-10) is not, and any other name (team, enterprise,
+    a new tier, or "?" from a failed profile read) is unknown.
+    """
+    if scoped:
+        return True
+    return _plan_is_max(plan)
+
+# Tier names seen without a Fable slice. Any other tier without "max" is unknown.
+NON_MAX_TIERS = ("claude_ai", "claude_pro")
+
+def _plan_is_max(plan):
+    if not isinstance(plan, str):
+        return None
+    name = plan.strip().lower().replace("default_", "")
+    if "max" in name:
+        return True
+    if name in NON_MAX_TIERS:
+        return False
+    return None
+
+def claude_max(s):
+    """The cached claude_max flag, or the plan name on a cache written before it. None when unknown."""
+    flag = s.get("claude_max")
+    if isinstance(flag, bool):
+        return flag
+    if "claude_max" in s:
+        return None
+    return _plan_is_max(s.get("claude_plan"))
 
 def claude_renewal():
     """Neither the OAuth profile nor usage endpoint carries a billing date (checked
@@ -1015,7 +1055,7 @@ def burn_line(e):
 SEAT_KEYS = {
     "claude": (
         "claude_5h", "claude_5h_reset_ts", "claude_week", "claude_week_pace", "claude_week_reset_ts",
-        "fable", "fable_pace", "fable_reset_ts", "claude_plan", "claude_status",
+        "fable", "fable_pace", "fable_reset_ts", "claude_plan", "claude_status", "claude_max",
         "claude_renews_ts", "claude_renews", "claude_renews_date_only", "claude_renews_on",
     ),
     "chatgpt": (
@@ -1586,14 +1626,23 @@ def score_route(role, s, now, states=None):
     """Pick a pool by fit, headroom, cost, and use-it-or-lose-it. No rule table."""
     if states is None:
         states = {pid: pool_status(pid, s, now) for pid in POOLS}
-    held = _hold_unknown(role, s, now, states)
+    # Off Max there is no Fable slice, so a Fable role cannot hold on Claude.
+    # It falls back as the council's Fable voter does: to the pools off the
+    # Claude seat that serve Fable (Other Models). Unknown plan: unchanged.
+    off_max = ROLES[role].get("primary") == "fable" and claude_max(s) is False
+    held = None if off_max else _hold_unknown(role, s, now, states)
     if held is not None:
         return held
     track = read_track()
-    missing = _cohort_unknown_ask(role, states, track)
+    missing = None if off_max else _cohort_unknown_ask(role, states, track)
     if missing:
         return _row(role, s, now, "ask", missing)
     ranked = _ranked(role, track)
+    if claude_max(s) is False:  # no slice off Max, whatever the role
+        ranked = [r for r in ranked if r[2] != "fable"]
+    if off_max:
+        frontier = set(_fable_frontier_ids(True))
+        ranked = [r for r in ranked if r[2] in frontier]
     best = None
     best_pid = None
     for fit, _index, pid in ranked:
@@ -2359,10 +2408,7 @@ def _fable_slice_absent(states, s):
     as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
     if not as_of.get("claude"):
         return False
-    plan = s.get("claude_plan")
-    if not isinstance(plan, str) or not plan.strip() or plan.strip() == "?":
-        return False
-    if "max" in plan.lower():
+    if claude_max(s) is not False:
         return False
     if not _is_number(s.get("claude_week")) or not _is_number(s.get("claude_5h")):
         return False

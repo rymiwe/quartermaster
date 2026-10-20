@@ -166,6 +166,17 @@ def cache_copy_is_an_allowlist_of_numbers_and_flags():
 
 
 @test
+def cache_copy_carries_claude_max_as_a_bool_only():
+    for flag in (True, False):
+        c = sp.build_cache_copy(google_cache(claude_max=flag))
+        assert c["claude_max"] is flag, c
+        assert "max_5x" not in json.dumps(c) and "claude_plan" not in c
+    for junk in ("yes", 1, 0, None, "max_5x"):
+        assert "claude_max" not in sp.build_cache_copy(google_cache(claude_max=junk)), junk
+    assert "claude_max" not in sp.build_cache_copy(google_cache())   # unknown stays absent
+
+
+@test
 def cache_copy_keeps_the_numbers_meters_and_routing_need():
     c = sp.build_cache_copy(google_cache())
     assert c["claude_week"] == 40 and c["claude_week_reset_ts"] == NOW + 3 * 86400
