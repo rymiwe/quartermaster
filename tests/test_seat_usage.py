@@ -444,7 +444,8 @@ def hook_role_mapping():
     assert hook.command_role("FOO=1 codex exec") == "hard-bug"
     assert hook.command_role("FOO=1 BAR=2 codex exec -m a") == "hard-bug"
     assert hook.command_role("/x/bin/cursor-agent") == "builder"
-    assert hook.command_role("agy -p --model claude-opus-5-5-low 'fix it'") == "builder"
+    assert hook.command_role("agy --model claude-opus-5-5-low -p 'fix it'") == "builder"
+    assert hook.command_role("agy --model claude-opus-5-5-low -p='fix it'") == "builder"
     assert hook.command_role("agy models") is None
     assert hook.command_role("claude -p --model fable") == "bounded-question"
     assert hook.command_role("claude -p --permission-mode bypassPermissions --model=fable") == "bounded-question"

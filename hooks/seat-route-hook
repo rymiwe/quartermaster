@@ -196,7 +196,9 @@ def command_role(command):
             return "bounded-question"
         return "builder"
     if base == "agy":
-        if not any(t in ("-p", "--print", "--prompt") for t in args):
+        # -p takes the prompt as its value: agy --model X -p "brief", or -p="brief".
+        if not any(t in ("-p", "--print", "--prompt") or t.startswith(("-p=", "--print=", "--prompt="))
+                   for t in args):
             return None
         return "builder"
     if base == "grok" and any(
