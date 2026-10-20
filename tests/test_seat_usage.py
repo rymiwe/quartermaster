@@ -1731,6 +1731,72 @@ def host_aged_reading_says_old_and_not_failed():
 
 
 @test
+def host_pulled_copy_15m_old_does_not_ask():
+    s = snap(pulled_ts=NOW - 60)
+    s["as_of"] = {k: NOW - 15 * 60 for k in s["as_of"]}
+    r = su.route_host(s, NOW)
+    assert r["mode"] != "ask" and r["suggestion"], r
+    assert "old" not in r["reason"], r
+
+
+@test
+def host_pulled_copy_25m_old_asks():
+    s = snap(pulled_ts=NOW - 60)
+    s["as_of"] = dict(s["as_of"])
+    s["as_of"]["grokbot"] = NOW - 25 * 60
+    r = su.route_host(s, NOW)
+    assert r["mode"] == "ask" and r["suggestion"] is None, r
+    assert "25m old" in r["reason"], r
+
+
+@test
+def host_live_cache_11m_old_still_asks():
+    s = snap()
+    assert "pulled_ts" not in s
+    s["as_of"] = dict(s["as_of"])
+    s["as_of"]["grokbot"] = NOW - 11 * 60
+    r = su.route_host(s, NOW)
+    assert r["mode"] == "ask" and "11m old" in r["reason"], r
+
+
+@test
+def route_freshness_comes_from_the_pool_config():
+    def host(age_m, pulled):
+        s = snap(pulled_ts=NOW - 60) if pulled else snap()
+        s["as_of"] = {k: NOW - age_m * 60 for k in s["as_of"]}
+        return su.route_host(s, NOW)
+    with tempfile.TemporaryDirectory() as d:
+        src = json.loads(Path(su.pools_file()).read_text())
+        path = os.path.join(d, "pools.json")
+        try:
+            src["route_freshness_s"] = {"live": 30 * 60, "pulled": 5 * 60}
+            Path(path).write_text(json.dumps(src))
+            su.load_config(pools_path=path)
+            live = host(15, pulled=False)
+            assert live["mode"] != "ask" and live["suggestion"], live
+            pulled = host(15, pulled=True)
+            assert pulled["mode"] == "ask" and "15m old" in pulled["reason"], pulled
+            del src["route_freshness_s"]   # missing key: 10 min live, 20 min pulled
+            Path(path).write_text(json.dumps(src))
+            su.load_config(pools_path=path)
+            live = host(11, pulled=False)
+            assert live["mode"] == "ask" and "11m old" in live["reason"], live
+            pulled = host(15, pulled=True)
+            assert pulled["mode"] != "ask" and pulled["suggestion"], pulled
+            assert host(25, pulled=True)["mode"] == "ask"
+        finally:
+            su.load_config()
+
+
+@test
+def live_merge_drops_the_pulled_marker():
+    base = snap(pulled_ts=NOW - 60)
+    fresh = {"ts": NOW, "as_of": {"claude": NOW}, "v": 1, "claude_week": 41}
+    out = su.merge_summary(base, fresh, ["claude"], NOW)
+    assert "pulled_ts" not in out, sorted(out)
+
+
+@test
 def f2_fable_uses_other_models_when_the_5h_window_is_full():
     seated = su.route_lineup(snap(claude_5h=100, cursor_api_pct=10), NOW)
     assert seated["mode"] != "ask" and seated["lineup"] is not None, seated

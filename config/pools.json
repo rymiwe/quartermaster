@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "route_freshness_s": {"live": 600, "pulled": 1200},
   "scoring": {
     "provider_pseudo": 8,
     "prior_pseudo": 8,

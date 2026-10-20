@@ -49,7 +49,16 @@ ASKS = os.environ.get("SEAT_USAGE_ASKS") or f"{H}/.local/state/seat-usage/asks.j
 RENEWALS_FILE = os.environ.get("SEAT_USAGE_RENEWALS") or f"{H}/.config/seat-usage/renewals.json"
 SUMMARY = {"ts": NOW, "as_of": {}, "v": 1}   # compact fields for the status line; no tokens, no PII
 STALE_HOURS = 3       # a seat reading older than this gets no burn line and is marked stale
-ROUTE_FRESH_S = 600   # a reading older than this is unknown to the router (status line refreshes at 10 min)
+# A reading older than ROUTE_FRESH_S is unknown to the router (the status line
+# refreshes at 10 min). A copy landed by `seat-usage-push --pull` carries
+# pulled_ts. Its readings were taken on the pushing machine (BLD), which pushes
+# at most every 5 min and refreshes at 10, so a good copy is 5-15 min old and
+# gets ROUTE_FRESH_PULLED_S. A live cache never has pulled_ts. Both come from
+# config/pools.json "route_freshness_s" {"live", "pulled"}; these are the
+# defaults when that key, or one of its values, is missing or not positive.
+ROUTE_FRESHNESS_DEFAULT_S = {"live": 600, "pulled": 1200}
+ROUTE_FRESH_S = ROUTE_FRESHNESS_DEFAULT_S["live"]
+ROUTE_FRESH_PULLED_S = ROUTE_FRESHNESS_DEFAULT_S["pulled"]
 # The usage endpoint publishes no limit and answers 429 with Retry-After: 0
 # (anthropics/claude-code#30930, still open 2026-10-14). So the floor is ours:
 # one call per USAGE_MIN_INTERVAL_S after a good read, and the profile
@@ -1231,7 +1240,8 @@ def load_config(pools_path=None, priors_path=None):
     install still sees it.
     """
     global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, BURN_HOURS, BURN_GAP, NEAR_CAP
-    global FAMILY_VENDOR, _FAMILY_NAME
+    global FAMILY_VENDOR, _FAMILY_NAME, ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S
+    ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S = (ROUTE_FRESHNESS_DEFAULT_S["live"], ROUTE_FRESHNESS_DEFAULT_S["pulled"])
     path = pools_path or pools_file()
     try:
         fh = open(path)
@@ -1253,6 +1263,12 @@ def load_config(pools_path=None, priors_path=None):
         fh.close()
     if not isinstance(data, dict) or not isinstance(data.get("pools"), dict):
         raise RuntimeError(f"pool config {path} needs a pools object")
+    fresh = data.get("route_freshness_s") if isinstance(data.get("route_freshness_s"), dict) else {}
+    ok = lambda v: _is_number(v) and v > 0
+    if ok(fresh.get("live")):
+        ROUTE_FRESH_S = fresh["live"]
+    if ok(fresh.get("pulled")):
+        ROUTE_FRESH_PULLED_S = fresh["pulled"]
     scoring = data.get("scoring") or {}
     SCORING = dict(scoring)
     BURN_HOURS = scoring.get("lose_it_hours", BURN_HOURS)
@@ -1574,12 +1590,17 @@ def _window(meta, s):
     w = meta["window"]
     return s.get(w) if isinstance(w, str) else w
 
+def route_fresh_s(s):
+    """How old a reading may be before a route treats it as unknown."""
+    return ROUTE_FRESH_PULLED_S if _is_number(s.get("pulled_ts")) else ROUTE_FRESH_S
+
 def pool_status(pool_id, s, now):
     """'unknown' | 'capped' | 'near_cap' | 'open' | 'under' | 'on' | 'ahead', plus why when unknown.
 
     The Fable slice is near_cap from 95% used until it caps. That band outranks pace.
 
-    unknown when the seat has no as_of, the reading is older than 10 minutes,
+    unknown when the seat has no as_of, the reading is older than 10 minutes
+    (20 on a pulled copy, see route_fresh_s),
     used% is absent or not a number (absent is never 0%), or the reset is
     missing or already past. grok is also capped when grok_exhausted.
     A 5h pool (facts.window 5h) is open when the plan has no session keys, or
@@ -1598,7 +1619,7 @@ def pool_status(pool_id, s, now):
     if _is_number(end) and end != reset and end <= now:
         return "capped", "term ended"
     age = now - stamp
-    if age > ROUTE_FRESH_S:
+    if age > route_fresh_s(s):
         return "unknown", f"reading {int(age // 60)}m old"
     used = s.get(meta["used"])
     short = (meta.get("facts") or {}).get("window") == "5h"
@@ -1699,6 +1720,7 @@ def merge_summary(base, fresh, seats, now=None):
     if now is None:
         now = NOW
     out = dict(base)
+    out.pop("pulled_ts", None)   # a live reading merged in: no longer a pulled copy
     out["as_of"] = dict(base.get("as_of") or {})
     fresh_as_of = fresh.get("as_of") or {}
     seat_set = list(seats)

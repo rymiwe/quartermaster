@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -176,6 +177,11 @@ def cache_copy_keeps_the_numbers_meters_and_routing_need():
 
 
 @test
+def only_pull_marks_a_copy_as_pulled():
+    assert "pulled_ts" not in sp.build_cache_copy(google_cache(pulled_ts=NOW))
+
+
+@test
 def cache_copy_drops_wrong_types():
     c = sp.build_cache_copy(google_cache(claude_week="40", codex=True, grok_pct=float("nan"),
                                          bot_exhausted="yes", cursor_api_pct=None))
@@ -204,6 +210,8 @@ def pull_lands_a_refiltered_copy_and_muse_file():
             assert calls == ["gists/abc123"], calls
             landed = json.load(open(sp.CACHE))
             assert strings_in(landed) == [], strings_in(landed)
+            pulled = landed.pop("pulled_ts")
+            assert isinstance(pulled, float) and abs(pulled - time.time()) < 60, pulled
             assert landed == sp.build_cache_copy(hand_edited)
             m = json.load(open(sp.MUSE_FILE))
             assert m["window"]["used_percent"] == 35 and m["window"]["window_duration_mins"] == 300
