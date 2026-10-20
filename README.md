@@ -39,6 +39,10 @@ This project only documents what it expects in `~/.claude/settings.json`; the fi
 - `PreToolUse`, matcher `"Agent|Bash"`, running `~/.claude/hooks/seat-route-hook`, timeout 50
 - `SessionStart`, running `seat-usage --cached`
 
+## Status-line rows
+
+Every cache write adds `seats` to `latest.json`: the groups and bars a status line draws (`seat_rows`). Each group has an `id` (`cl`, `cx`, `cu`, `gk`, `mu`, `gg`), a `hue`, and `bars`. A bar's `kind` is `seat`, `failed`, `empty`, or `off`. A new seat or state goes here, and the status line draws it with no change of its own. `~/.claude/statusline.py` (dotfiles) reads only these rows. It still owns the session part, staleness, and wording. A pulled copy carries numbers only, so a pull-only host has no `seats` and its status line draws no seat bars.
+
 ## Install this checkout
 
 `install.sh` points `~/.local/bin/seat-usage` and `~/.claude/hooks/seat-route-hook` at this checkout. The default is a symlink, so a later `git pull` updates those commands. The script does not edit `~/.claude/settings.json`. Dotfiles still owns that file.

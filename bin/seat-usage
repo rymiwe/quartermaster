@@ -565,7 +565,7 @@ def claude():
         is_max = claude_max_flag(plan, scoped)
         if is_max is not None:
             SUMMARY["claude_max"] = is_max
-        claude_renewal()
+        claude_renewal(status)
         SUMMARY["as_of"]["claude"] = NOW
         out.append(f"claude   | {plan} {status} | " + " | ".join(parts))
     except _RateLimited as e:
@@ -615,11 +615,16 @@ def claude_max(s):
         return None
     return _plan_is_max(s.get("claude_plan"))
 
-def claude_renewal():
+def claude_renewal(status=None):
     """Neither the OAuth profile nor usage endpoint carries a billing date (checked
     2026-10-08), so the Max term end is kept by hand in RENEWALS_FILE as
     {"claude": {"at": "2026-10-14", "renews": null}}. renews: true, false, or null
-    for not known."""
+    for not known.
+
+    A hand-kept date that has passed while the live profile says "active" is
+    dropped: the profile describes the plan in force now, and the date an earlier
+    term. Max ended 2026-10-14 for Pro, and the stale date capped every Claude
+    pool as "term ended" until it was cleared by hand."""
     try:
         r = json.load(open(RENEWALS_FILE)).get("claude") or {}
         at = r.get("at")
@@ -627,7 +632,10 @@ def claude_renewal():
             # A date with no clock is a calendar day. The timestamp is only the
             # day's start in Pacific time, so callers must not print it as a known hour.
             date_only = "T" not in at
-            SUMMARY["claude_renews_ts"] = iso_to_ts(at if not date_only else at + "T00:00:00-07:00")
+            ts = iso_to_ts(at if not date_only else at + "T00:00:00-07:00")
+            if status == "active" and ts <= NOW:
+                return
+            SUMMARY["claude_renews_ts"] = ts
             SUMMARY["claude_renews"] = r.get("renews")
             SUMMARY["claude_renews_date_only"] = date_only
             SUMMARY["claude_renews_on"] = at if date_only else None
@@ -2037,6 +2045,7 @@ def _store_merged(base, lines, seats, now, stamp_now):
     apply_muse(merged, now)
     apply_google(merged, now)
     apply_caps(merged, now)
+    merged["seats"] = seat_rows(merged, now)
     if stamp_now:
         merged["ts"] = now
     SUMMARY = merged
@@ -3968,6 +3977,113 @@ def plans_line(summary, now=None):
     if any(k.startswith("google_") for k in summary):
         parts.append("google AI Pro (label, not read)")
     return "plans    | " + " | ".join(parts)
+
+# Status-line groups, in drawing order. Hues are xterm-256 indexes. Google's
+# 63 is the nearest to seat-meters' indigo #5468f0.
+_ROW_GROUPS = (("cl", 208), ("cx", 141), ("cu", 43), ("gk", 75), ("mu", 212), ("gg", 63))
+
+def seat_rows(s, now=None):
+    """What a status line draws, from the cache numbers. Pure; written into latest.json.
+
+    A list of {"id", "hue", "tag"?, "ondemand_over"?, "bars"}. A bar is
+    {"kind": "seat"|"failed"|"empty"|"off", "name", "seat", ...}; a "seat" bar adds
+    pool, hue, pct, reset_ts, window_s, notify (may name its reset), and on Claude
+    term_ts/term_verb/term_day. "stdin" names the Claude Code rate_limits key that
+    overrides it live. "stale_name" sits on the first bar of each seat, for the
+    renderer's old-reading note. Staleness and wording stay with the renderer.
+    """
+    now = NOW if now is None else now
+    as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
+    num = lambda k: s.get(k) if _is_number(s.get(k)) else None
+    ok = lambda seat: _is_number(as_of.get(seat))
+    def bar(name, seat, pool, hue, pct, reset, window, notify=True, **extra):
+        return {"kind": "seat", "name": name, "seat": seat, "pool": pool, "hue": hue, "pct": pct,
+                "reset_ts": reset, "window_s": window, "notify": notify, **extra}
+    groups = {gid: {"id": gid, "hue": hue, "bars": []} for gid, hue in _ROW_GROUPS}
+
+    cl = groups["cl"]
+    if isinstance(s.get("claude_max"), bool):
+        cl["tag"] = "max" if s["claude_max"] else "pro"
+    renews = s.get("claude_renews")
+    term = {"term_ts": num("claude_renews_ts"),
+            "term_verb": {True: "renews", False: "sub ends"}.get(renews, "term ends"),
+            "term_day": s.get("claude_renews_on") if s.get("claude_renews_date_only") is True else None}
+    cl["bars"] += [bar("5h", "claude", "claude_5h", 223, num("claude_5h"), num("claude_5h_reset_ts"), 5 * 3600,
+                       stdin="five_hour", **term),
+                   bar("wk", "claude", "claude_week", 215, num("claude_week"), num("claude_week_reset_ts"), 7 * 86400,
+                       stdin="seven_day", **term)]
+    if num("fable") is not None:
+        if not ok("claude"):
+            cl["bars"].append({"kind": "failed", "name": "fable", "seat": "claude"})
+        else:
+            fr, wr = num("fable_reset_ts"), num("claude_week_reset_ts")
+            same = fr is not None and wr is not None and abs(fr - wr) < 3600
+            cl["bars"].append(bar("fable", "claude", "fable", 208, num("fable"), fr, 7 * 86400,
+                                  notify=not same, stale_name="fable", **term))
+
+    cx = groups["cx"]
+    if s.get("codex_renews") is False and num("codex_renews_ts") is not None and num("codex_renews_ts") <= now:
+        cx["bars"].append({"kind": "off", "name": "cx", "seat": "chatgpt"})
+    elif not ok("chatgpt"):
+        cx["bars"].append({"kind": "failed", "name": "cx", "seat": "chatgpt"})
+    else:
+        if num("codex_5h") is not None:
+            cx["bars"].append(bar("cx 5h", "chatgpt", "codex_5h", 183, num("codex_5h"), num("codex_5h_reset_ts"),
+                                  5 * 3600, stale_name="cx"))
+        cx["bars"].append(bar("cx", "chatgpt", "codex", 141, num("codex"), num("codex_reset_ts"),
+                              num("codex_window_s"), **({} if cx["bars"] else {"stale_name": "cx"})))
+
+    cu = groups["cu"]
+    if not ok("cursor"):
+        cu["bars"].append({"kind": "failed", "name": "cursor", "seat": "cursor"})
+    else:
+        reset, window = num("cursor_reset_ts"), num("cursor_window_s")
+        cu["bars"] += [bar("models", "cursor", "cursor_models", 122, num("cursor_auto_pct"), reset, window,
+                           notify=False, stale_name="cursor"),
+                       bar("other", "cursor", "cursor_other", 43, num("cursor_api_pct"), reset, window)]
+        od, lim = num("cursor_ondemand"), num("cursor_ondemand_limit")
+        if od is not None and lim is not None and od - lim >= 0.5:
+            cu["ondemand_over"] = round(od - lim, 2)
+    if not ok("grokbot"):
+        cu["bars"].append({"kind": "failed", "name": "bot", "seat": "grokbot"})
+    elif s.get("bot_exhausted") is True:
+        cu["bars"].append({"kind": "empty", "name": "bot", "seat": "grokbot", "reset_ts": num("bot_reset_ts")})
+    elif num("bot_pct") is not None:
+        cu["bars"].append(bar("bot", "grokbot", "grokbot", 30, num("bot_pct"), num("bot_reset_ts"),
+                              num("bot_window_s"), stale_name="bot"))
+
+    gk = groups["gk"]
+    if not ok("grok"):
+        gk["bars"].append({"kind": "failed", "name": "gk", "seat": "grok"})
+    elif s.get("grok_exhausted") is True:
+        gk["bars"].append({"kind": "empty", "name": "gk", "seat": "grok", "reset_ts": num("grok_reset_ts")})
+    else:
+        gk["bars"].append(bar("gk", "grok", "grok", 75, num("grok_pct"), num("grok_reset_ts"),
+                              num("grok_window_s"), stale_name="gk"))
+
+    mu = groups["mu"]
+    if not ok("muse"):
+        mu["bars"].append({"kind": "failed", "name": "mu", "seat": "muse"})
+    else:
+        if num("muse_5h") is not None:
+            mu["bars"].append(bar("mu 5h", "muse", "muse_5h", 218, num("muse_5h"), num("muse_5h_reset_ts"),
+                                  5 * 3600, stale_name="mu"))
+        mu["bars"].append(bar("mu", "muse", "muse_week", 212, num("muse_week"), num("muse_week_reset_ts"),
+                              7 * 86400, **({} if mu["bars"] else {"stale_name": "mu"})))
+
+    # Google: the three weekly pools. Its 5h windows are left to seat-usage's own lines.
+    gg = groups["gg"]
+    if any(k.startswith("google_") for k in s):
+        if not ok("google"):
+            gg["bars"].append({"kind": "failed", "name": "gg", "seat": "google"})
+        else:
+            for i, (pool, name, hue) in enumerate((("argon", "argon", 63), ("gemini", "gemini", 69),
+                                                   ("claudegpt", "c/g", 105))):
+                if num(f"google_{pool}_week") is not None:
+                    gg["bars"].append(bar(name, "google", f"google_{pool}_week", hue, num(f"google_{pool}_week"),
+                                          num(f"google_{pool}_week_reset_ts"), 7 * 86400,
+                                          **({} if gg["bars"] else {"stale_name": "gg"})))
+    return [g for g in groups.values() if g["bars"] or g.get("tag")]
 
 def print_cached():
     """--cached: print the last run's lines from the cache, no network. For the

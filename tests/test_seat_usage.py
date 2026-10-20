@@ -2294,6 +2294,32 @@ def claude_renewal_date_only_keeps_the_calendar_day():
         su.SUMMARY.update(saved)
 
 
+@test
+def claude_renewal_drops_a_passed_term_while_the_profile_is_active():
+    old, old_now = su.RENEWALS_FILE, su.NOW
+    saved = dict(su.SUMMARY)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "renewals.json")
+            with open(path, "w") as f:
+                json.dump({"claude": {"at": "2026-10-14", "renews": False}}, f)
+            su.RENEWALS_FILE = path
+            su.NOW = su.iso_to_ts("2026-10-20T12:00:00-07:00")
+            su.SUMMARY.clear()
+            su.claude_renewal("active")
+            assert "claude_renews_ts" not in su.SUMMARY, su.SUMMARY
+            su.claude_renewal("canceled")
+            assert su.SUMMARY["claude_renews"] is False, su.SUMMARY
+            su.SUMMARY.clear()
+            su.NOW = su.iso_to_ts("2026-10-10T12:00:00-07:00")
+            su.claude_renewal("active")
+            assert su.SUMMARY["claude_renews"] is False, "a term still ahead is kept"
+    finally:
+        su.RENEWALS_FILE, su.NOW = old, old_now
+        su.SUMMARY.clear()
+        su.SUMMARY.update(saved)
+
+
 UNDER_HARD_BUG = (
     "route: hard-bug | chatgpt | astra | low | - | suggest | "
     "Codex under pace: score 0.85 (fit 0.88, headroom 1.00, cost 3, lose-it 0.00) | reading 0m\n"
@@ -3811,6 +3837,29 @@ def plans_line_names_each_vendor_plan():
                                      + " | cursor Pro+ | grok SuperGrok | google AI Pro (label, not read)"), su.plans_line(s, now)
     line = su.plans_line({"claude_plan": "claude_max_5x", "cursor": "x_super", "codex_plan": "?"}, now)
     assert line == "plans    | claude Max 5x | cursor x_super", line
+
+
+@test
+def seat_rows_mirror_the_status_line_groups():
+    s = snap(claude_max=False, codex_5h=5, codex_5h_reset_ts=NOW + 3600, bot_exhausted=True,
+             google_argon_week=4, google_argon_week_reset_ts=NOW + 86400)
+    s["as_of"] = dict(s["as_of"], google=NOW)
+    rows = {g["id"]: g for g in su.seat_rows(s, NOW)}
+    assert list(rows) == ["cl", "cx", "cu", "gk", "mu", "gg"], list(rows)
+    assert rows["cl"]["tag"] == "pro"
+    assert [b["name"] for b in rows["cl"]["bars"]] == ["5h", "wk", "fable"], rows["cl"]
+    assert rows["cl"]["bars"][0]["stdin"] == "five_hour"
+    assert [b["name"] for b in rows["cx"]["bars"]] == ["cx 5h", "cx"]
+    assert rows["cx"]["bars"][0]["stale_name"] == "cx" and "stale_name" not in rows["cx"]["bars"][1]
+    assert rows["cu"]["bars"][-1] == {"kind": "empty", "name": "bot", "seat": "grokbot", "reset_ts": s["bot_reset_ts"]}
+    assert [(b["name"], b["pct"]) for b in rows["gg"]["bars"]] == [("argon", 4)], rows["gg"]
+    # A failed read, an ended ChatGPT term, and no Google keys at all.
+    s2 = snap(codex_renews=False, codex_renews_ts=NOW - 60)
+    s2["as_of"] = {k: v for k, v in s2["as_of"].items() if k != "grok"}
+    rows = {g["id"]: g for g in su.seat_rows(s2, NOW)}
+    assert rows["cx"]["bars"] == [{"kind": "off", "name": "cx", "seat": "chatgpt"}], rows["cx"]
+    assert rows["gk"]["bars"] == [{"kind": "failed", "name": "gk", "seat": "grok"}], rows["gk"]
+    assert "gg" not in rows
 
 
 def main():
