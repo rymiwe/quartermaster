@@ -3543,6 +3543,141 @@ def wsl_env_names_the_token_for_op_exe_only():
         assert "OP_SERVICE_ACCOUNT_TOKEN" in seen["kw"]["env"]["WSLENV"].split(":"), seen["kw"]["env"].get("WSLENV")
 
 
+def _pull_only_sandbox(d):
+    """HOME, cache, and a PATH of trap binaries that record any call."""
+    home = os.path.join(d, "home")
+    cache_dir = os.path.join(home, ".cache", "seat-usage")
+    os.makedirs(cache_dir)
+    os.makedirs(os.path.join(home, ".config", "seat-usage"))
+    traps = os.path.join(d, "traps")
+    os.makedirs(traps)
+    called = os.path.join(d, "called")
+    for name in ("op", "op.exe", "codex", "claude", "cursor-agent", "agy", "muse", "curl", "gh"):
+        path = os.path.join(traps, name)
+        with open(path, "w") as f:
+            f.write(f"#!/bin/sh\necho {name} >> '{called}'\nexit 1\n")
+        os.chmod(path, 0o755)
+    cache = os.path.join(cache_dir, "latest.json")
+    body = json.dumps(snap(ts=time.time() - 600, lines=["grok     | SuperGrok active | week 21%"]))
+    with open(cache, "w") as f:
+        f.write(body)
+    os.utime(cache, (1_700_000_000, 1_700_000_000))
+    env = {"PATH": traps + ":/usr/bin:/bin", "HOME": home, "PYTHONDONTWRITEBYTECODE": "1",
+           "SEAT_USAGE_CACHE_DIR": cache_dir, "SEAT_USAGE_OP_TOKEN_FILE": "/nonexistent/op-token"}
+    return env, cache, body, called, home
+
+
+def _pull_only_runs(env, cache, body, called):
+    argvs = ([], ["--quiet"], ["--route", "builder"], ["--route", "lineup", "--json", "--kind", "review"],
+             ["--route", "ask"], ["--route", "host"], ["--route"], ["--cached"])
+    outs = []
+    for argv in argvs:
+        r = subprocess.run([sys.executable, str(BIN)] + argv, env=env, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, (argv, r.returncode, r.stderr[-400:])
+        outs.append((argv, r.stdout))
+        assert not os.path.exists(called), (argv, open(called).read())
+        with open(cache) as f:
+            assert f.read() == body, argv
+        assert os.stat(cache).st_mtime == 1_700_000_000, argv
+    return outs
+
+
+@test
+def pull_only_marker_never_reads_live_or_writes_cache():
+    with tempfile.TemporaryDirectory() as d:
+        env, cache, body, called, home = _pull_only_sandbox(d)
+        open(os.path.join(home, ".config", "seat-usage", "pull-only"), "w").close()
+        outs = dict((" ".join(a), o) for a, o in _pull_only_runs(env, cache, body, called))
+        assert "[seat-usage] pull-only cached 10m ago" in outs[""], outs[""]
+        assert outs["--quiet"] == "", outs["--quiet"]
+        assert outs["--route builder"].startswith("route: builder"), outs["--route builder"]
+        json.loads(outs["--route lineup --json --kind review"])
+        env2 = dict(env, QUARTERMASTER_AUTO_UPDATE="1")
+        r = subprocess.run([sys.executable, str(BIN), "--route", "builder"], env=env2, capture_output=True, text=True, timeout=60)
+        assert "[seat-usage] pull-only cached 10m ago" in r.stderr, r.stderr
+        assert not os.path.exists(os.path.join(home, ".cache", "quartermaster", "seat-usage-update"))
+        os.remove(cache)
+        r = subprocess.run([sys.executable, str(BIN)], env=env2, capture_output=True, text=True, timeout=60)
+        assert "pull-only: no cached line" in r.stdout and "seat-usage-push --pull" in r.stdout, r.stdout
+        assert not os.path.exists(called), open(called).read()
+
+
+@test
+def pull_only_env_never_reads_live_or_writes_cache():
+    with tempfile.TemporaryDirectory() as d:
+        env, cache, body, called, _ = _pull_only_sandbox(d)
+        env["SEAT_USAGE_PULL_ONLY"] = "1"
+        outs = dict((" ".join(a), o) for a, o in _pull_only_runs(env, cache, body, called))
+        assert "pull-only cached" in outs[""], outs[""]
+
+
+@test
+def pull_only_in_process_skips_readers_and_op():
+    calls = []
+    saved = {n: getattr(su, n) for n in ("claude", "codex", "cursor", "grok", "write_cache")}
+    old_env = os.environ.get("SEAT_USAGE_PULL_ONLY")
+    old_run = subprocess.run
+    def trap(name):
+        def f(*a, **k):
+            calls.append(name)
+            return []
+        f.__name__ = name
+        return f
+    try:
+        for n in saved:
+            setattr(su, n, trap(n))
+        subprocess.run = trap("subprocess.run")
+        os.environ["SEAT_USAGE_PULL_ONLY"] = "1"
+        su.refresh(["claude", "chatgpt", "cursor", "grok"])
+        su.full_run(quiet=True)
+        assert su.grok_cookie() is None
+        assert su.refresh_muse_usage() is False
+        assert calls == [], calls
+    finally:
+        subprocess.run = old_run
+        for n, f in saved.items():
+            setattr(su, n, f)
+        if old_env is None:
+            os.environ.pop("SEAT_USAGE_PULL_ONLY", None)
+        else:
+            os.environ["SEAT_USAGE_PULL_ONLY"] = old_env
+
+
+@test
+def pull_only_off_still_runs_readers():
+    calls = []
+    saved = {n: getattr(su, n) for n in ("claude", "codex", "cursor", "grok")}
+    old_env = os.environ.pop("SEAT_USAGE_PULL_ONLY", None)
+    old_file = os.environ.get("SEAT_USAGE_PULL_ONLY_FILE")
+    with tempfile.TemporaryDirectory() as d:
+        old_cache, old_dir, old_summary = su.CACHE, su.CACHE_DIR, su.SUMMARY
+        os.environ["SEAT_USAGE_PULL_ONLY_FILE"] = os.path.join(d, "no-marker")
+        su.CACHE, su.CACHE_DIR = os.path.join(d, "latest.json"), d
+        def trap(name):
+            def f(*a, **k):
+                calls.append(name)
+                return []
+            f.__name__ = name
+            return f
+        try:
+            for n in saved:
+                setattr(su, n, trap(n))
+            assert su.pull_only() is False
+            su.refresh(["claude", "chatgpt", "cursor", "grok"])
+            assert calls == ["claude", "codex", "cursor", "grok"], calls
+            assert os.path.exists(su.CACHE)
+        finally:
+            for n, f in saved.items():
+                setattr(su, n, f)
+            su.CACHE, su.CACHE_DIR, su.SUMMARY = old_cache, old_dir, old_summary
+            if old_env is not None:
+                os.environ["SEAT_USAGE_PULL_ONLY"] = old_env
+            if old_file is None:
+                os.environ.pop("SEAT_USAGE_PULL_ONLY_FILE", None)
+            else:
+                os.environ["SEAT_USAGE_PULL_ONLY_FILE"] = old_file
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:
