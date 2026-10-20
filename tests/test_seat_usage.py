@@ -933,11 +933,14 @@ def seat_http_sandbox(profile_url, usage_url):
         "ANTHROPIC_PROFILE_URL": su.ANTHROPIC_PROFILE_URL,
         "ANTHROPIC_USAGE_URL": su.ANTHROPIC_USAGE_URL,
         "USAGE_MIN_INTERVAL_S": su.USAGE_MIN_INTERVAL_S,
+        "RENEWALS_FILE": su.RENEWALS_FILE,
     }
     fns = {name: getattr(su, name) for name in ("codex", "cursor", "grok")}
-    old_env = {key: os.environ.get(key) for key in ("NO_PROXY", "no_proxy")}
+    old_env = {key: os.environ.get(key) for key in ("NO_PROXY", "no_proxy", "SEAT_USAGE_SKIP_GOOGLE")}
     os.environ["NO_PROXY"] = "*"
     os.environ["no_proxy"] = "*"
+    # Never run the real agy from a test.
+    os.environ["SEAT_USAGE_SKIP_GOOGLE"] = "1"
     try:
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cache:
             os.makedirs(os.path.join(home, ".claude"))
@@ -945,6 +948,8 @@ def seat_http_sandbox(profile_url, usage_url):
                 json.dump({"claudeAiOauth": {"accessToken": "fixture-token"}}, f)
             su.H = home
             su.HISTORY = os.path.join(home, "history.jsonl")
+            # RENEWALS_FILE is resolved from the real home at import; a real term end would cap every Claude pool.
+            su.RENEWALS_FILE = os.path.join(home, ".config", "seat-usage", "renewals.json")
             su.CACHE_DIR = cache
             su.CACHE = os.path.join(cache, "latest.json")
             su.ANTHROPIC_PROFILE_URL = profile_url
@@ -2289,6 +2294,32 @@ def claude_renewal_date_only_keeps_the_calendar_day():
         su.SUMMARY.update(saved)
 
 
+@test
+def claude_renewal_drops_a_passed_term_while_the_profile_is_active():
+    old, old_now = su.RENEWALS_FILE, su.NOW
+    saved = dict(su.SUMMARY)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "renewals.json")
+            with open(path, "w") as f:
+                json.dump({"claude": {"at": "2026-10-14", "renews": False}}, f)
+            su.RENEWALS_FILE = path
+            su.NOW = su.iso_to_ts("2026-10-20T12:00:00-07:00")
+            su.SUMMARY.clear()
+            su.claude_renewal("active")
+            assert "claude_renews_ts" not in su.SUMMARY, su.SUMMARY
+            su.claude_renewal("canceled")
+            assert su.SUMMARY["claude_renews"] is False, su.SUMMARY
+            su.SUMMARY.clear()
+            su.NOW = su.iso_to_ts("2026-10-10T12:00:00-07:00")
+            su.claude_renewal("active")
+            assert su.SUMMARY["claude_renews"] is False, "a term still ahead is kept"
+    finally:
+        su.RENEWALS_FILE, su.NOW = old, old_now
+        su.SUMMARY.clear()
+        su.SUMMARY.update(saved)
+
+
 UNDER_HARD_BUG = (
     "route: hard-bug | chatgpt | astra | low | - | suggest | "
     "Codex under pace: score 0.85 (fit 0.88, headroom 1.00, cost 3, lose-it 0.00) | reading 0m\n"
@@ -3541,6 +3572,294 @@ def wsl_env_names_the_token_for_op_exe_only():
             finally:
                 shutil.which = old_which
         assert "OP_SERVICE_ACCOUNT_TOKEN" in seen["kw"]["env"]["WSLENV"].split(":"), seen["kw"]["env"].get("WSLENV")
+
+
+def _pull_only_sandbox(d):
+    """HOME, cache, and a PATH of trap binaries that record any call."""
+    home = os.path.join(d, "home")
+    cache_dir = os.path.join(home, ".cache", "seat-usage")
+    os.makedirs(cache_dir)
+    os.makedirs(os.path.join(home, ".config", "seat-usage"))
+    traps = os.path.join(d, "traps")
+    os.makedirs(traps)
+    called = os.path.join(d, "called")
+    for name in ("op", "op.exe", "codex", "claude", "cursor-agent", "agy", "muse", "curl", "gh"):
+        path = os.path.join(traps, name)
+        with open(path, "w") as f:
+            f.write(f"#!/bin/sh\necho {name} >> '{called}'\nexit 1\n")
+        os.chmod(path, 0o755)
+    cache = os.path.join(cache_dir, "latest.json")
+    body = json.dumps(snap(ts=time.time() - 600, lines=["grok     | SuperGrok active | week 21%"]))
+    with open(cache, "w") as f:
+        f.write(body)
+    os.utime(cache, (1_700_000_000, 1_700_000_000))
+    env = {"PATH": traps + ":/usr/bin:/bin", "HOME": home, "PYTHONDONTWRITEBYTECODE": "1",
+           "SEAT_USAGE_CACHE_DIR": cache_dir, "SEAT_USAGE_OP_TOKEN_FILE": "/nonexistent/op-token"}
+    return env, cache, body, called, home
+
+
+def _pull_only_runs(env, cache, body, called):
+    argvs = ([], ["--quiet"], ["--route", "builder"], ["--route", "lineup", "--json", "--kind", "review"],
+             ["--route", "ask"], ["--route", "host"], ["--route"], ["--cached"])
+    outs = []
+    for argv in argvs:
+        r = subprocess.run([sys.executable, str(BIN)] + argv, env=env, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, (argv, r.returncode, r.stderr[-400:])
+        outs.append((argv, r.stdout))
+        assert not os.path.exists(called), (argv, open(called).read())
+        with open(cache) as f:
+            assert f.read() == body, argv
+        assert os.stat(cache).st_mtime == 1_700_000_000, argv
+    return outs
+
+
+@test
+def pull_only_marker_never_reads_live_or_writes_cache():
+    with tempfile.TemporaryDirectory() as d:
+        env, cache, body, called, home = _pull_only_sandbox(d)
+        open(os.path.join(home, ".config", "seat-usage", "pull-only"), "w").close()
+        outs = dict((" ".join(a), o) for a, o in _pull_only_runs(env, cache, body, called))
+        assert "[seat-usage] pull-only cached 10m ago" in outs[""], outs[""]
+        assert outs["--quiet"] == "", outs["--quiet"]
+        assert outs["--route builder"].startswith("route: builder"), outs["--route builder"]
+        json.loads(outs["--route lineup --json --kind review"])
+        env2 = dict(env, QUARTERMASTER_AUTO_UPDATE="1")
+        r = subprocess.run([sys.executable, str(BIN), "--route", "builder"], env=env2, capture_output=True, text=True, timeout=60)
+        assert "[seat-usage] pull-only cached 10m ago" in r.stderr, r.stderr
+        assert not os.path.exists(os.path.join(home, ".cache", "quartermaster", "seat-usage-update"))
+        os.remove(cache)
+        r = subprocess.run([sys.executable, str(BIN)], env=env2, capture_output=True, text=True, timeout=60)
+        assert "pull-only: no cached line" in r.stdout and "seat-usage-push --pull" in r.stdout, r.stdout
+        assert not os.path.exists(called), open(called).read()
+
+
+@test
+def pull_only_env_never_reads_live_or_writes_cache():
+    with tempfile.TemporaryDirectory() as d:
+        env, cache, body, called, _ = _pull_only_sandbox(d)
+        env["SEAT_USAGE_PULL_ONLY"] = "1"
+        outs = dict((" ".join(a), o) for a, o in _pull_only_runs(env, cache, body, called))
+        assert "pull-only cached" in outs[""], outs[""]
+
+
+@test
+def pull_only_in_process_skips_readers_and_op():
+    calls = []
+    saved = {n: getattr(su, n) for n in ("claude", "codex", "cursor", "grok", "write_cache")}
+    old_env = os.environ.get("SEAT_USAGE_PULL_ONLY")
+    old_run = subprocess.run
+    def trap(name):
+        def f(*a, **k):
+            calls.append(name)
+            return []
+        f.__name__ = name
+        return f
+    try:
+        for n in saved:
+            setattr(su, n, trap(n))
+        subprocess.run = trap("subprocess.run")
+        os.environ["SEAT_USAGE_PULL_ONLY"] = "1"
+        su.refresh(["claude", "chatgpt", "cursor", "grok"])
+        su.full_run(quiet=True)
+        assert su.grok_cookie() is None
+        assert su.refresh_muse_usage() is False
+        assert calls == [], calls
+    finally:
+        subprocess.run = old_run
+        for n, f in saved.items():
+            setattr(su, n, f)
+        if old_env is None:
+            os.environ.pop("SEAT_USAGE_PULL_ONLY", None)
+        else:
+            os.environ["SEAT_USAGE_PULL_ONLY"] = old_env
+
+
+@test
+def pull_only_off_still_runs_readers():
+    calls = []
+    saved = {n: getattr(su, n) for n in ("claude", "codex", "cursor", "grok")}
+    old_env = os.environ.pop("SEAT_USAGE_PULL_ONLY", None)
+    old_file = os.environ.get("SEAT_USAGE_PULL_ONLY_FILE")
+    with tempfile.TemporaryDirectory() as d:
+        old_cache, old_dir, old_summary = su.CACHE, su.CACHE_DIR, su.SUMMARY
+        os.environ["SEAT_USAGE_PULL_ONLY_FILE"] = os.path.join(d, "no-marker")
+        su.CACHE, su.CACHE_DIR = os.path.join(d, "latest.json"), d
+        def trap(name):
+            def f(*a, **k):
+                calls.append(name)
+                return []
+            f.__name__ = name
+            return f
+        try:
+            for n in saved:
+                setattr(su, n, trap(n))
+            assert su.pull_only() is False
+            su.refresh(["claude", "chatgpt", "cursor", "grok"])
+            assert calls == ["claude", "codex", "cursor", "grok"], calls
+            assert os.path.exists(su.CACHE)
+        finally:
+            for n, f in saved.items():
+                setattr(su, n, f)
+            su.CACHE, su.CACHE_DIR, su.SUMMARY = old_cache, old_dir, old_summary
+            if old_env is not None:
+                os.environ["SEAT_USAGE_PULL_ONLY"] = old_env
+            if old_file is None:
+                os.environ.pop("SEAT_USAGE_PULL_ONLY_FILE", None)
+            else:
+                os.environ["SEAT_USAGE_PULL_ONLY_FILE"] = old_file
+
+
+def _cached_out(d, extra_env=None):
+    with tempfile.TemporaryDirectory() as td:
+        cache = os.path.join(td, "latest.json")
+        with open(cache, "w") as f:
+            json.dump(d, f)
+        env = {"PATH": "/usr/bin:/bin", "HOME": td, "PYTHONDONTWRITEBYTECODE": "1", "SEAT_USAGE_CACHE_DIR": td,
+               "SEAT_USAGE_OP_TOKEN_FILE": "/nonexistent/op-token"}
+        env.update(extra_env or {})
+        r = subprocess.run([sys.executable, str(BIN), "--cached"], env=env, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        with open(cache) as f:
+            assert json.load(f) == d
+        return r.stdout
+
+
+def _numbers_only(now):
+    return {"v": 1, "ts": now - 60, "as_of": {k: now - 60 for k in ("claude", "chatgpt", "cursor", "grokbot", "grok")},
+            "claude_5h": 3, "claude_5h_reset_ts": now + 3600, "claude_week": 64, "claude_week_reset_ts": now + 17 * 3600,
+            "codex": 9, "codex_reset_ts": now + 6 * 86400, "codex_window_s": WEEK, "codex_5h": 15, "codex_5h_reset_ts": now + 4 * 3600,
+            "cursor_pct": 30.7, "cursor_auto_pct": 6.8, "cursor_api_pct": 30.7, "cursor_reset_ts": now + 26 * 86400, "cursor_window_s": 31 * 86400,
+            "bot_pct": 96.7, "bot_reset_ts": now + 2 * 86400, "bot_window_s": WEEK,
+            "grok_pct": 21, "grok_reset_ts": now + 2 * 86400, "grok_window_s": WEEK,
+            "grok_renews_ts": now + 46 * 86400, "grok_renews": False, "grok_exhausted": False, "bot_exhausted": False}
+
+
+@test
+def cached_numbers_only_renders_rows():
+    out = _cached_out(_numbers_only(time.time()))
+    assert "KeyError" not in out and "no cached line" not in out, out
+    rows = {l.split("|")[0].strip(): l for l in out.splitlines()[1:]}
+    assert rows["grok"].startswith("  grok     | sub ends in 46.0d | week 21% (resets in 2.0d; "), rows["grok"]
+    assert rows["grok"].endswith("| no 402 since the last weekly reset"), rows["grok"]
+    assert "weekly all 64%:" in rows["claude"] and "5h 3% (resets in 1.0h)" in rows["claude"], rows["claude"]
+    assert rows["chatgpt"].startswith("  chatgpt  | weekly 9%: ") and "| 5h 15%: " in rows["chatgpt"], rows["chatgpt"]
+    assert rows["cursor"].startswith("  cursor   | cursor models 7%, other models 31%: "), rows["cursor"]
+    assert rows["grokbot"].startswith("  grokbot  | week 96.7%: "), rows["grokbot"]
+    assert "spent" not in out and "SuperGrok" not in out and "Pro+" not in out, out
+
+
+@test
+def cached_numbers_only_pull_only_renders_rows_and_omits_absent_seats():
+    d = _numbers_only(time.time())
+    for k in [k for k in d if k.startswith(("claude", "codex", "cursor", "bot_"))]:
+        d.pop(k)
+    out = _cached_out(d, {"SEAT_USAGE_PULL_ONLY": "1"})
+    assert out.startswith("[seat-usage] pull-only cached 1m ago"), out
+    seats = [l.split("|")[0].strip() for l in out.splitlines()[1:]]
+    assert "grok" in seats and "claude" not in seats and "chatgpt" not in seats and "cursor" not in seats, out
+    assert "KeyError" not in out, out
+
+
+@test
+def cached_lines_present_unchanged():
+    d = _numbers_only(time.time())
+    d["lines"] = ["grok     | SuperGrok active | week 21% (live text)", "claude   | max active | weekly all 64%"]
+    out = _cached_out(d)
+    body = out.splitlines()[1:3]
+    assert body == ["  grok     | SuperGrok active | week 21% (live text)", "  claude   | max active | weekly all 64%"], out
+    assert "chatgpt" not in out and "cursor   |" not in out, out
+
+
+@test
+def cached_numbers_only_odd_values_and_flags():
+    now = time.time()
+    d = _numbers_only(now)
+    d.update({"codex_window_s": None, "codex_reset_ts": now + 4 * 3600, "claude_week": float("nan"), "bot_exhausted": True,
+              "grok_exhausted": True, "grok_402_h": 2.5, "cursor_pct": None, "bot_reset_ts": True})
+    rows = {l.split("|")[0].strip(): l for l in lines_with(d, now)}
+    assert "weekly" not in rows["chatgpt"].split("|")[1] and "elapsed" not in rows["chatgpt"].split("|")[1], rows["chatgpt"]
+    assert "weekly all" not in rows["claude"], rows["claude"]
+    assert rows["grokbot"].endswith("| ALLOWANCE USED") and "elapsed" not in rows["grokbot"], rows["grokbot"]
+    assert rows["grok"].endswith("| EXHAUSTED: 402 2.5h ago, until the weekly reset"), rows["grok"]
+    assert rows["cursor"].startswith("cursor   | cursor models 7%, other models 31%: "), rows["cursor"]
+    d2 = _numbers_only(now)
+    d2.pop("grok_exhausted")
+    assert "402" not in [l for l in lines_with(d2, now) if l.startswith("grok ")][0]
+    d3 = _numbers_only(now)
+    d3.update({"codex_5h_reset_ts": now + 4 * 3600, "codex_renews": False, "codex_renews_ts": now + 3600})
+    row = [l for l in lines_with(d3, now) if l.startswith("chatgpt")][0]
+    assert "5h 15%: under pace" in row and "term ends in 1.0h" in row, row
+    d4 = _numbers_only(now)
+    d4.update({"codex_renews": False, "codex_renews_ts": float("-inf"), "claude_renews": False, "claude_renews_ts": now + 3600})
+    rows4 = {l.split("|")[0].strip(): l for l in lines_with(d4, now)}
+    assert "term ends" not in rows4["chatgpt"] and "term ends" not in rows4["claude"], rows4
+
+
+def lines_with(d, now):
+    return su.lines_from_numbers(d, now)
+
+
+@test
+def cached_empty_lines_list_unchanged():
+    d = _numbers_only(time.time())
+    d["lines"] = []
+    out = _cached_out(d)
+    assert "grok     |" not in out and "chatgpt  |" not in out, out
+
+
+@test
+def pull_only_plain_run_renders_pulled_copy():
+    push = load("seat_usage_push_lines", HERE.parents[0] / "bin" / "seat-usage-push")
+    now = time.time()
+    d = _numbers_only(now)
+    d["lines"] = ["grok     | SuperGrok active | live text"]
+    copy = push.build_cache_copy(d) if hasattr(push, "build_cache_copy") else None
+    assert isinstance(copy, dict) and "lines" not in copy, copy
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "latest.json"), "w") as f:
+            json.dump(copy, f)
+        env = {"PATH": "/usr/bin:/bin", "HOME": td, "PYTHONDONTWRITEBYTECODE": "1", "SEAT_USAGE_CACHE_DIR": td,
+               "SEAT_USAGE_PULL_ONLY": "1", "SEAT_USAGE_OP_TOKEN_FILE": "/nonexistent/op-token"}
+        r = subprocess.run([sys.executable, str(BIN)], env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("[seat-usage] pull-only cached"), r.stdout
+    assert "KeyError" not in r.stdout and "| week 21% (resets in 2.0d; " in r.stdout, r.stdout
+
+@test
+def plans_line_names_each_vendor_plan():
+    now = 1_800_000_000
+    assert su.plans_line({}, now) is None, "no plan known, no line"
+    s = {"claude_plan": "claude_ai", "codex_plan": "plus", "codex_renews": False, "codex_renews_ts": now + 86400,
+         "cursor": "pro+", "cursor_renews": True, "grok": "SuperGrok", "grok_renews": False, "grok_renews_ts": now - 1,
+         "google_argon_week": 0}
+    ends = datetime.fromtimestamp(now + 86400).strftime("%Y-%m-%d")
+    assert su.plans_line(s, now) == ("plans    | claude Pro | chatgpt Plus, ends " + ends
+                                     + " | cursor Pro+ | grok SuperGrok | google AI Pro (label, not read)"), su.plans_line(s, now)
+    line = su.plans_line({"claude_plan": "claude_max_5x", "cursor": "x_super", "codex_plan": "?"}, now)
+    assert line == "plans    | claude Max 5x | cursor x_super", line
+
+
+@test
+def seat_rows_mirror_the_status_line_groups():
+    s = snap(claude_max=False, codex_5h=5, codex_5h_reset_ts=NOW + 3600, bot_exhausted=True,
+             google_argon_week=4, google_argon_week_reset_ts=NOW + 86400)
+    s["as_of"] = dict(s["as_of"], google=NOW)
+    rows = {g["id"]: g for g in su.seat_rows(s, NOW)}
+    assert list(rows) == ["cl", "cx", "cu", "gk", "mu", "gg"], list(rows)
+    assert rows["cl"]["tag"] == "pro"
+    assert [b["name"] for b in rows["cl"]["bars"]] == ["5h", "wk", "fable"], rows["cl"]
+    assert rows["cl"]["bars"][0]["stdin"] == "five_hour"
+    assert [b["name"] for b in rows["cx"]["bars"]] == ["cx 5h", "cx"]
+    assert rows["cx"]["bars"][0]["stale_name"] == "cx" and "stale_name" not in rows["cx"]["bars"][1]
+    assert rows["cu"]["bars"][-1] == {"kind": "empty", "name": "bot", "seat": "grokbot", "reset_ts": s["bot_reset_ts"]}
+    assert [(b["name"], b["pct"]) for b in rows["gg"]["bars"]] == [("argon", 4)], rows["gg"]
+    # A failed read, an ended ChatGPT term, and no Google keys at all.
+    s2 = snap(codex_renews=False, codex_renews_ts=NOW - 60)
+    s2["as_of"] = {k: v for k, v in s2["as_of"].items() if k != "grok"}
+    rows = {g["id"]: g for g in su.seat_rows(s2, NOW)}
+    assert rows["cx"]["bars"] == [{"kind": "off", "name": "cx", "seat": "chatgpt"}], rows["cx"]
+    assert rows["gk"]["bars"] == [{"kind": "failed", "name": "gk", "seat": "grok"}], rows["gk"]
+    assert "gg" not in rows
 
 
 def main():

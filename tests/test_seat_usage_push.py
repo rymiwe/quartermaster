@@ -275,6 +275,334 @@ def push_sends_the_widget_file_and_the_numbers_copy():
             sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_api, sp.refresh_if_stale = saved
 
 
+# --- refresh: one journal line per decision, wait on the status line's lock, stale by ts ---
+
+import contextlib, fcntl, io, tempfile, threading
+
+
+FAKE = """#!/usr/bin/env python3
+import fcntl, json, os, sys, time
+mark, cache, lock, rc, write, err = {args!r}
+held = open(lock, "a")
+try:
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    state = "free"
+except OSError:
+    state = "locked"
+with open(mark, "a") as f:
+    f.write(state + " " + " ".join(sys.argv[1:]) + "\\n")
+if write:
+    with open(cache, "w") as f:
+        json.dump({{"ts": time.time(), "v": 1}}, f)
+sys.stdout.write("stdout cookie=sso-STDOUTSECRET\\n")
+sys.stderr.write(err)
+sys.exit(rc)
+"""
+
+
+@contextlib.contextmanager
+def refresh_env(rc=0, write=True, err="", seat_usage=True):
+    names = ("CACHE_DIR", "CACHE", "LOCK", "SEAT_USAGE", "LOCK_WAIT_S", "RUN_TIMEOUT_S", "KILL_AFTER_S")
+    saved = {n: getattr(sp, n, None) for n in names}
+    with tempfile.TemporaryDirectory() as t:
+        try:
+            sp.CACHE_DIR = f"{t}/cache"
+            os.makedirs(sp.CACHE_DIR)
+            sp.CACHE, sp.LOCK = f"{sp.CACHE_DIR}/latest.json", f"{sp.CACHE_DIR}/.lock"
+            sp.SEAT_USAGE, mark = f"{t}/seat-usage", f"{t}/runs"
+            if seat_usage:
+                with open(sp.SEAT_USAGE, "w") as f:
+                    f.write(FAKE.format(args=(mark, sp.CACHE, sp.LOCK, rc, write, err)))
+                os.chmod(sp.SEAT_USAGE, 0o755)
+            sp.LOCK_WAIT_S = 5
+            def runs(self):
+                if not os.path.exists(mark):
+                    return []
+                with open(mark) as f:
+                    return f.read().split("\n")[:-1]
+            yield type("Env", (), {"runs": runs})()
+        finally:
+            for n, v in saved.items():
+                if v is None:
+                    if hasattr(sp, n):
+                        delattr(sp, n)
+                else:
+                    setattr(sp, n, v)
+
+
+def write_cache_at(ts, mtime=None):
+    sp.write_json(sp.CACHE, {"ts": ts, "v": 1})
+    if mtime is not None:
+        os.utime(sp.CACHE, (mtime, mtime))
+
+
+def run_refresh():
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        sp.refresh_if_stale()
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    return lines
+
+
+def field(line, name):
+    """The number in name=<n>s, e.g. field(line, "new_age") -> 0.0."""
+    return float(line.split(f" {name}=")[1].split("s")[0])
+
+
+def one_line(lines):
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("seat-usage-push: refresh"), lines
+    return lines[0]
+
+
+def hold_lock(seconds, then=None):
+    """Hold the cache lock from this process (a separate open file, so it conflicts) for a while."""
+    h = open(sp.LOCK, "a")
+    fcntl.flock(h, fcntl.LOCK_EX)
+
+    def release():
+        time.sleep(seconds)
+        if then:
+            then()
+        fcntl.flock(h, fcntl.LOCK_UN)
+        h.close()
+    th = threading.Thread(target=release)
+    th.start()
+    return th
+
+
+@test
+def refresh_fresh_cache_logs_a_skip_with_its_age():
+    with refresh_env() as env:
+        write_cache_at(time.time() - 100)
+        line = one_line(run_refresh())
+        assert env.runs() == [], env.runs()
+        assert "skip" in line and "fresh" in line and "age=100s" in line and "by=ts" in line, line
+
+
+@test
+def refresh_stale_by_ts_runs_even_when_mtime_is_fresh():
+    with refresh_env() as env:
+        write_cache_at(time.time() - 1650, mtime=time.time())   # file touched, reading old
+        lines = run_refresh()
+        assert env.runs() == ["locked --quiet"], env.runs()     # ran once, under the lock
+        line = one_line(lines)
+        assert "ran" in line and "age=1650s" in line and "by=ts" in line and field(line, "mtime_age") <= 2, line
+        assert "rc=0" in line and "lock=got" in line and field(line, "new_age") <= 2, line
+
+
+@test
+def refresh_without_ts_falls_back_to_mtime():
+    with refresh_env() as env:
+        sp.write_json(sp.CACHE, {"v": 1})
+        os.utime(sp.CACHE, (time.time() - 700, time.time() - 700))
+        lines = run_refresh()
+        assert env.runs() == ["locked --quiet"], env.runs()
+        line = one_line(lines)
+        assert "age=700s" in line and "by=mtime" in line, line
+
+
+@test
+def refresh_waits_for_a_held_lock_then_runs():
+    with refresh_env() as env:
+        write_cache_at(time.time() - 1650)
+        th = hold_lock(1.5)                       # the status line's run, which did not land a reading
+        lines = run_refresh()
+        th.join()
+        assert env.runs() == ["locked --quiet"], (env.runs(), lines)
+        line = one_line(lines)
+        assert "ran" in line and "lock=got" in line, line
+        assert 1.0 <= field(line, "wait") < 5, line
+
+
+@test
+def refresh_waits_then_skips_when_the_other_run_refreshed():
+    with refresh_env() as env:
+        write_cache_at(time.time() - 1650)
+        th = hold_lock(1.5, then=lambda: write_cache_at(time.time()))
+        line = one_line(run_refresh())
+        th.join()
+        assert env.runs() == [], env.runs()       # no double read
+        assert "skip" in line and "fresh-after-wait" in line and "lock=got" in line, line
+
+
+@test
+def refresh_gives_up_on_the_lock_after_the_wait_and_says_so():
+    with refresh_env() as env:
+        sp.LOCK_WAIT_S = 1
+        write_cache_at(time.time() - 1650)
+        th = hold_lock(3)
+        line = one_line(run_refresh())
+        th.join()
+        assert env.runs() == [], env.runs()
+        assert "skip" in line and "lock=timeout" in line, line
+
+
+@test
+def refresh_logs_exit_code_and_a_scrubbed_stderr_tail():
+    err = ("seat-usage: first line\n"
+           "RuntimeError: op failed token=ops_eyJhbGciOiJIUzI1NiJ9abcdefSECRET1 "
+           "Cookie: sso=SECRETCOOKIE123; Authorization: Bearer sk-ant-SECRETBEARER4567890abc\n")
+    with refresh_env(rc=3, write=False, err=err) as env:
+        write_cache_at(time.time() - 1650)
+        line = one_line(run_refresh())
+        assert env.runs() == ["locked --quiet"], env.runs()
+        assert "ran" in line and "rc=3" in line and "new_age=1650s" in line, line
+        assert "RuntimeError: op failed" in line and "first line" not in line, line
+        for secret in ("SECRET", "eyJ", "sso=", "sk-ant", "STDOUT"):
+            assert secret not in line, (secret, line)
+
+
+@test
+def refresh_logs_a_timed_out_run():
+    with refresh_env():
+        sp.RUN_TIMEOUT_S = 1
+        with open(sp.SEAT_USAGE, "w") as f:
+            f.write("#!/bin/sh\nsleep 5\n")
+        write_cache_at(time.time() - 1650)
+        start = time.monotonic()
+        line = one_line(run_refresh())
+        assert time.monotonic() - start < 4, line
+        assert "rc=124" in line and "timed-out" in line, line
+
+
+@test
+def refresh_kills_a_run_that_ignores_sigterm_and_frees_the_lock():
+    with refresh_env():
+        sp.RUN_TIMEOUT_S, sp.KILL_AFTER_S = 1, 1
+        with open(sp.SEAT_USAGE, "w") as f:
+            f.write("#!/bin/sh\ntrap '' TERM\nsleep 8\n")
+        write_cache_at(time.time() - 1650)
+        start = time.monotonic()
+        line = one_line(run_refresh())
+        assert time.monotonic() - start < 5, line
+        assert ("rc=137" in line or "rc=-9" in line) and "killed" in line, line
+        with open(sp.LOCK, "a") as h:      # nothing left holding it
+            fcntl.flock(h, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@test
+def refresh_treats_a_future_ts_as_unusable():
+    with refresh_env() as env:
+        write_cache_at(time.time() * 1000, mtime=time.time() - 1650)   # milliseconds by mistake
+        lines = run_refresh()
+        assert env.runs() == ["locked --quiet"], (env.runs(), lines)
+        assert "by=mtime(bad-ts)" in one_line(lines) and "age=1650s" in lines[0], lines
+
+
+@test
+def refresh_reports_a_missing_flock_as_a_lock_error():
+    saved = os.environ["PATH"]
+    with refresh_env() as env:
+        try:
+            os.environ["PATH"] = os.path.dirname(sp.SEAT_USAGE)   # no flock, no timeout
+            write_cache_at(time.time() - 1650)
+            line = one_line(run_refresh())
+        finally:
+            os.environ["PATH"] = saved
+        assert env.runs() == [] and "why=lock-error" in line and "FileNotFoundError" in line, line
+
+
+@test
+def refresh_logs_an_unexpected_error_and_does_not_raise():
+    saved = sp.cache_age
+    try:
+        sp.cache_age = lambda now=None: 1 / 0
+        line = one_line(run_refresh())
+    finally:
+        sp.cache_age = saved
+    assert "why=error" in line and "ZeroDivisionError" in line, line
+
+
+@test
+def scrub_redacts_quoted_pairs_cookie_headers_and_token_prefixes():
+    cases = [
+        '{"token": "abc123"} failed',
+        "{'access_token': 'x9f'} failed",
+        "Cookie: a=1; sess2=SHORT; other=PRIV",
+        "set-cookie: sso=SHORTV; Path=/",
+        "Authorization: token SHORTGH",
+        "key=SHORTK sid=SHORTS api_key=SHORTA",
+        "got sk-ant-api03-SHORT and ghp_SHORTGH and ops_SHORTOP and xoxb-SHORTX",
+        "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIx.SHORTSIG",
+        "https://x.example/cb?code=SHORTC&state=1",
+        "fetch https://ryan:SHORTPW@host.example/x failed",
+    ]
+    for c in cases:
+        out = sp.scrub(c)
+        for bad in ("abc123", "x9f", "SHORT", "PRIV", "eyJ"):
+            assert bad not in out, (c, out)
+    keep = "HTTPError: HTTP Error 429: Too Many Requests; skipped options for author"
+    assert sp.scrub(keep) == keep, sp.scrub(keep)
+    assert len(sp.scrub("x" * 10 + " y" * 200)) <= 160
+
+
+@test
+def refresh_drops_a_cut_stderr_line():
+    long_line = "Cookie: sso=" + "v; other=PRIVATE " * 400 + "\n"     # far over the 4 KiB tail
+    with refresh_env(rc=1, write=False, err=long_line) as env:
+        write_cache_at(time.time() - 1650)
+        line = one_line(run_refresh())
+        assert env.runs() == ["locked --quiet"], env.runs()
+        assert 'stderr="<truncated>"' in line and "PRIVATE" not in line, line
+
+
+@test
+def refresh_without_seat_usage_says_so():
+    with refresh_env(seat_usage=False):
+        write_cache_at(time.time() - 1650)
+        line = one_line(run_refresh())
+        assert "skip" in line and "not-executable" in line, line
+
+
+@test
+def refresh_hands_seat_usage_the_lock_it_waited_for():
+    """The real seat-usage adopts the inherited lock instead of waiting 30 s on itself."""
+    real = HERE.parent / "bin" / "seat-usage"
+    with refresh_env() as env:
+        out = os.path.join(os.path.dirname(sp.SEAT_USAGE), "adopt")
+        with open(sp.SEAT_USAGE, "w") as f:
+            f.write("#!/usr/bin/env python3\n"
+                    "import importlib.machinery, importlib.util, os, sys\n"
+                    "sys.dont_write_bytecode = True\n"
+                    f"os.environ['SEAT_USAGE_CACHE_DIR'] = {sp.CACHE_DIR!r}\n"
+                    f"l = importlib.machinery.SourceFileLoader('su', {str(real)!r})\n"
+                    "m = importlib.util.module_from_spec(importlib.util.spec_from_loader(l.name, l))\n"
+                    "l.exec_module(m)\n"
+                    "h = m._acquire_lock(1)\n"
+                    f"open({out!r}, 'w').write('none' if h is None else 'owned=%s' % h.owned)\n")
+        write_cache_at(time.time() - 1650)
+        lines = run_refresh()
+        got = open(out).read() if os.path.exists(out) else "not run"
+        assert got == "owned=False", (got, lines)
+        one_line(lines)
+
+
+@test
+def push_carries_the_reading_age():
+    saved = (sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_api, sp.refresh_if_stale)
+    with tempfile.TemporaryDirectory() as t:
+        try:
+            _with_paths(t)
+            sp.write_json(sp.CONFIG, {"id": "abc123"})
+            ts = time.time() - 1650
+            sp.write_json(sp.CACHE, full_cache(ts=ts))
+            sent = []
+            sp.gh_api = lambda method, path, body: sent.append(body) or {}
+            sp.refresh_if_stale = lambda: None
+            assert sp.push() == 0
+            p = json.loads(sent[0]["files"]["seats.json"]["content"])
+            assert isinstance(p.get("age_s"), (int, float)) and not isinstance(p["age_s"], bool), p.get("age_s")
+            assert abs(p["age_s"] - (p["pushed_at"] - ts)) <= 1, (p["age_s"], p["pushed_at"] - ts)
+            assert sp.push() == 0 and len(sent) == 1   # the age alone does not defeat the heartbeat
+            os.remove(sp.STATE)
+            sp.write_json(sp.CACHE, full_cache(ts=time.time() * 1000))   # milliseconds by mistake
+            assert sp.push() == 0
+            assert json.loads(sent[-1]["files"]["seats.json"]["content"])["age_s"] is None
+        finally:
+            sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_api, sp.refresh_if_stale = saved
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:

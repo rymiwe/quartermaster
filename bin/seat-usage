@@ -30,6 +30,13 @@ day, prints one updated line, and starts again on the new code.
 --route, --quiet, --cached, COUNCIL_VOTER=1, and CONCLAVE_VOTER=1 skip that check.
 QUARTERMASTER_NO_UPDATE=1 turns it off and wins over the opt-in.
 The check never stashes or resets.
+Pull-only host mode: with SEAT_USAGE_PULL_ONLY=1 in the environment, or the
+marker file ~/.config/seat-usage/pull-only present (SEAT_USAGE_PULL_ONLY_FILE
+overrides the path), this host never reads a seat live. Every path (plain run,
+--quiet, --route without --cached, refresh) serves the cache that
+seat-usage-push --pull wrote, with no reader, no op/op.exe or cookie lookup,
+no Muse or agy ask, and no cache write. Output says "pull-only" and the cache
+age. For a VM that only renders a reader host's pushed copy.
 Sources are documented in the Delegation Routing section of ~/.claude/CLAUDE.md.
 """
 import base64, fcntl, glob, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
@@ -558,7 +565,7 @@ def claude():
         is_max = claude_max_flag(plan, scoped)
         if is_max is not None:
             SUMMARY["claude_max"] = is_max
-        claude_renewal()
+        claude_renewal(status)
         SUMMARY["as_of"]["claude"] = NOW
         out.append(f"claude   | {plan} {status} | " + " | ".join(parts))
     except _RateLimited as e:
@@ -608,11 +615,16 @@ def claude_max(s):
         return None
     return _plan_is_max(s.get("claude_plan"))
 
-def claude_renewal():
+def claude_renewal(status=None):
     """Neither the OAuth profile nor usage endpoint carries a billing date (checked
     2026-10-08), so the Max term end is kept by hand in RENEWALS_FILE as
     {"claude": {"at": "2026-10-14", "renews": null}}. renews: true, false, or null
-    for not known."""
+    for not known.
+
+    A hand-kept date that has passed while the live profile says "active" is
+    dropped: the profile describes the plan in force now, and the date an earlier
+    term. Max ended 2026-10-14 for Pro, and the stale date capped every Claude
+    pool as "term ended" until it was cleared by hand."""
     try:
         r = json.load(open(RENEWALS_FILE)).get("claude") or {}
         at = r.get("at")
@@ -620,7 +632,10 @@ def claude_renewal():
             # A date with no clock is a calendar day. The timestamp is only the
             # day's start in Pacific time, so callers must not print it as a known hour.
             date_only = "T" not in at
-            SUMMARY["claude_renews_ts"] = iso_to_ts(at if not date_only else at + "T00:00:00-07:00")
+            ts = iso_to_ts(at if not date_only else at + "T00:00:00-07:00")
+            if status == "active" and ts <= NOW:
+                return
+            SUMMARY["claude_renews_ts"] = ts
             SUMMARY["claude_renews"] = r.get("renews")
             SUMMARY["claude_renews_date_only"] = date_only
             SUMMARY["claude_renews_on"] = at if date_only else None
@@ -870,6 +885,9 @@ def grok_cookie():
     Hooks and the status line's background refresh can run without the Windows
     dirs on PATH, so op.exe falls back to its WinGet install path."""
     import glob, shutil, subprocess
+    if pull_only():
+        COOKIE_TRIED.append("pull-only host")
+        return None
     cached, age = read_cookie_cache()
     if cached and age < COOKIE_TTL_S:
         return cached
@@ -1867,6 +1885,13 @@ def merge_summary(base, fresh, seats, now=None):
     out["v"] = 1
     return out
 
+def pull_only():
+    """True on a pull-only host: SEAT_USAGE_PULL_ONLY=1, or the marker file exists."""
+    if os.environ.get("SEAT_USAGE_PULL_ONLY") == "1":
+        return True
+    marker = os.environ.get("SEAT_USAGE_PULL_ONLY_FILE") or f"{H}/.config/seat-usage/pull-only"
+    return os.path.exists(marker)
+
 def _load_cache():
     try:
         with open(CACHE) as f:
@@ -2020,6 +2045,7 @@ def _store_merged(base, lines, seats, now, stamp_now):
     apply_muse(merged, now)
     apply_google(merged, now)
     apply_caps(merged, now)
+    merged["seats"] = seat_rows(merged, now)
     if stamp_now:
         merged["ts"] = now
     SUMMARY = merged
@@ -2037,6 +2063,8 @@ def refresh(seats):
     for ~/.cache/seat-usage/.lock; on timeout returns the cache unchanged.
     """
     global SUMMARY
+    if pull_only():
+        return _load_cache()
     wanted = set(seats)
     lock = _acquire_lock(LOCK_TIMEOUT)
     base = _load_cache()
@@ -3018,7 +3046,7 @@ def _opt(argv, name):
 def cmd_route():
     argv = sys.argv[1:]
     as_json = "--json" in argv
-    cached = "--cached" in argv
+    cached = "--cached" in argv or pull_only()
     # A bare --route, or --route followed by a flag, routes every launch role.
     # Do not call _opt first: a missing value used to exit 2, and the launch
     # hook treats that as silence.
@@ -3056,6 +3084,11 @@ def cmd_route():
         builder = {"role": "builder", "family": _opt(argv, "--builder-family")}
     if cached:
         summary = _load_cache()
+        if pull_only():
+            # stderr only: stdout (text and --json) stays the parsed route.
+            ts = summary.get("ts") or 0
+            age = f"{round((time.time() - ts) / 60)}m ago" if ts else "age unknown"
+            print(f"[seat-usage] pull-only cached {age}", file=sys.stderr)
     elif role == "lineup":
         summary = refresh(list(LINEUP_SEATS))
     elif role == "host":
@@ -3461,7 +3494,10 @@ def refresh_muse_usage(now=None, path=None, binary=None, timeout=40):
 
     Returns True when a new file was written. A current file, a missing muse
     binary, or a failed ask leaves the file as it was and returns False.
+    A pull-only host never asks.
     """
+    if pull_only():
+        return False
     if now is None:
         now = time.time()
     if path is None:
@@ -3829,15 +3865,239 @@ def google_line(summary, now=None):
         return f"google   | usage failed: {err.strip()}"
     return _google_usage_line(summary, now)
 
+def _num(v):
+    import math
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+def lines_from_numbers(d, now=None):
+    """Display lines rebuilt from a numbers-only cache (a pushed copy has no
+    "lines"). Same layout as the live lines; a field the numbers do not carry
+    (plan names, spend, tier, products, an unknown window) is left out, never
+    guessed. A non-finite or non-numeric value drops only that part."""
+    if now is None:
+        now = NOW
+    def n(k):
+        v = d.get(k)
+        return v if _num(v) else None
+    def w(ts):
+        if ts is None: return "?"
+        dd = ts - now
+        if dd < 0: return "reset due"
+        if dd < 86400: return f"resets in {dd/3600:.1f}h"
+        return f"resets in {dd/86400:.1f}d"
+    def pc(pct, end, secs):
+        return pace(pct, end, secs, now) if end is not None and secs else ""
+    def pool(label, pct, reset, secs, seat=None):
+        # Validated renewal fields only; Claude's live line shows no term, so it gets none here.
+        clean = {"codex_renews_ts": n("codex_renews_ts"), "codex_renews": d.get("codex_renews")}
+        end = effective_end(clean, seat, reset) if seat == "chatgpt" and reset is not None else reset
+        term = f", term ends {w(end).replace('resets ', '').replace('reset due', 'now')}" if end != reset else ""
+        p = pc(pct, end, secs)
+        return f"{label} {pct}%: " + (f"{p}, " if p else "") + f"{w(reset)}{term}"
+    def head(name, *labels):
+        lab = " ".join(str(x) for x in labels if isinstance(x, str) and x)
+        return f"{name:8} | " + (f"{lab} | " if lab else "")
+    out = []
+    parts = []
+    if n("claude_5h") is not None:
+        parts.append(f"5h {n('claude_5h')}% ({w(n('claude_5h_reset_ts'))})")
+    if n("claude_week") is not None:
+        parts.append(pool("weekly all", n("claude_week"), n("claude_week_reset_ts"), 7*86400))
+    if n("fable") is not None:
+        parts.append(pool("weekly Fable", n("fable"), n("fable_reset_ts"), 7*86400))
+    if parts:
+        out.append(head("claude", d.get("claude_plan"), d.get("claude_status")) + " | ".join(parts))
+    parts = []
+    if n("codex") is not None:
+        secs = n("codex_window_s")
+        label = ("weekly" if secs >= 7*86400 else f"{secs/3600:.0f}h") if secs else "window"
+        parts.append(pool(label, n("codex"), n("codex_reset_ts"), secs, "chatgpt"))
+    if n("codex_5h") is not None:
+        parts.append(pool("5h", n("codex_5h"), n("codex_5h_reset_ts"), 5*3600, "chatgpt"))
+    if parts:
+        plan, src = d.get("codex_plan"), d.get("codex_source")
+        out.append(head("chatgpt", f"{plan} ({src})" if isinstance(plan, str) and isinstance(src, str) else plan) + " | ".join(parts))
+    bits = []
+    if n("cursor_auto_pct") is not None: bits.append(f"cursor models {n('cursor_auto_pct'):.0f}%")
+    if n("cursor_api_pct") is not None: bits.append(f"other models {n('cursor_api_pct'):.0f}%")
+    if bits or n("cursor_pct") is not None:
+        end, secs = n("cursor_reset_ts"), n("cursor_window_s")
+        body = ", ".join(bits) or f"{n('cursor_pct'):.0f}%"
+        p = pc(n("cursor_pct"), end, secs) if n("cursor_pct") is not None else ""
+        out.append(head("cursor") + f"{body}: " + (f"{p}, " if p else "") + w(end))
+    if n("bot_pct") is not None:
+        end, secs = n("bot_reset_ts"), n("bot_window_s")
+        p = pc(n("bot_pct"), end, secs)
+        out.append(head("grokbot") + f"week {n('bot_pct'):.1f}%: " + (f"{p}, " if p else "") + w(end)
+                   + (" | ALLOWANCE USED" if d.get("bot_exhausted") is True else ""))
+    if n("grok_pct") is not None:
+        reset, secs = n("grok_reset_ts"), n("grok_window_s")
+        p = pc(n("grok_pct"), reset, secs)
+        parts = []
+        if n("grok_renews_ts") is not None and isinstance(d.get("grok_renews"), bool):
+            parts.append(f"sub {'renews' if d['grok_renews'] else 'ends'} {w(n('grok_renews_ts')).replace('resets ', '')}")
+        parts.append(f"week {n('grok_pct')}% ({w(reset)}" + (f"; {p})" if p else ")"))
+        if d.get("grok_exhausted") is True:
+            h = n("grok_402_h")
+            parts.append(f"EXHAUSTED: 402 {h}h ago, until the weekly reset" if h is not None else "EXHAUSTED, until the weekly reset")
+        elif d.get("grok_exhausted") is False:
+            parts.append("no 402 since the last weekly reset")
+        out.append(head("grok") + " | ".join(parts))
+    return out
+
+# Vendor plan IDs to the names on the vendor's pricing page. An ID missing here
+# prints raw, so a new or changed plan shows up instead of being guessed.
+PLAN_NAMES = {
+    "claude": {"claude_ai": "Pro", "claude_pro": "Pro", "claude_max_5x": "Max 5x", "claude_max_20x": "Max 20x"},
+    "chatgpt": {"free": "Free", "plus": "Plus", "prolite": "Pro $100", "pro": "Pro $200"},
+    "cursor": {"free": "Free", "pro": "Pro", "pro+": "Pro+", "ultra": "Ultra"},
+}
+PLAN_KEYS = (("claude", "claude_plan", "claude_renews"), ("chatgpt", "codex_plan", "codex_renews"),
+             ("cursor", "cursor", "cursor_renews"), ("grok", "grok", "grok_renews"))
+
+def plans_line(summary, now=None):
+    """One line naming each seat's plan as its vendor reported it, or None when no seat has one.
+
+    Google's tier is a fixed label (agy /usage does not report it) and Muse reports none.
+    A plan set to end gets its end date while that date is still ahead.
+    """
+    now = NOW if now is None else now
+    parts = []
+    for seat, key, renews_key in PLAN_KEYS:
+        raw = summary.get(key)
+        if not isinstance(raw, str) or not raw or raw == "?":
+            continue
+        name = PLAN_NAMES.get(seat, {}).get(raw.lower().replace("default_", ""), raw)
+        ends = summary.get(f"{renews_key}_ts")
+        if summary.get(renews_key) is False and _is_number(ends) and ends > now:
+            name += ", ends " + datetime.fromtimestamp(ends).strftime("%Y-%m-%d")
+        parts.append(f"{seat} {name}")
+    if not parts:
+        return None
+    if any(k.startswith("google_") for k in summary):
+        parts.append("google AI Pro (label, not read)")
+    return "plans    | " + " | ".join(parts)
+
+# Status-line groups, in drawing order. Hues are xterm-256 indexes. Google's
+# 63 is the nearest to seat-meters' indigo #5468f0.
+_ROW_GROUPS = (("cl", 208), ("cx", 141), ("cu", 43), ("gk", 75), ("mu", 212), ("gg", 63))
+
+def seat_rows(s, now=None):
+    """What a status line draws, from the cache numbers. Pure; written into latest.json.
+
+    A list of {"id", "hue", "tag"?, "ondemand_over"?, "bars"}. A bar is
+    {"kind": "seat"|"failed"|"empty"|"off", "name", "seat", ...}; a "seat" bar adds
+    pool, hue, pct, reset_ts, window_s, notify (may name its reset), and on Claude
+    term_ts/term_verb/term_day. "stdin" names the Claude Code rate_limits key that
+    overrides it live. "stale_name" sits on the first bar of each seat, for the
+    renderer's old-reading note. Staleness and wording stay with the renderer.
+    """
+    now = NOW if now is None else now
+    as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
+    num = lambda k: s.get(k) if _is_number(s.get(k)) else None
+    ok = lambda seat: _is_number(as_of.get(seat))
+    def bar(name, seat, pool, hue, pct, reset, window, notify=True, **extra):
+        return {"kind": "seat", "name": name, "seat": seat, "pool": pool, "hue": hue, "pct": pct,
+                "reset_ts": reset, "window_s": window, "notify": notify, **extra}
+    groups = {gid: {"id": gid, "hue": hue, "bars": []} for gid, hue in _ROW_GROUPS}
+
+    cl = groups["cl"]
+    if isinstance(s.get("claude_max"), bool):
+        cl["tag"] = "max" if s["claude_max"] else "pro"
+    renews = s.get("claude_renews")
+    term = {"term_ts": num("claude_renews_ts"),
+            "term_verb": {True: "renews", False: "sub ends"}.get(renews, "term ends"),
+            "term_day": s.get("claude_renews_on") if s.get("claude_renews_date_only") is True else None}
+    cl["bars"] += [bar("5h", "claude", "claude_5h", 223, num("claude_5h"), num("claude_5h_reset_ts"), 5 * 3600,
+                       stdin="five_hour", **term),
+                   bar("wk", "claude", "claude_week", 215, num("claude_week"), num("claude_week_reset_ts"), 7 * 86400,
+                       stdin="seven_day", **term)]
+    if num("fable") is not None:
+        if not ok("claude"):
+            cl["bars"].append({"kind": "failed", "name": "fable", "seat": "claude"})
+        else:
+            fr, wr = num("fable_reset_ts"), num("claude_week_reset_ts")
+            same = fr is not None and wr is not None and abs(fr - wr) < 3600
+            cl["bars"].append(bar("fable", "claude", "fable", 208, num("fable"), fr, 7 * 86400,
+                                  notify=not same, stale_name="fable", **term))
+
+    cx = groups["cx"]
+    if s.get("codex_renews") is False and num("codex_renews_ts") is not None and num("codex_renews_ts") <= now:
+        cx["bars"].append({"kind": "off", "name": "cx", "seat": "chatgpt"})
+    elif not ok("chatgpt"):
+        cx["bars"].append({"kind": "failed", "name": "cx", "seat": "chatgpt"})
+    else:
+        if num("codex_5h") is not None:
+            cx["bars"].append(bar("cx 5h", "chatgpt", "codex_5h", 183, num("codex_5h"), num("codex_5h_reset_ts"),
+                                  5 * 3600, stale_name="cx"))
+        cx["bars"].append(bar("cx", "chatgpt", "codex", 141, num("codex"), num("codex_reset_ts"),
+                              num("codex_window_s"), **({} if cx["bars"] else {"stale_name": "cx"})))
+
+    cu = groups["cu"]
+    if not ok("cursor"):
+        cu["bars"].append({"kind": "failed", "name": "cursor", "seat": "cursor"})
+    else:
+        reset, window = num("cursor_reset_ts"), num("cursor_window_s")
+        cu["bars"] += [bar("models", "cursor", "cursor_models", 122, num("cursor_auto_pct"), reset, window,
+                           notify=False, stale_name="cursor"),
+                       bar("other", "cursor", "cursor_other", 43, num("cursor_api_pct"), reset, window)]
+        od, lim = num("cursor_ondemand"), num("cursor_ondemand_limit")
+        if od is not None and lim is not None and od - lim >= 0.5:
+            cu["ondemand_over"] = round(od - lim, 2)
+    if not ok("grokbot"):
+        cu["bars"].append({"kind": "failed", "name": "bot", "seat": "grokbot"})
+    elif s.get("bot_exhausted") is True:
+        cu["bars"].append({"kind": "empty", "name": "bot", "seat": "grokbot", "reset_ts": num("bot_reset_ts")})
+    elif num("bot_pct") is not None:
+        cu["bars"].append(bar("bot", "grokbot", "grokbot", 30, num("bot_pct"), num("bot_reset_ts"),
+                              num("bot_window_s"), stale_name="bot"))
+
+    gk = groups["gk"]
+    if not ok("grok"):
+        gk["bars"].append({"kind": "failed", "name": "gk", "seat": "grok"})
+    elif s.get("grok_exhausted") is True:
+        gk["bars"].append({"kind": "empty", "name": "gk", "seat": "grok", "reset_ts": num("grok_reset_ts")})
+    else:
+        gk["bars"].append(bar("gk", "grok", "grok", 75, num("grok_pct"), num("grok_reset_ts"),
+                              num("grok_window_s"), stale_name="gk"))
+
+    mu = groups["mu"]
+    if not ok("muse"):
+        mu["bars"].append({"kind": "failed", "name": "mu", "seat": "muse"})
+    else:
+        if num("muse_5h") is not None:
+            mu["bars"].append(bar("mu 5h", "muse", "muse_5h", 218, num("muse_5h"), num("muse_5h_reset_ts"),
+                                  5 * 3600, stale_name="mu"))
+        mu["bars"].append(bar("mu", "muse", "muse_week", 212, num("muse_week"), num("muse_week_reset_ts"),
+                              7 * 86400, **({} if mu["bars"] else {"stale_name": "mu"})))
+
+    # Google: the three weekly pools. Its 5h windows are left to seat-usage's own lines.
+    gg = groups["gg"]
+    if any(k.startswith("google_") for k in s):
+        if not ok("google"):
+            gg["bars"].append({"kind": "failed", "name": "gg", "seat": "google"})
+        else:
+            for i, (pool, name, hue) in enumerate((("argon", "argon", 63), ("gemini", "gemini", 69),
+                                                   ("claudegpt", "c/g", 105))):
+                if num(f"google_{pool}_week") is not None:
+                    gg["bars"].append(bar(name, "google", f"google_{pool}_week", hue, num(f"google_{pool}_week"),
+                                          num(f"google_{pool}_week_reset_ts"), 7 * 86400,
+                                          **({} if gg["bars"] else {"stale_name": "gg"})))
+    return [g for g in groups.values() if g["bars"] or g.get("tag")]
+
 def print_cached():
     """--cached: print the last run's lines from the cache, no network. For the
     synchronous SessionStart hook; the async hook refreshes the cache."""
     try:
         d = json.load(open(CACHE))
         age_m = round((NOW - d["ts"]) / 60)
-        header = f"[seat-usage] cached {age_m}m ago; run ~/.local/bin/seat-usage for live numbers"
+        if pull_only():
+            header = f"[seat-usage] pull-only cached {age_m}m ago; numbers from seat-usage-push --pull"
+        else:
+            header = f"[seat-usage] cached {age_m}m ago; run ~/.local/bin/seat-usage for live numbers"
         seats = []
-        for l in d["lines"]:
+        lines = d["lines"] if "lines" in d else lines_from_numbers(d, NOW)
+        for l in lines:
             seat = l.split("|")[0].strip()
             l = re.sub(r" \| stale \(reading [\d.]+h old\)$", "", l)   # recomputed below at the current age
             age = seat_age_s(d, seat, NOW)
@@ -3846,10 +4106,16 @@ def print_cached():
         # Recomputed against the current time, so a reset that already passed drops its line.
         burns = ["  " + burn_line(e) for e in burn_entries(d, NOW)]
     except Exception as e:
-        print(f"[seat-usage] no cached line ({e.__class__.__name__}); run ~/.local/bin/seat-usage")
+        if pull_only():
+            print(f"[seat-usage] pull-only: no cached line ({e.__class__.__name__}); run seat-usage-push --pull")
+        else:
+            print(f"[seat-usage] no cached line ({e.__class__.__name__}); run ~/.local/bin/seat-usage")
         print("  " + muse_line())
         return
     print(header)
+    pline = plans_line(d, NOW)
+    if pline:
+        print("  " + pline)
     for line in seats:
         print(line)
     # Cached Google row only. --cached does not run agy.
@@ -3863,6 +4129,9 @@ def print_cached():
 
 def _print_full(lines, burn):
     print("[seat-usage] " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ"))
+    pline = plans_line(SUMMARY)
+    if pline:
+        print("  " + pline)
     for l in lines:
         print("  " + l)
     gline = google_line(SUMMARY)
@@ -3882,6 +4151,10 @@ def full_run(quiet=False, timeout=LOCK_TIMEOUT):
     fd is not unlocked.
     """
     global SUMMARY
+    if pull_only():
+        if not quiet:
+            print_cached()
+        return _load_cache()
     now = time.time()
     lock = _acquire_lock(timeout)
     if lock is None:
@@ -3912,6 +4185,8 @@ _GIT_ENV_DROP = (
 
 def _update_skipped():
     if os.environ.get("QUARTERMASTER_NO_UPDATE") == "1":
+        return True
+    if pull_only():
         return True
     if os.environ.get("QUARTERMASTER_AUTO_UPDATE") != "1":
         return True
@@ -4117,6 +4392,10 @@ def main():
         if os.environ.get("COUNCIL_VOTER") == "1":
             return
         return print_cached()
+    if pull_only():
+        if "--quiet" not in sys.argv:
+            print_cached()
+        return
     if os.environ.get("SEAT_USAGE_SKIP_MUSE") != "1" and os.environ.get("COUNCIL_VOTER") != "1" and os.environ.get("CONCLAVE_VOTER") != "1":
         try:
             refresh_muse_usage(time.time())

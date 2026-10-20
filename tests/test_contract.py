@@ -37,8 +37,8 @@ ASK_LINE = (
     "Other Models reading unknown: fix the failed reading, then ask Ryan | reading 0m\n"
 )
 ASK_REASON = "Other Models reading unknown: fix the failed reading, then ask Ryan"
-CLAUDE_RENEWAL_2026_10_14 = 1791961200.0
-CLAUDE_RENEWAL_2026_11_01 = 1793516400.0
+CLAUDE_RENEWAL_2099_10_14 = 4095644400.0
+CLAUDE_RENEWAL_2099_11_01 = 4097199600.0
 _PROFILE_BODY = json.dumps({
     "organization": {"rate_limit_tier": "default_max", "subscription_status": "active"},
 }).encode()
@@ -239,7 +239,7 @@ def history_rows(home):
 def default_home_receives_cache_asks_history_and_renewals():
     with tempfile.TemporaryDirectory() as home, loopback_anthropic() as (profile, usage):
         write_credentials(home)
-        write_renewals(Path(home) / ".config" / "seat-usage" / "renewals.json", "2026-10-14", None)
+        write_renewals(Path(home) / ".config" / "seat-usage" / "renewals.json", "2099-10-14", None)
         proc = run_bounded(claude_env(home, profile, usage))
         assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
         assert proc.stdout == ASK_LINE, proc.stdout
@@ -247,7 +247,7 @@ def default_home_receives_cache_asks_history_and_renewals():
         cache = json.loads((Path(home) / ".cache" / "seat-usage" / "latest.json").read_text())
         assert cache["claude_week"] == 100 and cache["fable"] == 100 and cache["claude_5h"] == 11, cache
         assert cache["claude_renews"] is None, cache.get("claude_renews")
-        assert cache["claude_renews_ts"] == CLAUDE_RENEWAL_2026_10_14, cache.get("claude_renews_ts")
+        assert cache["claude_renews_ts"] == CLAUDE_RENEWAL_2099_10_14, cache.get("claude_renews_ts")
         assert cache["lines"][0].startswith("claude   | max active"), cache["lines"]
         asks = (Path(home) / ".local" / "state" / "seat-usage" / "asks.jsonl").read_text().splitlines()
         assert len(asks) == 1, asks
@@ -264,11 +264,11 @@ def default_home_receives_cache_asks_history_and_renewals():
 def env_overrides_redirect_cache_asks_and_renewals():
     with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as scratch, loopback_anthropic() as (profile, usage):
         write_credentials(home)
-        write_renewals(Path(home) / ".config" / "seat-usage" / "renewals.json", "2026-10-14", None)
+        write_renewals(Path(home) / ".config" / "seat-usage" / "renewals.json", "2099-10-14", None)
         cache_dir = Path(scratch) / "cache"
         asks_path = Path(scratch) / "asks.jsonl"
         renewals_path = Path(scratch) / "renewals.json"
-        write_renewals(renewals_path, "2026-11-01", False)
+        write_renewals(renewals_path, "2099-11-01", False)
         proc = run_bounded(claude_env(home, profile, usage, {
             "SEAT_USAGE_CACHE_DIR": str(cache_dir),
             "SEAT_USAGE_ASKS": str(asks_path),
@@ -281,7 +281,7 @@ def env_overrides_redirect_cache_asks_and_renewals():
         assert not (Path(home) / ".local" / "state" / "seat-usage" / "asks.jsonl").exists()
         cache = json.loads((cache_dir / "latest.json").read_text())
         assert cache["claude_renews"] is False, cache.get("claude_renews")
-        assert cache["claude_renews_ts"] == CLAUDE_RENEWAL_2026_11_01, cache.get("claude_renews_ts")
+        assert cache["claude_renews_ts"] == CLAUDE_RENEWAL_2099_11_01, cache.get("claude_renews_ts")
         assert cache["claude_week"] == 100, cache.get("claude_week")
         ask = json.loads(asks_path.read_text().splitlines()[0])
         assert ask["row"]["mode"] == "ask" and ask["row"]["reason"] == ASK_REASON, ask["row"]
@@ -513,7 +513,7 @@ def example_renewals_schema_sets_the_term_and_a_placeholder_date_does_not():
         assert "claude_renews_ts" not in placeholder_cache, placeholder_cache.get("claude_renews_ts")
         assert "claude_renews" not in placeholder_cache, placeholder_cache.get("claude_renews")
         dated = json.loads(json.dumps(example))
-        dated["claude"]["at"] = "2026-10-14"
+        dated["claude"]["at"] = "2099-10-14"
         dated_path = Path(home) / "renewals.json"
         dated_path.write_text(json.dumps(dated))
         applied = run_bounded(claude_env(home, profile, usage, {
@@ -523,7 +523,7 @@ def example_renewals_schema_sets_the_term_and_a_placeholder_date_does_not():
         assert applied.stdout == ASK_LINE, applied.stdout
         applied_cache = json.loads(cache_path.read_text())
         assert applied_cache["claude_renews"] is None, applied_cache.get("claude_renews")
-        assert applied_cache["claude_renews_ts"] == CLAUDE_RENEWAL_2026_10_14, applied_cache.get("claude_renews_ts")
+        assert applied_cache["claude_renews_ts"] == CLAUDE_RENEWAL_2099_10_14, applied_cache.get("claude_renews_ts")
         assert applied_cache["claude_week"] == 100, applied_cache.get("claude_week")
 
 

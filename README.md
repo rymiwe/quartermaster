@@ -39,6 +39,10 @@ This project only documents what it expects in `~/.claude/settings.json`; the fi
 - `PreToolUse`, matcher `"Agent|Bash"`, running `~/.claude/hooks/seat-route-hook`, timeout 50
 - `SessionStart`, running `seat-usage --cached`
 
+## Status-line rows
+
+Every cache write adds `seats` to `latest.json`: the groups and bars a status line draws (`seat_rows`). Each group has an `id` (`cl`, `cx`, `cu`, `gk`, `mu`, `gg`), a `hue`, and `bars`. A bar's `kind` is `seat`, `failed`, `empty`, or `off`. A new seat or state goes here, and the status line draws it with no change of its own. `~/.claude/statusline.py` (dotfiles) reads only these rows. It still owns the session part, staleness, and wording. A pulled copy carries numbers only, so a pull-only host has no `seats` and its status line draws no seat bars.
+
 ## Install this checkout
 
 `install.sh` points `~/.local/bin/seat-usage` and `~/.claude/hooks/seat-route-hook` at this checkout. The default is a symlink, so a later `git pull` updates those commands. The script does not edit `~/.claude/settings.json`. Dotfiles still owns that file.
@@ -87,7 +91,7 @@ A missing `agy`, a session that is not signed in, a non-zero exit, a timeout, or
 
 ## Phone widget (optional)
 
-`bin/seat-usage-push` copies an allowlist of `~/.cache/seat-usage/latest.json` into a secret gist: percent, reset time, window, exhausted flag and reading time per seat, in the status line's pool order and hues. No token, cookie, plan text or `lines` leaves the machine. Anyone holding the gist id can read those numbers. It refreshes a cache older than 10 minutes under the status line's lock, then pushes when the payload changed, and at least every 30 minutes as a heartbeat.
+`bin/seat-usage-push` copies an allowlist of `~/.cache/seat-usage/latest.json` into a secret gist: percent, reset time, window, exhausted flag and reading time per seat, in the status line's pool order and hues. No token, cookie, plan text or `lines` leaves the machine. Anyone holding the gist id can read those numbers. It refreshes a cache whose reading (`ts`, or the file's mtime when there is no `ts`) is older than 10 minutes under the status line's lock, then pushes when the payload changed, and at least every 30 minutes as a heartbeat. When the status line holds the lock it waits up to 60 seconds (`flock -w`), then rechecks the age so a reading the status line just landed is not read again; `seat-usage` itself gets 90 seconds (`timeout`). Every run logs one `seat-usage-push: refresh ...` line to stderr, which lands in the journal (`journalctl --user -u seat-usage-push`): `ran` or `skip` with `why=` (`fresh`, `fresh-after-wait`, `lock-busy`, `lock-error`, `not-executable`, `lock-open-failed`, `error`), the reading's `age=` and `by=` (`ts`; `mtime` when there is no `ts`; `mtime(bad-ts)` when `ts` is more than 5 minutes in the future; `none` without a cache), the file's `mtime_age=`, the lock outcome and `wait=`, and for a run `seat-usage`'s `rc=` (124 is a timeout; 137 or -9, logged `killed`, is the SIGKILL 10 seconds after it), `dur=` and `new_age=`. Its stdout is discarded; only the last stderr line is kept, with anything token- or cookie-shaped replaced by `<redacted>`. `seats.json` also carries `age_s`, the reading's age in seconds when it was pushed (null without a `ts`).
 
 `android/` is Seats, a home-screen widget that draws one row per seat in the status line's order. The phone never reaches the desktop: it reads the gist from `api.github.com` when Android's 30-minute update fires or when you tap it, and keeps the last good copy for when there is no network. `Seats.kt` holds the rules and is unit tested (`cd android && ./gradlew testDebugUnitTest`).
 
