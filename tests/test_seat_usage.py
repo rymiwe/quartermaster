@@ -3678,6 +3678,123 @@ def pull_only_off_still_runs_readers():
                 os.environ["SEAT_USAGE_PULL_ONLY_FILE"] = old_file
 
 
+def _cached_out(d, extra_env=None):
+    with tempfile.TemporaryDirectory() as td:
+        cache = os.path.join(td, "latest.json")
+        with open(cache, "w") as f:
+            json.dump(d, f)
+        env = {"PATH": "/usr/bin:/bin", "HOME": td, "PYTHONDONTWRITEBYTECODE": "1", "SEAT_USAGE_CACHE_DIR": td,
+               "SEAT_USAGE_OP_TOKEN_FILE": "/nonexistent/op-token"}
+        env.update(extra_env or {})
+        r = subprocess.run([sys.executable, str(BIN), "--cached"], env=env, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stderr
+        with open(cache) as f:
+            assert json.load(f) == d
+        return r.stdout
+
+
+def _numbers_only(now):
+    return {"v": 1, "ts": now - 60, "as_of": {k: now - 60 for k in ("claude", "chatgpt", "cursor", "grokbot", "grok")},
+            "claude_5h": 3, "claude_5h_reset_ts": now + 3600, "claude_week": 64, "claude_week_reset_ts": now + 17 * 3600,
+            "codex": 9, "codex_reset_ts": now + 6 * 86400, "codex_window_s": WEEK, "codex_5h": 15, "codex_5h_reset_ts": now + 4 * 3600,
+            "cursor_pct": 30.7, "cursor_auto_pct": 6.8, "cursor_api_pct": 30.7, "cursor_reset_ts": now + 26 * 86400, "cursor_window_s": 31 * 86400,
+            "bot_pct": 96.7, "bot_reset_ts": now + 2 * 86400, "bot_window_s": WEEK,
+            "grok_pct": 21, "grok_reset_ts": now + 2 * 86400, "grok_window_s": WEEK,
+            "grok_renews_ts": now + 46 * 86400, "grok_renews": False, "grok_exhausted": False, "bot_exhausted": False}
+
+
+@test
+def cached_numbers_only_renders_rows():
+    out = _cached_out(_numbers_only(time.time()))
+    assert "KeyError" not in out and "no cached line" not in out, out
+    rows = {l.split("|")[0].strip(): l for l in out.splitlines()[1:]}
+    assert rows["grok"].startswith("  grok     | sub ends in 46.0d | week 21% (resets in 2.0d; "), rows["grok"]
+    assert rows["grok"].endswith("| no 402 since the last weekly reset"), rows["grok"]
+    assert "weekly all 64%:" in rows["claude"] and "5h 3% (resets in 1.0h)" in rows["claude"], rows["claude"]
+    assert rows["chatgpt"].startswith("  chatgpt  | weekly 9%: ") and "| 5h 15%: " in rows["chatgpt"], rows["chatgpt"]
+    assert rows["cursor"].startswith("  cursor   | cursor models 7%, other models 31%: "), rows["cursor"]
+    assert rows["grokbot"].startswith("  grokbot  | week 96.7%: "), rows["grokbot"]
+    assert "spent" not in out and "SuperGrok" not in out and "Pro+" not in out, out
+
+
+@test
+def cached_numbers_only_pull_only_renders_rows_and_omits_absent_seats():
+    d = _numbers_only(time.time())
+    for k in [k for k in d if k.startswith(("claude", "codex", "cursor", "bot_"))]:
+        d.pop(k)
+    out = _cached_out(d, {"SEAT_USAGE_PULL_ONLY": "1"})
+    assert out.startswith("[seat-usage] pull-only cached 1m ago"), out
+    seats = [l.split("|")[0].strip() for l in out.splitlines()[1:]]
+    assert "grok" in seats and "claude" not in seats and "chatgpt" not in seats and "cursor" not in seats, out
+    assert "KeyError" not in out, out
+
+
+@test
+def cached_lines_present_unchanged():
+    d = _numbers_only(time.time())
+    d["lines"] = ["grok     | SuperGrok active | week 21% (live text)", "claude   | max active | weekly all 64%"]
+    out = _cached_out(d)
+    body = out.splitlines()[1:3]
+    assert body == ["  grok     | SuperGrok active | week 21% (live text)", "  claude   | max active | weekly all 64%"], out
+    assert "chatgpt" not in out and "cursor   |" not in out, out
+
+
+@test
+def cached_numbers_only_odd_values_and_flags():
+    now = time.time()
+    d = _numbers_only(now)
+    d.update({"codex_window_s": None, "codex_reset_ts": now + 4 * 3600, "claude_week": float("nan"), "bot_exhausted": True,
+              "grok_exhausted": True, "grok_402_h": 2.5, "cursor_pct": None, "bot_reset_ts": True})
+    rows = {l.split("|")[0].strip(): l for l in lines_with(d, now)}
+    assert "weekly" not in rows["chatgpt"].split("|")[1] and "elapsed" not in rows["chatgpt"].split("|")[1], rows["chatgpt"]
+    assert "weekly all" not in rows["claude"], rows["claude"]
+    assert rows["grokbot"].endswith("| ALLOWANCE USED") and "elapsed" not in rows["grokbot"], rows["grokbot"]
+    assert rows["grok"].endswith("| EXHAUSTED: 402 2.5h ago, until the weekly reset"), rows["grok"]
+    assert rows["cursor"].startswith("cursor   | cursor models 7%, other models 31%: "), rows["cursor"]
+    d2 = _numbers_only(now)
+    d2.pop("grok_exhausted")
+    assert "402" not in [l for l in lines_with(d2, now) if l.startswith("grok ")][0]
+    d3 = _numbers_only(now)
+    d3.update({"codex_5h_reset_ts": now + 4 * 3600, "codex_renews": False, "codex_renews_ts": now + 3600})
+    row = [l for l in lines_with(d3, now) if l.startswith("chatgpt")][0]
+    assert "5h 15%: under pace" in row and "term ends in 1.0h" in row, row
+    d4 = _numbers_only(now)
+    d4.update({"codex_renews": False, "codex_renews_ts": float("-inf"), "claude_renews": False, "claude_renews_ts": now + 3600})
+    rows4 = {l.split("|")[0].strip(): l for l in lines_with(d4, now)}
+    assert "term ends" not in rows4["chatgpt"] and "term ends" not in rows4["claude"], rows4
+
+
+def lines_with(d, now):
+    return su.lines_from_numbers(d, now)
+
+
+@test
+def cached_empty_lines_list_unchanged():
+    d = _numbers_only(time.time())
+    d["lines"] = []
+    out = _cached_out(d)
+    assert "grok     |" not in out and "chatgpt  |" not in out, out
+
+
+@test
+def pull_only_plain_run_renders_pulled_copy():
+    push = load("seat_usage_push_lines", HERE.parents[0] / "bin" / "seat-usage-push")
+    now = time.time()
+    d = _numbers_only(now)
+    d["lines"] = ["grok     | SuperGrok active | live text"]
+    copy = push.build_cache_copy(d) if hasattr(push, "build_cache_copy") else None
+    assert isinstance(copy, dict) and "lines" not in copy, copy
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "latest.json"), "w") as f:
+            json.dump(copy, f)
+        env = {"PATH": "/usr/bin:/bin", "HOME": td, "PYTHONDONTWRITEBYTECODE": "1", "SEAT_USAGE_CACHE_DIR": td,
+               "SEAT_USAGE_PULL_ONLY": "1", "SEAT_USAGE_OP_TOKEN_FILE": "/nonexistent/op-token"}
+        r = subprocess.run([sys.executable, str(BIN)], env=env, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("[seat-usage] pull-only cached"), r.stdout
+    assert "KeyError" not in r.stdout and "| week 21% (resets in 2.0d; " in r.stdout, r.stdout
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:
