@@ -432,7 +432,12 @@ if PHONE:
             st = h.get("state")
             if st == "capped": why.append(f"{n}: {w} is used up{used}.")
             elif st == "ahead": why.append(f"{n}: {w} is{used}" + ("," if used else "") + " ahead of the time elapsed, so it may run out before it resets.")
-            elif st == "unknown": why.append(f"{n}: no reading.")
+            elif st == "unknown":
+                # an old reading is not a missing one: say how old it is
+                age = h.get("reading_age_s")
+                if isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) and age > 0:
+                    why.append(f"{n}: reading stale, {fspan(age)} old.")
+                else: why.append(f"{n}: no reading.")
         if why and s.get("mode") == "ask" and not label:
             why.append("No host is clear, so the router leaves the choice to you.")
             if lean: why.append("If you start one anyway, draw Grok from " + lean[5:] + " first.")
@@ -461,13 +466,23 @@ if PHONE:
             else: line = t
         return out + ([line] if line else [])
     def ellipsize(parts, f, width):
-        """orderly's .v is nowrap + ellipsis: trim from the end."""
+        """Trim from the end until the parts fit on one line."""
         parts = list(parts)
         while parts and tw(" \u00b7 ".join(t for t, _ in parts), f) > width:
             t, r = parts[-1]
             if len(t) <= 2: parts.pop(); continue
             parts[-1] = (t[:-2].rstrip() + "\u2026" if not t.endswith("\u2026") else t[:-3].rstrip() + "\u2026", r)
         return parts
+    def stat_lines(parts, f, width):
+        """The .v line, wrapped between parts so nothing is cut off; only a single part
+        wider than the card on its own is ellipsized."""
+        out, line = [], []
+        for part in parts:
+            if line and tw(" \u00b7 ".join(t for t, _ in line + [part]), f) > width:
+                out.append(line); line = []
+            line.append(part)
+        if line: out.append(line)
+        return [ellipsize(l, f, width) for l in out] or [[]]
     g = ImageDraw.Draw(Image.new("RGB", (1, 1)))  # measuring only
     host_l = wrap(HOST, F_HOST, CX1 - CX0 - 16 * K)
     why_l = wrap(WHY, F_WHY, CX1 - CX0 - 16 * K) if WHY else []
@@ -486,17 +501,19 @@ if PHONE:
                 if x + w_ > TX1: break
                 p["fit"].append((name, style, x, line)); x += w_ + 3 * K
             p["chip_lines"] = max([l for *_, l in p["fit"]], default=0)
+            p["stat_l"] = stat_lines(p["stats"], F_V, TX1 - TX0)
     if TEXT:
         print(json.dumps({"host": HOST, "why": WHY, "legend": LEGEND, "notes": NOTES, "errors": {k: str(v) for k, v in errs.items()},
                           "cards": [{"header": c["header"], "header_warn": c["header_warn"], "sub": c["sub"],
                                      "pools": [{"title": p["title"], "chips": p["chips"], "chips_drawn": len(p["fit"]),
                                                 "stats": " \u00b7 ".join(t for t, _ in p["stats"]),
+                                                "stats_drawn": [" \u00b7 ".join(t for t, _ in l) for l in p["stat_l"]],
                                                 "red": [t for t, r in p["stats"] if r]} for p in c["pools"]]}
                                     for c in cards]}))
 
     pool_h = lambda p: p["chip_lines"] * CHIP_LH + (PADY + LH(12) + GAP + (12 if p["five"] and p["main"] else 6) * K
-                                                    + GAP + LH(11) + PADY
-        if (p["main"] or p["five"]) else PADY + LH(12) + GAP + LH(11) + PADY)
+                                                    + GAP + LH(11) * len(p["stat_l"]) + PADY
+        if (p["main"] or p["five"]) else PADY + LH(12) + GAP + LH(11) * len(p["stat_l"]) + PADY)
     for c in cards:
         c["sub_l"] = wrap(c["sub"], F_HDR, TX1 - TX0) if c["sub"] else []
     hdr_h = lambda c: (3 * K + LH(10.5) * (1 + len(c["sub_l"])) + 2 * K) if c["header"] else 0
@@ -583,12 +600,12 @@ if PHONE:
                 bh = (12 if (m and f) else 6) * K
                 ntick(X0 + MW * nowfrac, yy, yy + bh)
                 yy += bh + GAP
-            parts = ellipsize(p["stats"], F_V, TX1 - TX0)
-            x = TX0
-            for j, (t, red) in enumerate(parts):
-                s_ = (" \u00b7 " if j else "") + t
-                if j: g.text((P(x), P(yy + LH(11) / 2)), " \u00b7 ", font=F_V, fill=O_MUTED, anchor="lm"); x += tw(" \u00b7 ", F_V)
-                g.text((P(x), P(yy + LH(11) / 2)), t, font=F_V, fill=O_CRIT if red else O_MUTED, anchor="lm"); x += tw(t, F_V)
+            for parts in p["stat_l"]:
+                x = TX0
+                for j, (t, red) in enumerate(parts):
+                    if j: g.text((P(x), P(yy + LH(11) / 2)), " \u00b7 ", font=F_V, fill=O_MUTED, anchor="lm"); x += tw(" \u00b7 ", F_V)
+                    g.text((P(x), P(yy + LH(11) / 2)), t, font=F_V, fill=O_CRIT if red else O_MUTED, anchor="lm"); x += tw(t, F_V)
+                yy += LH(11)
             y += pool_h(p)
     y += 8 * K
     star_font = vfont(MONO_FB, 10.5 * K) if MONO_FB else F_HDR

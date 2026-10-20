@@ -303,6 +303,39 @@ def test_phone_stale_reading_says_so():
         doc = phone_text(t, cache)
     assert _pool(doc, "Claude \u00b7 weekly")["stats"].endswith(" \u00b7 stale 40m")
 
+def test_phone_long_stats_line_wraps_instead_of_being_cut():
+    """A Claude line with caps, 5h, reset and stale is wider than the card: every part is drawn, on two lines."""
+    now = time.time()
+    base = {"ts": now, "as_of": {"claude": now}, "claude_week": 68, "claude_week_reset_ts": now + 4 * 86400,
+            "claude_5h": 38, "claude_5h_reset_ts": now + 3600}
+    long_ = {**base, "as_of": {"claude": now - 3 * 3600 - 13 * 60 - 5}, "claude_week_caps_early_s": 2 * 86400}
+    with tempfile.TemporaryDirectory() as t:
+        # not latest.json: no route, so the host lines are the same in both and only the stats differ
+        short = phone_text(t, base, name="c.json"); h_short = Image.open(os.path.join(t, "p.png")).size[1]
+        doc = phone_text(t, long_, name="c.json"); h_long = Image.open(os.path.join(t, "p.png")).size[1]
+    p = _pool(short, "Claude \u00b7 weekly")
+    assert p["stats_drawn"] == [p["stats"]], p  # a line that fits stays one line
+    p = _pool(doc, "Claude \u00b7 weekly")
+    assert p["stats"] == f"68% \u00b7 caps 2d early \u00b7 5h 38% \u00b7 resets {_wd(now + 4 * 86400)} \u00b7 stale 3h 13m", p
+    assert len(p["stats_drawn"]) == 2, p
+    assert " \u00b7 ".join(p["stats_drawn"]) == p["stats"], p  # nothing cut, no ellipsis
+    assert not any("\u2026" in l for l in p["stats_drawn"]), p
+    assert h_long > h_short, (h_short, h_long)  # the card grows for the second line
+
+def test_phone_header_says_an_old_reading_is_stale_with_its_age():
+    now = time.time()
+    old = now - 3 * 3600 - 13 * 60 - 5
+    cache = {"ts": old, "as_of": {"claude": old, "grokbot": old}, "bot_pct": 10, "bot_reset_ts": now + 5 * 86400,
+             "bot_window_s": 7 * 86400, "claude_week": 42, "claude_week_reset_ts": now + 4 * 86400,
+             "claude_5h": 10, "claude_5h_reset_ts": now + 3600}
+    with tempfile.TemporaryDirectory() as t:
+        doc = phone_text(t, cache)
+        fresh = phone_text(t, {**cache, "ts": now, "as_of": {"claude": now, "grokbot": now}})
+    assert "Grok Bot: reading stale, 3h 13m old." in doc["why"], doc["why"]
+    assert "Opus: reading stale, 3h 13m old." in doc["why"], doc["why"]
+    assert "no reading" not in doc["why"], doc["why"]
+    assert "stale" not in fresh["why"] and "no reading" not in fresh["why"], fresh["why"]
+
 def test_phone_card_headers_use_cached_renewals_only():
     claude_t, codex_t, cursor_t, grok_t = NOW + 25 * 86400, NOW + 3 * 86400, NOW + 27 * 86400, NOW + 45 * 86400
     cache = {"ts": NOW, "as_of": FRESH,
