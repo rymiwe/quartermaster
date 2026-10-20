@@ -2019,6 +2019,7 @@ def _store_merged(base, lines, seats, now, stamp_now):
     merged = merge_summary(base, fresh, seats, now=now)
     apply_muse(merged, now)
     apply_google(merged, now)
+    apply_caps(merged, now)
     if stamp_now:
         merged["ts"] = now
     SUMMARY = merged
@@ -3109,6 +3110,55 @@ def log_asks(rows, s, now):
                 f.write(json.dumps({"ts": now, "host": socket.gethostname(), "row": r, "pools": pools}) + "\n")
     except Exception:
         pass
+
+# Cap projection. Burn rate is linear from the window's start: used % divided
+# by the time elapsed since the window opened (window length minus time left).
+# At that rate the pool reaches 100% after (100 - used) / rate more seconds;
+# when that is before the reset, <pool>_caps_early_s is how many seconds
+# early. No key means no projection: no reading, 0% used, already at 100%,
+# the reset passed or is further off than one window, the window is unknown,
+# or less than CAPS_MIN_ELAPSED of the window has passed (one large job at
+# the start of a window projects a cap that is not real).
+CAPS_MIN_ELAPSED = 0.10
+_GOOGLE_CAPS = tuple((f"google_{p}_{w}", f"google_{p}_{w}_reset_ts", secs)
+                     for p, ws in (("argon", ("week",)), ("gemini", ("week", "5h")), ("claudegpt", ("week", "5h")))
+                     for w, secs in ((w, 7 * 86400 if w == "week" else 5 * 3600) for w in ws))
+
+def caps_early_s(used, reset, window, now):
+    """Seconds before the reset that a linear burn from the window's start hits 100%, or None."""
+    if not (_is_number(used) and _is_number(reset) and _is_number(window)) or window <= 0:
+        return None
+    left = reset - now
+    if left <= 0 or left > window:
+        return None
+    elapsed = window - left
+    if elapsed < CAPS_MIN_ELAPSED * window or used <= 0 or used >= 100:
+        return None
+    cap_in = (100 - used) * elapsed / used
+    early = round(left - cap_in)
+    return early if early > 0 else None
+
+def caps_sources():
+    """(key prefix, used key, reset key, window seconds or window key, as_of seat) per projected pool."""
+    out = [(pid, meta["used"], meta["reset"], meta["window"], meta["seat"]) for pid, meta in POOLS.items()]
+    return out + [(used, used, reset, secs, "google") for used, reset, secs in _GOOGLE_CAPS]
+
+def apply_caps(summary, now):
+    """Project each pool at its own reading's time (as_of), so a carried-over
+    reading keeps the projection it had rather than one diluted by time that
+    saw no new reading. A reset already past drops the key."""
+    for k in [k for k in summary if k.endswith("_caps_early_s")]:
+        del summary[k]
+    as_of = summary.get("as_of") if isinstance(summary.get("as_of"), dict) else {}
+    for name, used, reset, window, seat in caps_sources():
+        win = summary.get(window) if isinstance(window, str) else window
+        at = as_of.get(seat) if _is_number(as_of.get(seat)) else now
+        rts = summary.get(reset)
+        if not _is_number(rts) or rts <= now:
+            continue
+        early = caps_early_s(summary.get(used), rts, win, min(at, now))
+        if early is not None:
+            summary[f"{name}_caps_early_s"] = early
 
 def write_cache():
     try:

@@ -127,9 +127,8 @@ def _epoch(text):
 
 def test_google_group_is_its_own_color_in_both_layouts():
     """Numbers match tests/fixtures/agy-usage.tsv: remaining 100/100/99 -> used 0/0/1."""
-    week = _epoch("2026-10-27T01:39:26Z")
-    five = _epoch("2026-10-20T06:39:26Z")
-    argon = _epoch("2026-10-27T01:38:40Z")
+    # The fixture's resets, moved to now: absolute stamps expired at 2026-10-20T06:39:26Z and dropped the 5h rows.
+    week, five, argon = NOW + 7 * 86400 - 60, NOW + 5 * 3600 - 60, NOW + 7 * 86400 - 106
     google = {
         "google_argon_week": 1, "google_argon_week_reset_ts": argon,
         "google_gemini_week": 0, "google_gemini_week_reset_ts": week,
