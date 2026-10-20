@@ -15,7 +15,7 @@ Snapshot of Ryan's "router core": `seat-usage` (reads per-seat/pool usage for Cl
 | `tests/test_seat_usage.py` | test suite (only the two path constants changed, see Tests) |
 | `renewals.example.json` | placeholder for `~/.config/seat-usage/renewals.json` (same schema, placeholder values) |
 | `install.sh` | links or copies the two commands into the frozen paths |
-| `bin/seat-meters` | optional: draws the cached reading as an orderly-style PNG (needs Pillow; no network). `seat-meters [--phone] [out.png]` (`--phone`: tall layout grouped by subscription), cache path from `SEAT_USAGE_CACHE`. Google AI Pro is its own group in both layouts |
+| `bin/seat-meters` | optional: draws the cached reading as an orderly-style PNG (needs Pillow; no network). `seat-meters [--phone] [--text] [out.png]` (`--phone`: orderly's meters panel: a `Next host` line from `seat-usage --route host --cached --json`, one card per subscription with its cached renewal, orderly's model-family chips, and a `55% · 5h 1% · resets Wed` stats line per pool; `--text` prints that layout's words as JSON instead of the path), cache path from `SEAT_USAGE_CACHE`. Google AI Pro is its own group in both layouts |
 | `bin/seat-usage-push` | optional: copies an allowlist of the cache to a secret gist for the phone widget, plus a numbers-only cache copy that `--pull` lands on a reader |
 | `systemd/` | the `seat-usage-push` timer (every 5 minutes) |
 | `android/` | Seats, the Android home-screen widget that reads that gist |

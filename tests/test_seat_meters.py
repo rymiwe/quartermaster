@@ -45,6 +45,23 @@ def render(t, cache, muse=None, *flags):
     r = subprocess.run([sys.executable, BIN, *flags, out], env=env, capture_output=True, text=True)
     return r, out
 
+O_INK, O_PANEL2 = (0xe4, 0xe8, 0xee), (0x20, 0x26, 0x2e)  # orderly's dark palette, used by --phone
+PHONE_CX0 = 6 + 14 * 1.3  # phone: frame inset plus the rail's 14px padding, at K = 1.3
+
+def phone_text(t, cache, muse=None, name="latest.json"):
+    """The phone layout's words, from --text: host line, card headers, pool titles, chips, stats."""
+    cp, mp, out = os.path.join(t, name), os.path.join(t, "muse-usage.json"), os.path.join(t, "p.png")
+    json.dump(cache, open(cp, "w"))
+    if muse is not None:
+        json.dump(muse, open(mp, "w"))
+    elif os.path.exists(mp):
+        os.remove(mp)
+    env = {**os.environ, "SEAT_USAGE_CACHE": cp, "SEAT_USAGE_MUSE_FILE": mp}
+    r = subprocess.run([sys.executable, BIN, "--phone", "--text", out], env=env, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert open(out, "rb").read(8) == b"\x89PNG\r\n\x1a\n"
+    return json.loads(r.stdout)
+
 def muse_band(out):
     """Pixels of the Muse row, the only row when the cache is empty (y 44.. in 1x units)."""
     im = Image.open(out).convert("RGB"); w, h = im.size
@@ -103,13 +120,22 @@ def test_nearly_finished_5h_window_stays_on_the_page():
     cache = {"ts": NOW, "claude_week": 42, "claude_week_reset_ts": NOW + 4 * 86400,
              "claude_5h": 90, "claude_5h_reset_ts": NOW + 60,
              "cursor_api_pct": 20, "cursor_reset_ts": NOW + 29 * 86400, "cursor_window_s": 31 * 86400}
-    for flags, edge in (((), 14 * 2), (("--phone",), 10 * 3)):
-        with tempfile.TemporaryDirectory() as t:
-            r, out = render(t, cache, muse_doc(), *flags)
-            assert r.returncode == 0, r.stderr
-            im = Image.open(out).convert("RGB")
-            spill = [(x, y) for x in range(edge) for y in range(im.size[1]) if im.getpixel((x, y)) != BG]
-            assert not spill, (flags, spill[:3])
+    with tempfile.TemporaryDirectory() as t:
+        r, out = render(t, cache, muse_doc())
+        assert r.returncode == 0, r.stderr
+        im = Image.open(out).convert("RGB")
+        spill = [(x, y) for x in range(14 * 2) for y in range(im.size[1]) if im.getpixel((x, y)) != BG]
+        assert not spill, spill[:3]
+    # phone: left of the cards is only the page, the frame and its border (orderly's palette)
+    with tempfile.TemporaryDirectory() as t:
+        r, out = render(t, cache, muse_doc(), "--phone")
+        assert r.returncode == 0, r.stderr
+        im = Image.open(out).convert("RGB")
+        page = [(0x14, 0x17, 0x1c), (0x20, 0x26, 0x2e), (0x2b, 0x32, 0x3c)]
+        edge = int(PHONE_CX0 * 3) - 1
+        spill = [(x, y) for x in range(edge) for y in range(im.size[1])
+                 if not any(near(im.getpixel((x, y)), c, 12) for c in page)]
+        assert not spill, spill[:3]
 
 def test_expired_5h_window_draws_no_bar():
     cache = {"ts": NOW - 9 * 3600, "claude_week": 42, "claude_week_reset_ts": NOW + 4 * 86400,
@@ -166,36 +192,34 @@ def test_google_group_is_its_own_color_in_both_layouts():
         assert Image.open(short_out).size[1] < wide_h
 
 
-def test_phone_5h_track_stops_before_its_label():
-    """A weekly window near its reset used to push the 5h track under its "5h N%" text."""
+def test_phone_5h_track_has_no_text_beside_it():
+    """The 5h figure moved to the stats line under the bars, so no text shares the 5h track's rows."""
     cache = {"ts": NOW, "google_gemini_week": 5, "google_gemini_week_reset_ts": NOW + 86400,
              "google_gemini_5h": 20, "google_gemini_5h_reset_ts": NOW + 3 * 3600}
     with tempfile.TemporaryDirectory() as t:
         r, out = render(t, cache, None, "--phone")
         assert r.returncode == 0, r.stderr
         im = Image.open(out).convert("RGB"); w, h = im.size
-        # the track is ink at 14% over the Google card's 9% tint
-        track = over(INK, over((0x54, 0x68, 0xf0), BG, 0.09), 0.14)
+        # the track is orderly's ink at 14% over the Google card's 9% tint over the rail
+        track = over(O_INK, over((0x54, 0x68, 0xf0), O_PANEL2, 0.09), 0.14)
         is_bar = lambda p: near(p, track) or p in (BLUE, RED)
-        # track rows form two bands, weekly then 5h; the 5h band is the lower one
         rows = [y for y in range(h) if has_run([im.getpixel((x, y)) for x in range(w)], is_bar)]
         bands = [[rows[0]]] if rows else []
         for y in rows[1:]:
             (bands[-1].append(y) if y - bands[-1][-1] <= 1 else bands.append([y]))
         assert len(bands) == 2, bands
         five = bands[1]
-        S, PAD, W = 3, 18, 390  # phone layout: 3x scale, 18px pad, 390px wide
-        lo, hi = (PAD - 8 + 4) * S, (W - PAD + 8 - 6) * S  # inside the card: skip its left stripe and right edge
+        lo, hi = int(PHONE_CX0 * 3) + 12, w - int(PHONE_CX0 * 3)
         bar = {x for y in five for x in runs([im.getpixel((x, y)) for x in range(w)], is_bar) if lo <= x < hi}
         assert bar, "no 5h track drawn"
-        def dim_text(p):  # DIM (#8a96a8) label text, antialiased against the card: grey and clearly lit
-            return not is_bar(p) and p != INK and max(p) - min(p) < 48 and sum(p) / 3 > 90
-        # the now tick is antialiased too: its grey edge pixels are not label text
-        tick = {x for x in range(lo, hi) if all(near(im.getpixel((x, y)), INK, 8) for y in five)}
+        def dim_text(p):  # muted label text, antialiased against the card: grey and clearly lit
+            return not is_bar(p) and not near(p, O_INK, 8) and max(p) - min(p) < 48 and sum(p) / 3 > 90
+        tick = {x for x in range(lo, hi) if all(near(im.getpixel((x, y)), O_INK, 8) for y in five)}
         ink = {x for y in five for x in range(lo, hi)
-               if dim_text(im.getpixel((x, y))) and not any(abs(x - t) <= 3 for t in tick)}
-        assert ink, "no 5h label drawn"
-        assert max(bar) < min(ink) or max(ink) < min(bar), (min(bar), max(bar), min(ink), max(ink))
+               if dim_text(im.getpixel((x, y))) and not any(abs(x - t) <= 4 for t in tick)}
+        assert not ink, sorted(ink)[:5]
+        pools = phone_text(t, cache)["cards"][0]["pools"]
+        assert pools[0]["stats"].startswith("5% \u00b7 5h 20%"), pools[0]["stats"]
 
 def test_phone_over_pace_segment_is_red_on_both_tracks():
     """Use past the pace tick draws red on the weekly track and, at full strength, on the 5h one."""
@@ -236,6 +260,114 @@ def test_phone_over_pace_5h_blue_stays_dim():
         assert not any(BLUE in row for row in five), "5h blue drawn at full strength"
         dim_blue = lambda p: p[2] - p[0] > 40 and p[2] < BLUE[2] - 30  # blue over the tinted panel's track
         assert any(has_run(row, dim_blue, 6) for row in five), "no dim blue head on the 5h track"
+
+def _md(ts):
+    dt = datetime.fromtimestamp(ts); return f"{dt.month}/{dt.day}"
+def _wd(ts):
+    return datetime.fromtimestamp(ts).strftime("%a")
+def _pool(doc, title):
+    return next(p for c in doc["cards"] for p in c["pools"] if p["title"] == title)
+def _card(doc, title):
+    return next(c for c in doc["cards"] if any(p["title"] == title for p in c["pools"]))
+FRESH = {"claude": NOW, "chatgpt": NOW, "cursor": NOW, "grokbot": NOW, "grok": NOW, "google": NOW}
+
+def test_phone_stats_line_reads_like_orderly():
+    cache = {"ts": NOW, "as_of": FRESH, "claude_week": 55.4, "claude_week_reset_ts": NOW + 4 * 86400,
+             "claude_5h": 1, "claude_5h_reset_ts": NOW + 2.5 * 3600, "grok_pct": 19, "grok_reset_ts": NOW + 3 * 86400,
+             "grok_window_s": 7 * 86400, "cursor_api_pct": 20.5, "cursor_reset_ts": NOW + 20 * 86400,
+             "cursor_window_s": 31 * 86400}
+    with tempfile.TemporaryDirectory() as t:
+        doc = phone_text(t, cache)
+    assert _pool(doc, "Claude \u00b7 weekly")["stats"] == f"55% \u00b7 5h 1% \u00b7 resets {_wd(NOW + 4 * 86400)}"
+    assert _pool(doc, "SuperGrok \u00b7 weekly")["stats"] == f"19% \u00b7 resets {_wd(NOW + 3 * 86400)}"
+    assert _pool(doc, "Cursor \u00b7 Other Models")["stats"] == "21%"  # half up, like orderly; reset is the header's
+    assert _pool(doc, "Muse \u00b7 weekly")["stats"] == "no reading"
+
+def test_phone_hot_5h_is_red_and_there_is_no_caps_projection():
+    """quartermaster computes no time-to-cap, so no 'caps ... early' even far over pace."""
+    cache = {"ts": NOW, "as_of": FRESH, "claude_week": 90, "claude_week_reset_ts": NOW + 6 * 86400,
+             "claude_5h": 90, "claude_5h_reset_ts": NOW + 4 * 3600}
+    with tempfile.TemporaryDirectory() as t:
+        doc = phone_text(t, cache)
+    p = _pool(doc, "Claude \u00b7 weekly")
+    assert p["red"] == ["5h 90%"], p
+    assert not any("caps" in q["stats"] or "early" in q["stats"] for c in doc["cards"] for q in c["pools"])
+
+def test_phone_stale_reading_says_so():
+    cache = {"ts": NOW, "as_of": {"claude": NOW - 40 * 60}, "claude_week": 10, "claude_week_reset_ts": NOW + 4 * 86400}
+    with tempfile.TemporaryDirectory() as t:
+        doc = phone_text(t, cache)
+    assert _pool(doc, "Claude \u00b7 weekly")["stats"].endswith(" \u00b7 stale 40m")
+
+def test_phone_card_headers_use_cached_renewals_only():
+    claude_t, codex_t, cursor_t, grok_t = NOW + 25 * 86400, NOW + 3 * 86400, NOW + 27 * 86400, NOW + 45 * 86400
+    cache = {"ts": NOW, "as_of": FRESH,
+             "claude_week": 10, "claude_week_reset_ts": NOW + 4 * 86400, "claude_renews_ts": claude_t, "claude_renews": True,
+             "codex": 2, "codex_reset_ts": NOW + 5 * 86400, "codex_window_s": 7 * 86400,
+             "codex_renews_ts": codex_t, "codex_renews": False,
+             "cursor_auto_pct": 2, "cursor_api_pct": 20, "cursor_reset_ts": cursor_t, "cursor_window_s": 31 * 86400,
+             "cursor_renews": True, "bot_pct": 30, "bot_reset_ts": NOW + 2 * 86400, "bot_window_s": 7 * 86400,
+             "grok_pct": 19, "grok_reset_ts": NOW + 3 * 86400, "grok_window_s": 7 * 86400, "grok_renews_ts": grok_t,
+             "google_argon_week": 0, "google_argon_week_reset_ts": NOW + 6 * 86400}
+    with tempfile.TemporaryDirectory() as t:
+        doc = phone_text(t, cache)
+    assert _card(doc, "Claude \u00b7 weekly")["header"] == f"Claude \u00b7 renews {_md(claude_t)}"
+    codex = _card(doc, "Codex \u00b7 weekly")
+    assert codex["header"] == f"Codex \u00b7 sub ends {_wd(codex_t)}" and codex["header_warn"]  # last week of a plan that ends
+    cur = _card(doc, "Cursor \u00b7 Cursor Models")
+    assert cur["header"] == f"Cursor \u00b7 renews {_md(cursor_t)}"
+    assert cur["sub"] == "Cursor Models and Other Models reset then"
+    assert _pool(doc, "Cursor \u00b7 Cursor Models")["stats"] == "2%"           # its reset is on the header
+    assert "resets" in _pool(doc, "Grok Bot \u00b7 weekly")["stats"]          # Grok Bot's is its own
+    assert _card(doc, "SuperGrok \u00b7 weekly")["header"] == f"SuperGrok \u00b7 term ends {_md(grok_t)}"  # renews unknown
+    assert _card(doc, "Google AI Pro \u00b7 Argon")["header"] is None          # no renewal in the cache
+    assert _card(doc, "Muse \u00b7 weekly")["header"] is None
+
+def test_phone_chips_follow_orderly_and_the_claude_plan():
+    base = {"ts": NOW, "as_of": FRESH, "claude_week": 10, "claude_week_reset_ts": NOW + 4 * 86400,
+            "cursor_api_pct": 20, "cursor_reset_ts": NOW + 20 * 86400, "cursor_window_s": 31 * 86400,
+            "grok_pct": 19, "grok_reset_ts": NOW + 3 * 86400, "grok_window_s": 7 * 86400,
+            "google_argon_week": 0, "google_argon_week_reset_ts": NOW + 6 * 86400}
+    with tempfile.TemporaryDirectory() as t:
+        unknown = phone_text(t, base, muse_doc())
+        pro = phone_text(t, {**base, "claude_plan": "pro"})
+        mx = phone_text(t, {**base, "claude_plan": "max_5x", "fable": 12, "fable_reset_ts": NOW + 4 * 86400})
+    assert _pool(unknown, "Claude \u00b7 weekly")["chips"] == [["Opus", "solid"]]
+    assert any("Claude plan" in n for n in unknown["notes"])
+    assert _pool(pro, "Claude \u00b7 weekly")["chips"] == [["Opus", "solid"]] and pro["notes"] == []
+    assert not any(p["title"] == "Claude \u00b7 Fable slice" for c in pro["cards"] for p in c["pools"])
+    assert _pool(mx, "Claude \u00b7 weekly")["chips"] == [["Fable", "solid"], ["Opus", "solid"]]
+    assert _pool(mx, "Claude \u00b7 Fable slice")["chips"] == [["Fable", "solid"]]
+    assert _pool(unknown, "Cursor \u00b7 Other Models")["chips"] == [["Fable", "dashed"], ["Opus", "dashed"], ["Sol", "dashed"]]
+    assert _pool(unknown, "SuperGrok \u00b7 weekly")["chips"] == [["Grok", "dotted"]]
+    assert _pool(unknown, "Muse \u00b7 weekly")["chips"] == [["Wonder full", "solid"], ["Wonder", "solid"]]
+    assert _pool(unknown, "Google AI Pro \u00b7 Argon")["chips"] == []          # no family map for Google
+    assert unknown["legend"] == "dashed = metered \u00b7 dotted = builder only \u00b7 \u2605 first usable pool for the family"
+
+def test_phone_header_is_seat_usages_host_pick():
+    cache = {"ts": NOW, "as_of": {"claude": NOW, "grokbot": NOW}, "bot_pct": 10, "bot_reset_ts": NOW + 5 * 86400,
+             "bot_window_s": 7 * 86400, "claude_week": 42, "claude_week_reset_ts": NOW + 4 * 86400,
+             "claude_5h": 10, "claude_5h_reset_ts": NOW + 3600}
+    with tempfile.TemporaryDirectory() as t:
+        doc = phone_text(t, cache)
+        route = json.loads(subprocess.run([sys.executable, os.path.join(ROOT, "bin", "seat-usage"), "--route", "host",
+                                           "--cached", "--json"], env={**os.environ, "SEAT_USAGE_CACHE_DIR": t},
+                                          capture_output=True, text=True).stdout)[0]
+        ahead = phone_text(t, {**cache, "bot_pct": 90})
+        none = phone_text(t, cache, name="elsewhere.json")  # seat-usage cannot read that file: no route
+    assert route["suggestion"] == "grokbot"
+    assert doc["host"] == "Next host: Grok Bot" + (f" ({route['reason']})" if route["reason"] else "")
+    assert ahead["host"].startswith("Next host: Opus high")  # no "on Max": the cache has no plan
+    assert "Grok Bot: its weekly allowance is at 90%, ahead of the time elapsed" in ahead["why"]
+    assert none["host"] == "Next host: no cached route" and none["why"] == ""
+
+def test_text_flag_prints_json_not_the_path():
+    with tempfile.TemporaryDirectory() as t:
+        r, out = render(t, {"ts": NOW}, None, "--phone")
+        assert r.stdout.strip() == out
+        doc = phone_text(t, {"ts": NOW})
+        assert doc["host"].startswith("Next host:")
+
 
 if __name__ == "__main__":
     if Image is None:
