@@ -15,6 +15,7 @@ Snapshot of Ryan's "router core": `seat-usage` (reads per-seat/pool usage for Cl
 | `tests/test_seat_usage.py` | test suite (only the two path constants changed, see Tests) |
 | `renewals.example.json` | placeholder for `~/.config/seat-usage/renewals.json` (same schema, placeholder values) |
 | `install.sh` | links or copies the two commands into the frozen paths |
+| `bin/seat-meters` | optional: draws the cached reading as an orderly-style PNG (needs Pillow; no network). `seat-meters [--phone] [out.png]` (`--phone`: tall layout grouped by subscription), cache path from `SEAT_USAGE_CACHE` |
 | `bin/seat-usage-push` | optional: copies an allowlist of the cache to a secret gist for the phone widget |
 | `systemd/` | the `seat-usage-push` timer (every 5 minutes) |
 | `android/` | Seats, the Android home-screen widget that reads that gist |
