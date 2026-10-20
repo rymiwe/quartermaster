@@ -3856,6 +3856,86 @@ def google_line(summary, now=None):
         return f"google   | usage failed: {err.strip()}"
     return _google_usage_line(summary, now)
 
+def _num(v):
+    import math
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+def lines_from_numbers(d, now=None):
+    """Display lines rebuilt from a numbers-only cache (a pushed copy has no
+    "lines"). Same layout as the live lines; a field the numbers do not carry
+    (plan names, spend, tier, products, an unknown window) is left out, never
+    guessed. A non-finite or non-numeric value drops only that part."""
+    if now is None:
+        now = NOW
+    def n(k):
+        v = d.get(k)
+        return v if _num(v) else None
+    def w(ts):
+        if ts is None: return "?"
+        dd = ts - now
+        if dd < 0: return "reset due"
+        if dd < 86400: return f"resets in {dd/3600:.1f}h"
+        return f"resets in {dd/86400:.1f}d"
+    def pc(pct, end, secs):
+        return pace(pct, end, secs, now) if end is not None and secs else ""
+    def pool(label, pct, reset, secs, seat=None):
+        # Validated renewal fields only; Claude's live line shows no term, so it gets none here.
+        clean = {"codex_renews_ts": n("codex_renews_ts"), "codex_renews": d.get("codex_renews")}
+        end = effective_end(clean, seat, reset) if seat == "chatgpt" and reset is not None else reset
+        term = f", term ends {w(end).replace('resets ', '').replace('reset due', 'now')}" if end != reset else ""
+        p = pc(pct, end, secs)
+        return f"{label} {pct}%: " + (f"{p}, " if p else "") + f"{w(reset)}{term}"
+    def head(name, *labels):
+        lab = " ".join(str(x) for x in labels if isinstance(x, str) and x)
+        return f"{name:8} | " + (f"{lab} | " if lab else "")
+    out = []
+    parts = []
+    if n("claude_5h") is not None:
+        parts.append(f"5h {n('claude_5h')}% ({w(n('claude_5h_reset_ts'))})")
+    if n("claude_week") is not None:
+        parts.append(pool("weekly all", n("claude_week"), n("claude_week_reset_ts"), 7*86400))
+    if n("fable") is not None:
+        parts.append(pool("weekly Fable", n("fable"), n("fable_reset_ts"), 7*86400))
+    if parts:
+        out.append(head("claude", d.get("claude_plan"), d.get("claude_status")) + " | ".join(parts))
+    parts = []
+    if n("codex") is not None:
+        secs = n("codex_window_s")
+        label = ("weekly" if secs >= 7*86400 else f"{secs/3600:.0f}h") if secs else "window"
+        parts.append(pool(label, n("codex"), n("codex_reset_ts"), secs, "chatgpt"))
+    if n("codex_5h") is not None:
+        parts.append(pool("5h", n("codex_5h"), n("codex_5h_reset_ts"), 5*3600, "chatgpt"))
+    if parts:
+        plan, src = d.get("codex_plan"), d.get("codex_source")
+        out.append(head("chatgpt", f"{plan} ({src})" if isinstance(plan, str) and isinstance(src, str) else plan) + " | ".join(parts))
+    bits = []
+    if n("cursor_auto_pct") is not None: bits.append(f"cursor models {n('cursor_auto_pct'):.0f}%")
+    if n("cursor_api_pct") is not None: bits.append(f"other models {n('cursor_api_pct'):.0f}%")
+    if bits or n("cursor_pct") is not None:
+        end, secs = n("cursor_reset_ts"), n("cursor_window_s")
+        body = ", ".join(bits) or f"{n('cursor_pct'):.0f}%"
+        p = pc(n("cursor_pct"), end, secs) if n("cursor_pct") is not None else ""
+        out.append(head("cursor") + f"{body}: " + (f"{p}, " if p else "") + w(end))
+    if n("bot_pct") is not None:
+        end, secs = n("bot_reset_ts"), n("bot_window_s")
+        p = pc(n("bot_pct"), end, secs)
+        out.append(head("grokbot") + f"week {n('bot_pct'):.1f}%: " + (f"{p}, " if p else "") + w(end)
+                   + (" | ALLOWANCE USED" if d.get("bot_exhausted") is True else ""))
+    if n("grok_pct") is not None:
+        reset, secs = n("grok_reset_ts"), n("grok_window_s")
+        p = pc(n("grok_pct"), reset, secs)
+        parts = []
+        if n("grok_renews_ts") is not None and isinstance(d.get("grok_renews"), bool):
+            parts.append(f"sub {'renews' if d['grok_renews'] else 'ends'} {w(n('grok_renews_ts')).replace('resets ', '')}")
+        parts.append(f"week {n('grok_pct')}% ({w(reset)}" + (f"; {p})" if p else ")"))
+        if d.get("grok_exhausted") is True:
+            h = n("grok_402_h")
+            parts.append(f"EXHAUSTED: 402 {h}h ago, until the weekly reset" if h is not None else "EXHAUSTED, until the weekly reset")
+        elif d.get("grok_exhausted") is False:
+            parts.append("no 402 since the last weekly reset")
+        out.append(head("grok") + " | ".join(parts))
+    return out
+
 def print_cached():
     """--cached: print the last run's lines from the cache, no network. For the
     synchronous SessionStart hook; the async hook refreshes the cache."""
@@ -3867,7 +3947,8 @@ def print_cached():
         else:
             header = f"[seat-usage] cached {age_m}m ago; run ~/.local/bin/seat-usage for live numbers"
         seats = []
-        for l in d["lines"]:
+        lines = d["lines"] if "lines" in d else lines_from_numbers(d, NOW)
+        for l in lines:
             seat = l.split("|")[0].strip()
             l = re.sub(r" \| stale \(reading [\d.]+h old\)$", "", l)   # recomputed below at the current age
             age = seat_age_s(d, seat, NOW)
