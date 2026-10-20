@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -2878,7 +2879,7 @@ def grok_cookie_reads_seat_usage_op_ref():
         returncode = 0
         stdout = "sso-cookie\r\n"
 
-    def run(cmd, capture_output, text, timeout):
+    def run(cmd, capture_output, text, timeout, **kw):
         seen["cmd"] = cmd
         return Result()
 
@@ -3119,6 +3120,80 @@ def cached_output_does_not_run_agy():
         assert "claude   | cached" in proc.stdout, proc.stdout
         assert "google" not in proc.stdout, proc.stdout
         assert not marker.exists(), "cached run executed agy"
+
+
+@test
+def grok_cookie_op_cannot_be_stopped_by_a_terminal():
+    """`op` that touches the terminal must not freeze a run started under a tty.
+
+    The child runs as a background process group of a pty, as `timeout` puts
+    it. A fake op that reads /dev/tty would get SIGTTIN and stop the whole
+    group, so grok_cookie() would never return. Detached, op has no terminal
+    and fails at once, and the stale cached cookie is returned.
+    """
+    import pty
+    import select
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cache = tmp / "cache"
+        cache.mkdir()
+        cookie = cache / "grok-cookie"
+        cookie.write_text("stale-cookie")
+        old = time.time() - su.COOKIE_TTL_S - 60
+        os.utime(cookie, (old, old))
+        fake = tmp / "op"
+        fake.write_text("#!/bin/sh\nread line < /dev/tty || exit 1\necho fresh-cookie\n")
+        fake.chmod(0o755)
+        helper = tmp / "helper.py"
+        helper.write_text(
+            "import importlib.machinery, importlib.util, os, sys, time\n"
+            "pid = os.fork()\n"   # the pty child leads its session; its child can take a new group
+            "if pid:\n    os._exit(os.waitstatus_to_exitcode(os.waitpid(pid, 0)[1]))\n"
+            "os.setpgid(0, 0)\n"   # a background group of the pty, like `timeout`
+            "print('GROUP', os.getpid(), flush=True)\n"
+            "loader = importlib.machinery.SourceFileLoader('su', sys.argv[1])\n"
+            "spec = importlib.util.spec_from_loader('su', loader)\n"
+            "m = importlib.util.module_from_spec(spec); loader.exec_module(m)\n"
+            "t = time.monotonic(); v = m.grok_cookie()\n"
+            "print('RETURNED', v, round(time.monotonic() - t, 2), m.COOKIE_TRIED, flush=True)\n")
+        env = os.environ.copy()
+        env.update(SEAT_USAGE_CACHE_DIR=str(cache), SEAT_USAGE_OP=str(fake), QUARTERMASTER_NO_UPDATE="1")
+        pid, fd = pty.fork()
+        if pid == 0:
+            try:
+                os.execve(sys.executable, [sys.executable, str(helper), str(BIN)], env)
+            finally:
+                os._exit(127)
+        out, deadline = b"", time.monotonic() + 8
+        try:
+            while time.monotonic() < deadline:
+                ready, _, _ = select.select([fd], [], [], 0.2)
+                if ready:
+                    try:
+                        chunk = os.read(fd, 4096)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    out += chunk
+                if b"RETURNED" in out and b"\n" in out.split(b"RETURNED", 1)[1]:
+                    break
+        finally:
+            groups = [pid] + [int(g) for g in re.findall(rb"GROUP (\d+)", out)]
+            for group in groups:
+                try:
+                    os.killpg(group, 9)
+                except OSError:
+                    pass
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+            os.waitpid(pid, 0)
+            os.close(fd)
+        text = out.decode(errors="replace")
+        assert "RETURNED stale-cookie" in text, f"grok_cookie did not return within 8s under a tty: {text!r}"
+        assert "op read failed" in text, text
 
 
 def main():
