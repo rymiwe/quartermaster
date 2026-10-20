@@ -1012,6 +1012,42 @@ def failed_profile_with_a_fable_slice_is_max():
     assert cache["claude_plan"] == "?" and cache["claude_max"] is True, cache
 
 
+@test
+def caps_projection_is_linear_from_the_window_start():
+    f = su.caps_early_s
+    D = 86400
+    # 7d window, 4d left: 3d elapsed at 60% is 20%/day, so 100% in 2 more days, 2d before the reset.
+    assert f(60, NOW + 4 * D, WEEK, NOW) == 2 * D
+    assert f(90, NOW + 4 * D, WEEK, NOW) == round(4 * D - 10 * 3 * D / 90)
+    assert f(40, NOW + 4 * D, WEEK, NOW) is None          # under pace: reaches 100% after the reset
+    assert f(3 / 7 * 100, NOW + 4 * D, WEEK, NOW) is None  # exactly on pace: caps at the reset, not early
+    assert f(0, NOW + 4 * D, WEEK, NOW) is None            # nothing used
+    assert f(100, NOW + 4 * D, WEEK, NOW) is None and f(120, NOW + 4 * D, WEEK, NOW) is None  # already capped
+    assert f(30, NOW + 6.5 * D, WEEK, NOW) is None         # 7% of the window: too early to project
+    assert f(30, NOW + 6.3 * D, WEEK, NOW) is not None     # 10%: projected
+    assert f(50, NOW - 1, WEEK, NOW) is None and f(50, NOW + 8 * D, WEEK, NOW) is None   # reset passed, or > a window off
+    for bad in (None, 0, -5, "x", True):
+        assert f(50, NOW + 4 * D, bad, NOW) is None, bad
+    assert f(None, NOW + 4 * D, WEEK, NOW) is None and f(50, None, WEEK, NOW) is None and f(True, NOW + D, WEEK, NOW) is None
+    # 5h window, 2h left: 3h elapsed at 90% is 30%/h, so 100% in 20 minutes, 1h 40m early.
+    assert f(90, NOW + 2 * 3600, 5 * 3600, NOW) == 100 * 60
+
+
+@test
+def apply_caps_writes_one_key_per_projected_pool_and_drops_old_ones():
+    s = snap(claude_week=60, claude_week_reset_ts=NOW + 4 * 86400, bot_pct=10,
+             google_gemini_5h=90, google_gemini_5h_reset_ts=NOW + 2 * 3600, codex_caps_early_s=999)
+    su.apply_caps(s, NOW)
+    assert s["claude_week_caps_early_s"] == 2 * 86400, s
+    assert s["google_gemini_5h_caps_early_s"] == 6000, s
+    assert "codex_caps_early_s" not in s and "grokbot_caps_early_s" not in s, s   # stale key gone; under pace
+    push = load("seat_usage_push", HERE.parents[0] / "bin" / "seat-usage-push")
+    keys = {f"{name}_caps_early_s" for name, *_ in su.caps_sources()}
+    assert keys <= push.CACHE_NUMBERS, sorted(keys - push.CACHE_NUMBERS)
+    copy = push.build_cache_copy({**s, "fable_caps_early_s": "soon"})
+    assert copy["claude_week_caps_early_s"] == 2 * 86400 and "fable_caps_early_s" not in copy, copy
+
+
 _RATE_CHILD = r"""
 import importlib.machinery
 import importlib.util
