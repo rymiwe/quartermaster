@@ -972,7 +972,6 @@ _RATE_CHILD = r"""
 import importlib.machinery
 import importlib.util
 import os
-import re
 import sys
 sys.dont_write_bytecode = True
 bin_path, cache_dir, home, profile, usage = sys.argv[1:6]
