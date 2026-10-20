@@ -328,13 +328,22 @@ def test_phone_header_says_an_old_reading_is_stale_with_its_age():
     cache = {"ts": old, "as_of": {"claude": old, "grokbot": old}, "bot_pct": 10, "bot_reset_ts": now + 5 * 86400,
              "bot_window_s": 7 * 86400, "claude_week": 42, "claude_week_reset_ts": now + 4 * 86400,
              "claude_5h": 10, "claude_5h_reset_ts": now + 3600}
+    recent = now - 60
     with tempfile.TemporaryDirectory() as t:
         doc = phone_text(t, cache)
         fresh = phone_text(t, {**cache, "ts": now, "as_of": {"claude": now, "grokbot": now}})
+        # unknown for a reason other than age (no used %): a minute-old reading is not stale
+        nopct = phone_text(t, {k: v for k, v in {**cache, "ts": recent, "as_of": {"claude": recent, "grokbot": recent}}.items()
+                               if k not in ("bot_pct", "claude_week")})
+        # a pulled copy gets 20 minutes before the route calls a reading unknown
+        pulled = phone_text(t, {**cache, "ts": now - 25 * 60, "pulled_ts": now,
+                                "as_of": {"claude": now - 25 * 60 - 5, "grokbot": now - 25 * 60 - 5}})
     assert "Grok Bot: reading stale, 3h 13m old." in doc["why"], doc["why"]
     assert "Opus: reading stale, 3h 13m old." in doc["why"], doc["why"]
     assert "no reading" not in doc["why"], doc["why"]
     assert "stale" not in fresh["why"] and "no reading" not in fresh["why"], fresh["why"]
+    assert "Grok Bot: no reading." in nopct["why"] and "stale" not in nopct["why"], nopct["why"]
+    assert "Grok Bot: reading stale, 25m old." in pulled["why"], pulled["why"]
 
 def test_phone_card_headers_use_cached_renewals_only():
     claude_t, codex_t, cursor_t, grok_t = NOW + 25 * 86400, NOW + 3 * 86400, NOW + 27 * 86400, NOW + 45 * 86400

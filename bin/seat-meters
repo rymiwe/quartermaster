@@ -279,13 +279,17 @@ if PHONE:
                 ("Astra", ["codex"]), ("Sol", ["codex", "cursor_other"]), ("Grok", ["cursor_models", "supergrok"]),
                 ("Grok Bot", ["grokbot"]), ("Wonder full", ["muse"]), ("Wonder", ["muse"])]
     METERED, BUILDER_ONLY = {"cursor_other"}, {"supergrok"}
-    def google_families():
-        """{orderly-style seat id: [(family, style)]} from pools.json's google_ai_pro block."""
+    def pools_conf():
+        """pools.json as seat-usage finds it (SEAT_USAGE_POOLS, then the repo's config), or {}."""
         path = os.environ.get("SEAT_USAGE_POOLS") or os.path.join(
             os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config", "pools.json")
         try:
-            with open(path) as fh: block = json.load(fh).get("google_ai_pro")
-        except (OSError, ValueError, AttributeError): return {}
+            with open(path) as fh: conf = json.load(fh)
+        except (OSError, ValueError): return {}
+        return conf if isinstance(conf, dict) else {}
+    def google_families():
+        """{orderly-style seat id: [(family, style)]} from pools.json's google_ai_pro block."""
+        block = pools_conf().get("google_ai_pro")
         pools = block.get("pools") if isinstance(block, dict) else None
         if not isinstance(pools, dict): return {}
         out = {}
@@ -433,15 +437,25 @@ if PHONE:
             if st == "capped": why.append(f"{n}: {w} is used up{used}.")
             elif st == "ahead": why.append(f"{n}: {w} is{used}" + ("," if used else "") + " ahead of the time elapsed, so it may run out before it resets.")
             elif st == "unknown":
-                # an old reading is not a missing one: say how old it is
+                # unknown because the reading is past the route's freshness limit: an old
+                # reading, not a missing one, so say how old it is
                 age = h.get("reading_age_s")
-                if isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) and age > 0:
+                if isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) and age > FRESH_S:
                     why.append(f"{n}: reading stale, {fspan(age)} old.")
                 else: why.append(f"{n}: no reading.")
         if why and s.get("mode") == "ask" and not label:
             why.append("No host is clear, so the router leaves the choice to you.")
             if lean: why.append("If you start one anyway, draw Grok from " + lean[5:] + " first.")
         return text, " ".join(why)
+    def route_fresh_s():
+        """seat-usage's route_fresh_s: how old a reading may be before a route calls it unknown.
+        pools.json route_freshness_s, 600 s live / 1200 s on a pulled copy when unset."""
+        fresh = pools_conf().get("route_freshness_s")
+        fresh = fresh if isinstance(fresh, dict) else {}
+        key = "pulled" if isinstance(d.get("pulled_ts"), (int, float)) and not isinstance(d.get("pulled_ts"), bool) else "live"
+        v = fresh.get(key)
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else {"live": 600, "pulled": 1200}[key]
+    FRESH_S = route_fresh_s()
     HOST, WHY = host_lines(route_host())
     LEGEND = "dashed = metered \u00b7 dotted = builder only \u00b7 \u2605 first usable pool for the family"
     NOTES = []
