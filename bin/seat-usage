@@ -537,6 +537,7 @@ def claude():
     try:
         u = _usage_get(hdr)
         parts = []
+        scoped = False
         for l in u.get("limits", []):
             kind = l.get("kind"); pct = l.get("percent"); rs = l.get("resets_at")
             rts = iso_to_ts(rs) if rs else None
@@ -551,8 +552,12 @@ def claude():
                 name = ((l.get("scope") or {}).get("model") or {}).get("display_name", "scoped")
                 parts.append(f"weekly {name} {pct}%: {pace(pct, rts, 7*86400)}")
                 SUMMARY["fable"] = pct; SUMMARY["fable_pace"] = pace_code(pct, rts, 7*86400); SUMMARY["fable_reset_ts"] = rts
+                scoped = True
                 record_pool("claude", "claude weekly Fable", pct, rts, 7 * 86400, "live")
         SUMMARY["claude_plan"] = plan; SUMMARY["claude_status"] = status
+        is_max = claude_max_flag(plan, scoped)
+        if is_max is not None:
+            SUMMARY["claude_max"] = is_max
         claude_renewal()
         SUMMARY["as_of"]["claude"] = NOW
         out.append(f"claude   | {plan} {status} | " + " | ".join(parts))
@@ -567,6 +572,41 @@ def claude():
             return _mark_reading_stale(reused)
         out.append(f"claude   | {plan} {status} | usage failed: {_err(e)}")
     return out
+
+def claude_max_flag(plan, scoped):
+    """True on a Max plan, False on Pro, None when unknown.
+
+    A weekly_scoped (Fable) limit in this usage reading says Max outright:
+    only Max has one. Otherwise the OAuth profile's organization.rate_limit_tier
+    decides (claude_plan is that name without "default_"): "max" in it is Max,
+    claude_ai (Pro, seen 2026-10) is not, and any other name (team, enterprise,
+    a new tier, or "?" from a failed profile read) is unknown.
+    """
+    if scoped:
+        return True
+    return _plan_is_max(plan)
+
+# Tier names seen without a Fable slice. Any other tier without "max" is unknown.
+NON_MAX_TIERS = ("claude_ai", "claude_pro")
+
+def _plan_is_max(plan):
+    if not isinstance(plan, str):
+        return None
+    name = plan.strip().lower().replace("default_", "")
+    if "max" in name:
+        return True
+    if name in NON_MAX_TIERS:
+        return False
+    return None
+
+def claude_max(s):
+    """The cached claude_max flag, or the plan name on a cache written before it. None when unknown."""
+    flag = s.get("claude_max")
+    if isinstance(flag, bool):
+        return flag
+    if "claude_max" in s:
+        return None
+    return _plan_is_max(s.get("claude_plan"))
 
 def claude_renewal():
     """Neither the OAuth profile nor usage endpoint carries a billing date (checked
@@ -1015,7 +1055,7 @@ def burn_line(e):
 SEAT_KEYS = {
     "claude": (
         "claude_5h", "claude_5h_reset_ts", "claude_week", "claude_week_pace", "claude_week_reset_ts",
-        "fable", "fable_pace", "fable_reset_ts", "claude_plan", "claude_status",
+        "fable", "fable_pace", "fable_reset_ts", "claude_plan", "claude_status", "claude_max",
         "claude_renews_ts", "claude_renews", "claude_renews_date_only", "claude_renews_on",
     ),
     "chatgpt": (
@@ -1586,14 +1626,23 @@ def score_route(role, s, now, states=None):
     """Pick a pool by fit, headroom, cost, and use-it-or-lose-it. No rule table."""
     if states is None:
         states = {pid: pool_status(pid, s, now) for pid in POOLS}
-    held = _hold_unknown(role, s, now, states)
+    # Off Max there is no Fable slice, so a Fable role cannot hold on Claude.
+    # It falls back as the council's Fable voter does: to the pools off the
+    # Claude seat that serve Fable (Other Models). Unknown plan: unchanged.
+    off_max = ROLES[role].get("primary") == "fable" and claude_max(s) is False
+    held = None if off_max else _hold_unknown(role, s, now, states)
     if held is not None:
         return held
     track = read_track()
-    missing = _cohort_unknown_ask(role, states, track)
+    missing = None if off_max else _cohort_unknown_ask(role, states, track)
     if missing:
         return _row(role, s, now, "ask", missing)
     ranked = _ranked(role, track)
+    if claude_max(s) is False:  # no slice off Max, whatever the role
+        ranked = [r for r in ranked if r[2] != "fable"]
+    if off_max:
+        frontier = set(_fable_frontier_ids(True))
+        ranked = [r for r in ranked if r[2] in frontier]
     best = None
     best_pid = None
     for fit, _index, pid in ranked:
@@ -1970,6 +2019,7 @@ def _store_merged(base, lines, seats, now, stamp_now):
     merged = merge_summary(base, fresh, seats, now=now)
     apply_muse(merged, now)
     apply_google(merged, now)
+    apply_caps(merged, now)
     if stamp_now:
         merged["ts"] = now
     SUMMARY = merged
@@ -2359,10 +2409,7 @@ def _fable_slice_absent(states, s):
     as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
     if not as_of.get("claude"):
         return False
-    plan = s.get("claude_plan")
-    if not isinstance(plan, str) or not plan.strip() or plan.strip() == "?":
-        return False
-    if "max" in plan.lower():
+    if claude_max(s) is not False:
         return False
     if not _is_number(s.get("claude_week")) or not _is_number(s.get("claude_5h")):
         return False
@@ -3063,6 +3110,55 @@ def log_asks(rows, s, now):
                 f.write(json.dumps({"ts": now, "host": socket.gethostname(), "row": r, "pools": pools}) + "\n")
     except Exception:
         pass
+
+# Cap projection. Burn rate is linear from the window's start: used % divided
+# by the time elapsed since the window opened (window length minus time left).
+# At that rate the pool reaches 100% after (100 - used) / rate more seconds;
+# when that is before the reset, <pool>_caps_early_s is how many seconds
+# early. No key means no projection: no reading, 0% used, already at 100%,
+# the reset passed or is further off than one window, the window is unknown,
+# or less than CAPS_MIN_ELAPSED of the window has passed (one large job at
+# the start of a window projects a cap that is not real).
+CAPS_MIN_ELAPSED = 0.10
+_GOOGLE_CAPS = tuple((f"google_{p}_{w}", f"google_{p}_{w}_reset_ts", secs)
+                     for p, ws in (("argon", ("week",)), ("gemini", ("week", "5h")), ("claudegpt", ("week", "5h")))
+                     for w, secs in ((w, 7 * 86400 if w == "week" else 5 * 3600) for w in ws))
+
+def caps_early_s(used, reset, window, now):
+    """Seconds before the reset that a linear burn from the window's start hits 100%, or None."""
+    if not (_is_number(used) and _is_number(reset) and _is_number(window)) or window <= 0:
+        return None
+    left = reset - now
+    if left <= 0 or left > window:
+        return None
+    elapsed = window - left
+    if elapsed < CAPS_MIN_ELAPSED * window or used <= 0 or used >= 100:
+        return None
+    cap_in = (100 - used) * elapsed / used
+    early = round(left - cap_in)
+    return early if early > 0 else None
+
+def caps_sources():
+    """(key prefix, used key, reset key, window seconds or window key, as_of seat) per projected pool."""
+    out = [(pid, meta["used"], meta["reset"], meta["window"], meta["seat"]) for pid, meta in POOLS.items()]
+    return out + [(used, used, reset, secs, "google") for used, reset, secs in _GOOGLE_CAPS]
+
+def apply_caps(summary, now):
+    """Project each pool at its own reading's time (as_of), so a carried-over
+    reading keeps the projection it had rather than one diluted by time that
+    saw no new reading. A reset already past drops the key."""
+    for k in [k for k in summary if k.endswith("_caps_early_s")]:
+        del summary[k]
+    as_of = summary.get("as_of") if isinstance(summary.get("as_of"), dict) else {}
+    for name, used, reset, window, seat in caps_sources():
+        win = summary.get(window) if isinstance(window, str) else window
+        at = as_of.get(seat) if _is_number(as_of.get(seat)) else now
+        rts = summary.get(reset)
+        if not _is_number(rts) or rts <= now:
+            continue
+        early = caps_early_s(summary.get(used), rts, win, min(at, now))
+        if early is not None:
+            summary[f"{name}_caps_early_s"] = early
 
 def write_cache():
     try:

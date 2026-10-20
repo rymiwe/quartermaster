@@ -77,6 +77,11 @@ POOLS = [
 # named here, and any value of the wrong type, is dropped.
 _GOOGLE = [f"google_{p}_{s}" for p in ("argon", "gemini", "claudegpt")
            for s in ("week", "week_reset_ts", "5h", "5h_reset_ts")]
+# seat-usage's cap projections (apply_caps): seconds early, one per pool.
+_CAPS = [f"{p}_caps_early_s" for p in (
+    "claude_5h", "claude_week", "fable", "codex_5h", "codex", "cursor_models", "cursor_other",
+    "grokbot", "grok", "muse_5h", "muse_week",
+    "google_argon_week", "google_gemini_week", "google_gemini_5h", "google_claudegpt_week", "google_claudegpt_5h")]
 CACHE_NUMBERS = frozenset([
     "ts", "v",
     "claude_5h", "claude_5h_reset_ts", "claude_week", "claude_week_reset_ts",
@@ -88,9 +93,11 @@ CACHE_NUMBERS = frozenset([
     "bot_pct", "bot_reset_ts", "bot_window_s",
     "grok_pct", "grok_reset_ts", "grok_window_s", "grok_402_h", "grok_renews_ts",
     "muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts",
-] + _GOOGLE)
+] + _GOOGLE + _CAPS)
+# claude_max is the Claude plan as one bit (seat-usage derives it from the plan
+# name on the reading machine), so a reader can route Fable without the name.
 CACHE_FLAGS = frozenset(["bot_exhausted", "grok_exhausted", "claude_renews", "codex_renews",
-                         "cursor_renews", "grok_renews"])
+                         "cursor_renews", "grok_renews", "claude_max"])
 AS_OF_SEATS = frozenset(["claude", "chatgpt", "cursor", "grokbot", "grok", "muse", "google"])
 
 
