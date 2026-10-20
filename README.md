@@ -112,7 +112,8 @@ Tests: `python3 tests/test_seat_usage_push.py`.
 
 - Hardcoded paths (see contract above).
 - WSL/Windows assumptions, including the `op.exe` WinGet path (`$SEAT_USAGE_OP` overrides).
-- 1Password item path defaults to `op://grok/grok web cookie/credential` (`$SEAT_USAGE_OP_REF` overrides).
+- 1Password item path defaults to `op://seat-usage/grok web cookie/credential` (`$SEAT_USAGE_OP_REF` overrides).
+- `op` authenticates with a per-machine service-account token read from `~/.config/seat-usage/op-token` (`$SEAT_USAGE_OP_TOKEN_FILE` overrides; keep it mode 0600 on the Linux filesystem, a looser mode prints a warning) and passed only in op's environment as `OP_SERVICE_ACCOUNT_TOKEN`. For `op.exe` under WSL the variable is also added to `WSLENV`. A token file wins over an `OP_SERVICE_ACCOUNT_TOKEN` already in the environment. With no file, or an empty one, op inherits the environment as before.
 - A successful read is cached in `~/.cache/seat-usage/grok-cookie` (mode 0600) for 6 hours, and the stale copy is used when 1Password fails. The service account's daily read cap is shared by every machine, so live runs must not each read it.
 - Fixed Thursday 5:38 PM PT fallback for the Grok reset.
 - Council lineup and host order still name families in code. Launch routing does not.

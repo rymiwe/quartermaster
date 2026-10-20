@@ -35,6 +35,8 @@ def load(name, path):
 
 
 su = load("seat_usage", BIN)
+# Never hand a real ~/.config/seat-usage/op-token to a fake op; tests that need one set their own.
+os.environ["SEAT_USAGE_OP_TOKEN_FILE"] = "/nonexistent/seat-usage-test/op-token"
 hook = load("seat_route_hook", HOOK)
 
 NOW = 1_800_000_000
@@ -2867,9 +2869,9 @@ def grok_cookie_reads_seat_usage_op_ref():
     old_ref = os.environ.get("SEAT_USAGE_OP_REF")
     old_op = os.environ.get("SEAT_USAGE_OP")
     os.environ.pop("SEAT_USAGE_OP_REF", None)
-    assert su.op_ref() == "op://grok/grok web cookie/credential"
+    assert su.op_ref() == "op://seat-usage/grok web cookie/credential"
     os.environ["SEAT_USAGE_OP_REF"] = ""
-    assert su.op_ref() == "op://grok/grok web cookie/credential"
+    assert su.op_ref() == "op://seat-usage/grok web cookie/credential"
     seen = {}
 
     def which(name):
@@ -3194,6 +3196,214 @@ def grok_cookie_op_cannot_be_stopped_by_a_terminal():
         text = out.decode(errors="replace")
         assert "RETURNED stale-cookie" in text, f"grok_cookie did not return within 8s under a tty: {text!r}"
         assert "op read failed" in text, text
+
+
+FAKE_OP_TOKEN = "ops_FAKE_TEST_TOKEN_not_a_secret_7c1e"
+
+
+@contextlib.contextmanager
+def _fake_op_run(token_file, returncode=0, stdout="sso-cookie\n"):
+    """grok_cookie() with which/run faked, an empty cache and SEAT_USAGE_OP_TOKEN_FILE set."""
+    import shutil
+    import subprocess as sp
+    seen = {}
+
+    class Result:
+        pass
+
+    def run(cmd, **kw):
+        seen["cmd"], seen["kw"] = cmd, kw
+        r = Result()
+        r.returncode, r.stdout, r.stderr = returncode, stdout, ""
+        return r
+
+    saved = {k: os.environ.get(k) for k in ("SEAT_USAGE_OP", "SEAT_USAGE_OP_REF", "SEAT_USAGE_OP_TOKEN_FILE", "OP_SERVICE_ACCOUNT_TOKEN")}
+    old_which, old_run, old_tried, old_cache_dir = shutil.which, sp.run, list(su.COOKIE_TRIED), su.CACHE_DIR
+    tmp = tempfile.TemporaryDirectory()
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        if token_file is not None:
+            os.environ["SEAT_USAGE_OP_TOKEN_FILE"] = str(token_file)
+        shutil.which = lambda name: "/tmp/fake-op" if name == "op.exe" else None
+        sp.run = run
+        su.COOKIE_TRIED = []
+        su.CACHE_DIR = tmp.name
+        yield seen
+    finally:
+        su.CACHE_DIR = old_cache_dir
+        tmp.cleanup()
+        shutil.which, sp.run = old_which, old_run
+        su.COOKIE_TRIED = old_tried
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+@test
+def grok_cookie_default_op_ref_is_the_seat_usage_vault():
+    old = os.environ.pop("SEAT_USAGE_OP_REF", None)
+    try:
+        assert su.DEFAULT_OP_REF == "op://seat-usage/grok web cookie/credential", su.DEFAULT_OP_REF
+        assert su.op_ref() == "op://seat-usage/grok web cookie/credential"
+        os.environ["SEAT_USAGE_OP_REF"] = "op://other/item/credential"
+        assert su.op_ref() == "op://other/item/credential"
+    finally:
+        if old is None:
+            os.environ.pop("SEAT_USAGE_OP_REF", None)
+        else:
+            os.environ["SEAT_USAGE_OP_REF"] = old
+
+
+@test
+def grok_cookie_passes_token_file_to_op_env():
+    with tempfile.TemporaryDirectory() as d:
+        tok = Path(d) / "op-token"
+        tok.write_text(f"  {FAKE_OP_TOKEN}\n")
+        tok.chmod(0o600)
+        err = io.StringIO()
+        with _fake_op_run(tok) as seen, contextlib.redirect_stderr(err):
+            assert su.grok_cookie() == "sso-cookie"
+        kw = seen["kw"]
+        env = kw.get("env")
+        assert env is not None, "op ran without an env built from the token file"
+        assert env["OP_SERVICE_ACCOUNT_TOKEN"] == FAKE_OP_TOKEN
+        assert env.get("PATH") == os.environ.get("PATH"), "env must be a copy of os.environ"
+        assert "OP_SERVICE_ACCOUNT_TOKEN" not in os.environ, "token leaked into this process's environ"
+        assert kw.get("stdin") == subprocess.DEVNULL and kw.get("start_new_session") is True, kw
+        assert FAKE_OP_TOKEN not in " ".join(seen["cmd"]), "token in argv"
+        assert FAKE_OP_TOKEN not in err.getvalue()
+
+
+@test
+def grok_cookie_without_token_file_leaves_op_env_alone():
+    with tempfile.TemporaryDirectory() as d:
+        for case in ("missing", "empty"):
+            tok = Path(d) / "op-token"
+            if case == "empty":
+                tok.write_text("  \n")
+            with _fake_op_run(tok) as seen:
+                assert su.grok_cookie() == "sso-cookie"
+            kw = seen["kw"]
+            assert kw.get("env") is None, f"{case}: env passed: {sorted(kw)}"
+            assert kw.get("stdin") == subprocess.DEVNULL and kw.get("start_new_session") is True, kw
+        # Default path is under HOME; with none there, op inherits the environment.
+        old_home = os.environ.get("HOME")
+        old_file = os.environ.pop("SEAT_USAGE_OP_TOKEN_FILE", None)
+        os.environ["HOME"] = d
+        try:
+            assert su.op_token_file() == os.path.join(d, ".config", "seat-usage", "op-token")
+            with _fake_op_run(None) as seen:
+                assert su.grok_cookie() == "sso-cookie"
+            assert seen["kw"].get("env") is None, "default token path absent, yet env passed"
+            # ...and a token at the default path is used.
+            dflt = Path(d) / ".config" / "seat-usage" / "op-token"
+            dflt.parent.mkdir(parents=True)
+            dflt.write_text(FAKE_OP_TOKEN)
+            dflt.chmod(0o600)
+            with _fake_op_run(None) as seen:
+                assert su.grok_cookie() == "sso-cookie"
+            assert seen["kw"]["env"]["OP_SERVICE_ACCOUNT_TOKEN"] == FAKE_OP_TOKEN
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+            if old_file is not None:
+                os.environ["SEAT_USAGE_OP_TOKEN_FILE"] = old_file
+
+
+@test
+def grok_cookie_token_never_reaches_output():
+    """A real child: fake op gets the token, fails, and nothing printed carries it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        tok = tmp / "op-token"
+        tok.write_text(FAKE_OP_TOKEN + "\n")
+        tok.chmod(0o644)   # loose mode: any warning must not echo the token
+        marker = tmp / "marker"
+        fake = tmp / "op"
+        fake.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"$OP_SERVICE_ACCOUNT_TOKEN\" = \"{FAKE_OP_TOKEN}\" ]; then echo token-ok > \"{marker}\"; fi\n"
+            "echo \"[ERROR] token $OP_SERVICE_ACCOUNT_TOKEN rejected\" >&2\n"
+            "exit 1\n")
+        fake.chmod(0o755)
+        helper = tmp / "helper.py"
+        helper.write_text(
+            "import importlib.machinery, importlib.util, sys\n"
+            "loader = importlib.machinery.SourceFileLoader('su', sys.argv[1])\n"
+            "spec = importlib.util.spec_from_loader('su', loader)\n"
+            "m = importlib.util.module_from_spec(spec); loader.exec_module(m)\n"
+            "print('RETURNED', m.grok_cookie(), m.COOKIE_TRIED, flush=True)\n")
+        env = {k: v for k, v in os.environ.items() if k != "OP_SERVICE_ACCOUNT_TOKEN"}
+        env.update(SEAT_USAGE_CACHE_DIR=str(tmp / "cache"), SEAT_USAGE_OP=str(fake),
+                   SEAT_USAGE_OP_TOKEN_FILE=str(tok), HOME=str(tmp), QUARTERMASTER_NO_UPDATE="1")
+        proc = subprocess.run([sys.executable, str(helper), str(BIN)], env=env, capture_output=True, text=True, timeout=20)
+        out = proc.stdout + proc.stderr
+        assert "RETURNED None" in proc.stdout, out
+        assert "read failed" in proc.stdout, out
+        assert marker.exists() and marker.read_text().strip() == "token-ok", "fake op did not receive the token"
+        assert FAKE_OP_TOKEN not in out, "token printed"
+
+
+@test
+def op_token_file_bom_fifo_and_mode_warning():
+    with tempfile.TemporaryDirectory() as d:
+        tok = Path(d) / "op-token"
+        saved = os.environ.get("SEAT_USAGE_OP_TOKEN_FILE")
+        os.environ["SEAT_USAGE_OP_TOKEN_FILE"] = str(tok)
+        try:
+            tok.write_bytes(b"\xef\xbb\xbf" + FAKE_OP_TOKEN.encode() + b"\r\n")
+            tok.chmod(0o600)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                env = su.op_env()
+            assert env["OP_SERVICE_ACCOUNT_TOKEN"] == FAKE_OP_TOKEN, "BOM or CRLF kept"
+            assert err.getvalue() == "", err.getvalue()
+            tok.chmod(0o644)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                assert su.op_env()["OP_SERVICE_ACCOUNT_TOKEN"] == FAKE_OP_TOKEN
+            assert "chmod 600" in err.getvalue() and "644" in err.getvalue(), err.getvalue()
+            assert FAKE_OP_TOKEN not in err.getvalue()
+            tok.unlink()
+            os.mkfifo(tok)   # open() would block on a FIFO with no writer
+            assert su.op_env() is None
+        finally:
+            if saved is None:
+                os.environ.pop("SEAT_USAGE_OP_TOKEN_FILE", None)
+            else:
+                os.environ["SEAT_USAGE_OP_TOKEN_FILE"] = saved
+
+
+@test
+def wsl_env_names_the_token_for_op_exe_only():
+    base = {"PATH": "/usr/bin", "OP_SERVICE_ACCOUNT_TOKEN": FAKE_OP_TOKEN}
+    assert su.wsl_env(None, "/mnt/c/x/op.exe") is None
+    assert su.wsl_env(base, "/usr/bin/op") is base
+    e = su.wsl_env(base, "/mnt/c/x/op.exe")
+    assert e["WSLENV"] == "OP_SERVICE_ACCOUNT_TOKEN" and "WSLENV" not in base, e
+    e = su.wsl_env(dict(base, WSLENV="FOO/p:BAR"), "C:/op.EXE")
+    assert e["WSLENV"] == "FOO/p:BAR:OP_SERVICE_ACCOUNT_TOKEN", e
+    e = su.wsl_env(dict(base, WSLENV="OP_SERVICE_ACCOUNT_TOKEN/u"), "op.exe")
+    assert e["WSLENV"] == "OP_SERVICE_ACCOUNT_TOKEN/u", e
+    # Through grok_cookie: the faked op.exe path gets WSLENV.
+    with tempfile.TemporaryDirectory() as d:
+        tok = Path(d) / "op-token"
+        tok.write_text(FAKE_OP_TOKEN)
+        tok.chmod(0o600)
+        import shutil
+        with _fake_op_run(tok) as seen:
+            old_which = shutil.which
+            shutil.which = lambda name: "/mnt/c/fake/op.exe" if name == "op.exe" else None
+            try:
+                assert su.grok_cookie() == "sso-cookie"
+            finally:
+                shutil.which = old_which
+        assert "OP_SERVICE_ACCOUNT_TOKEN" in seen["kw"]["env"]["WSLENV"].split(":"), seen["kw"]["env"].get("WSLENV")
 
 
 def main():
