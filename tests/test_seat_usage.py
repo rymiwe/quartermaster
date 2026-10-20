@@ -3794,6 +3794,19 @@ def pull_only_plain_run_renders_pulled_copy():
     assert r.stdout.startswith("[seat-usage] pull-only cached"), r.stdout
     assert "KeyError" not in r.stdout and "| week 21% (resets in 2.0d; " in r.stdout, r.stdout
 
+@test
+def plans_line_names_each_vendor_plan():
+    now = 1_800_000_000
+    assert su.plans_line({}, now) is None, "no plan known, no line"
+    s = {"claude_plan": "claude_ai", "codex_plan": "plus", "codex_renews": False, "codex_renews_ts": now + 86400,
+         "cursor": "pro+", "cursor_renews": True, "grok": "SuperGrok", "grok_renews": False, "grok_renews_ts": now - 1,
+         "google_argon_week": 0}
+    ends = datetime.fromtimestamp(now + 86400).strftime("%Y-%m-%d")
+    assert su.plans_line(s, now) == ("plans    | claude Pro | chatgpt Plus, ends " + ends
+                                     + " | cursor Pro+ | grok SuperGrok | google AI Pro (label, not read)"), su.plans_line(s, now)
+    line = su.plans_line({"claude_plan": "claude_max_5x", "cursor": "x_super", "codex_plan": "?"}, now)
+    assert line == "plans    | claude Max 5x | cursor x_super", line
+
 
 def main():
     passed = failed = 0

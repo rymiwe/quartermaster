@@ -3936,6 +3936,39 @@ def lines_from_numbers(d, now=None):
         out.append(head("grok") + " | ".join(parts))
     return out
 
+# Vendor plan IDs to the names on the vendor's pricing page. An ID missing here
+# prints raw, so a new or changed plan shows up instead of being guessed.
+PLAN_NAMES = {
+    "claude": {"claude_ai": "Pro", "claude_pro": "Pro", "claude_max_5x": "Max 5x", "claude_max_20x": "Max 20x"},
+    "chatgpt": {"free": "Free", "plus": "Plus", "prolite": "Pro $100", "pro": "Pro $200"},
+    "cursor": {"free": "Free", "pro": "Pro", "pro+": "Pro+", "ultra": "Ultra"},
+}
+PLAN_KEYS = (("claude", "claude_plan", "claude_renews"), ("chatgpt", "codex_plan", "codex_renews"),
+             ("cursor", "cursor", "cursor_renews"), ("grok", "grok", "grok_renews"))
+
+def plans_line(summary, now=None):
+    """One line naming each seat's plan as its vendor reported it, or None when no seat has one.
+
+    Google's tier is a fixed label (agy /usage does not report it) and Muse reports none.
+    A plan set to end gets its end date while that date is still ahead.
+    """
+    now = NOW if now is None else now
+    parts = []
+    for seat, key, renews_key in PLAN_KEYS:
+        raw = summary.get(key)
+        if not isinstance(raw, str) or not raw or raw == "?":
+            continue
+        name = PLAN_NAMES.get(seat, {}).get(raw.lower().replace("default_", ""), raw)
+        ends = summary.get(f"{renews_key}_ts")
+        if summary.get(renews_key) is False and _is_number(ends) and ends > now:
+            name += ", ends " + datetime.fromtimestamp(ends).strftime("%Y-%m-%d")
+        parts.append(f"{seat} {name}")
+    if not parts:
+        return None
+    if any(k.startswith("google_") for k in summary):
+        parts.append("google AI Pro (label, not read)")
+    return "plans    | " + " | ".join(parts)
+
 def print_cached():
     """--cached: print the last run's lines from the cache, no network. For the
     synchronous SessionStart hook; the async hook refreshes the cache."""
@@ -3964,6 +3997,9 @@ def print_cached():
         print("  " + muse_line())
         return
     print(header)
+    pline = plans_line(d, NOW)
+    if pline:
+        print("  " + pline)
     for line in seats:
         print(line)
     # Cached Google row only. --cached does not run agy.
@@ -3977,6 +4013,9 @@ def print_cached():
 
 def _print_full(lines, burn):
     print("[seat-usage] " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ"))
+    pline = plans_line(SUMMARY)
+    if pline:
+        print("  " + pline)
     for l in lines:
         print("  " + l)
     gline = google_line(SUMMARY)
