@@ -260,6 +260,10 @@ def gh_get(path):
 def land(raw):
     """Write the filtered copy (and Muse's file) on the reader. Returns the copy."""
     copy = build_cache_copy(raw)
+    # Set here, after the filter, so only --pull marks a copy (the allowlist
+    # drops any pulled_ts that arrives in the gist). seat-usage's routes allow
+    # a pulled reading ROUTE_FRESH_PULLED_S instead of ROUTE_FRESH_S.
+    copy["pulled_ts"] = time.time()
     write_json(CACHE, copy)
     m = muse_doc(copy)
     if m is not None:
