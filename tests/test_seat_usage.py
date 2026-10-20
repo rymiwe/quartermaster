@@ -49,7 +49,7 @@ def snap(**kw):
     s = {
         "v": 1,
         "ts": NOW,
-        "as_of": {"claude": NOW, "chatgpt": NOW, "cursor": NOW, "grokbot": NOW, "grok": NOW, "muse": NOW},
+        "as_of": {"claude": NOW, "chatgpt": NOW, "cursor": NOW, "grokbot": NOW, "grok": NOW, "muse": NOW, "google": NOW},
         "claude_5h": 10,
         "claude_5h_reset_ts": NOW + 4 * 3600,
         "claude_week": 10,
@@ -75,6 +75,10 @@ def snap(**kw):
         "muse_5h_reset_ts": NOW + 4 * 3600,
         "muse_week": 10,
         "muse_week_reset_ts": NOW + 3 * 86400,
+        "google_claudegpt_5h": 10,
+        "google_claudegpt_5h_reset_ts": NOW + 4 * 3600,
+        "google_claudegpt_week": 10,
+        "google_claudegpt_week_reset_ts": NOW + 3 * 86400,
     }
     s.update(kw)
     if as_of is not None:
@@ -245,11 +249,14 @@ def builder_cursor_capped_uses_supergrok_until_that_pool_is_capped_too():
     assert ok["mode"] == "suggest" and ok["seat"] == "claude" and ok["family"] == "opus", ok
     assert ok["effort"] == "low" and ok["variant"] == "-", ok
     assert ok["reason"] == "claude weekly all under pace: score 0.36 (fit 0.40, headroom 1.00, cost 4, lose-it 0.00)", ok
-    blocked = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_week=100, claude_5h=10), NOW)
+    agy = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_week=100, claude_5h=10), NOW)
+    assert (agy["mode"], agy["seat"], agy["family"], agy["effort"]) == ("suggest", "google", "opus", "low"), agy
+    blocked = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_week=100, claude_5h=10,
+                                       google_claudegpt_week=100), NOW)
     assert blocked["mode"] == "ask" and blocked["seat"] == "cursor" and blocked["family"] == "grok", blocked
     assert blocked["effort"] == "high" and blocked["variant"] == "fast", blocked
-    assert blocked["reason"] == "Max weekly capped: ask Ryan", blocked
-    unknown = snap(cursor_auto_pct=100, grok_pct=100, claude_5h=10)
+    assert blocked["reason"] == "Google Claude/GPT weekly capped: ask Ryan", blocked
+    unknown = snap(cursor_auto_pct=100, grok_pct=100, claude_5h=10, google_claudegpt_week=100)
     del unknown["claude_week"]
     u = su.route("builder", unknown, NOW)
     assert u["mode"] == "ask" and u["reason"].endswith("fix the failed reading, then ask Ryan"), u
@@ -268,9 +275,12 @@ def chair_uses_supergrok_when_cursor_is_capped_and_opus_only_when_both_are_dead(
     native = su.route("chair", snap(cursor_auto_pct=100, grok_pct=10, grok_exhausted=False, claude_week=10, claude_5h=10), NOW)
     assert native["mode"] == "default" and native["seat"] == "grok" and native["family"] == "grok", native
     assert native["effort"] == "high" and native["variant"] == "-", native
-    none = su.route("chair", snap(cursor_auto_pct=100, grok_pct=100, claude_week=100, claude_5h=100), NOW)
+    agy = su.route("chair", snap(cursor_auto_pct=100, grok_pct=100, claude_week=100, claude_5h=100), NOW)
+    assert (agy["seat"], agy["family"], agy["effort"]) == ("google", "opus", "high"), agy
+    none = su.route("chair", snap(cursor_auto_pct=100, grok_pct=100, claude_week=100, claude_5h=100,
+                                  google_claudegpt_week=100), NOW)
     assert none["mode"] == "ask" and none["seat"] == "cursor", none
-    assert none["reason"] == "Max weekly capped: ask Ryan", none
+    assert none["reason"] == "Google Claude/GPT weekly capped: ask Ryan", none
 
 
 @test
@@ -434,6 +444,8 @@ def hook_role_mapping():
     assert hook.command_role("FOO=1 codex exec") == "hard-bug"
     assert hook.command_role("FOO=1 BAR=2 codex exec -m a") == "hard-bug"
     assert hook.command_role("/x/bin/cursor-agent") == "builder"
+    assert hook.command_role("agy -p --model claude-opus-5-5-low 'fix it'") == "builder"
+    assert hook.command_role("agy models") is None
     assert hook.command_role("claude -p --model fable") == "bounded-question"
     assert hook.command_role("claude -p --permission-mode bypassPermissions --model=fable") == "bounded-question"
     assert hook.command_role("claude -p --model opus") == "builder"
@@ -513,8 +525,9 @@ def f4_zero_5h_without_reset_is_open():
     assert past["mode"] == "suggest" and past["family"] == "opus", past
     used = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_5h=1, claude_5h_reset_ts=None), NOW)
     assert used["mode"] == "suggest" and used["family"] == "opus", used
-    full = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_5h=100, claude_5h_reset_ts=None), NOW)
-    assert full["mode"] == "ask" and "Max 5h" in full["reason"], full
+    full = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_5h=100, claude_5h_reset_ts=None,
+                                    google_claudegpt_5h=100), NOW)
+    assert full["mode"] == "ask" and "5h" in full["reason"], full
 
 
 @test
@@ -3852,14 +3865,25 @@ def seat_rows_mirror_the_status_line_groups():
     assert [b["name"] for b in rows["cx"]["bars"]] == ["cx 5h", "cx"]
     assert rows["cx"]["bars"][0]["stale_name"] == "cx" and "stale_name" not in rows["cx"]["bars"][1]
     assert rows["cu"]["bars"][-1] == {"kind": "empty", "name": "bot", "seat": "grokbot", "reset_ts": s["bot_reset_ts"]}
-    assert [(b["name"], b["pct"]) for b in rows["gg"]["bars"]] == [("argon", 4)], rows["gg"]
+    assert [(b["name"], b["pct"]) for b in rows["gg"]["bars"]] == [("argon", 4), ("c/g", 10)], rows["gg"]
     # A failed read, an ended ChatGPT term, and no Google keys at all.
-    s2 = snap(codex_renews=False, codex_renews_ts=NOW - 60)
+    s2 = {k: v for k, v in snap(codex_renews=False, codex_renews_ts=NOW - 60).items() if not k.startswith("google_")}
     s2["as_of"] = {k: v for k, v in s2["as_of"].items() if k != "grok"}
     rows = {g["id"]: g for g in su.seat_rows(s2, NOW)}
     assert rows["cx"]["bars"] == [{"kind": "off", "name": "cx", "seat": "chatgpt"}], rows["cx"]
     assert rows["gk"]["bars"] == [{"kind": "failed", "name": "gk", "seat": "grok"}], rows["gk"]
     assert "gg" not in rows
+
+
+@test
+def google_opus_pool_wins_only_when_the_pools_ahead_of_it_cannot():
+    s = snap()
+    assert su.route("builder", s, NOW)["seat"] != "google"
+    capped = dict(s, grok_exhausted=True, cursor_auto_pct=100, claude_week=99)
+    r = su.route("builder", capped, NOW)
+    assert (r["seat"], r["family"], r["effort"]) == ("google", "opus", "low"), r
+    held = dict(capped, google_claudegpt_5h=100)
+    assert su.route("builder", held, NOW)["seat"] != "google", "the 5h window blocks the weekly pool"
 
 
 def main():

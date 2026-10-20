@@ -55,14 +55,14 @@
       "default": {"seat": "chatgpt", "family": "astra", "effort": "low", "variant": "-"}
     },
     "builder": {
-      "seats": ["cursor", "grok", "claude"],
+      "seats": ["cursor", "grok", "claude", "google"],
       "primary": "cursor_models",
       "on_unknown": "fallthrough",
       "under_mode": "default",
       "default": {"seat": "cursor", "family": "grok", "effort": "high", "variant": "fast"}
     },
     "chair": {
-      "seats": ["cursor", "grok", "claude"],
+      "seats": ["cursor", "grok", "claude", "google"],
       "primary": "cursor_models",
       "on_unknown": "fallthrough",
       "under_mode": "default",
@@ -262,6 +262,59 @@
       "facts": {"context": 200000, "limits": "Cursor other models, monthly", "window": "month"},
       "strengths": {
         "bounded-question": {"provider": 0.25, "prior": 0.25}
+      }
+    },
+    "google_opus_5h": {
+      "enabled": true,
+      "seat": "google",
+      "label": "google claude/gpt 5h",
+      "ask_label": "Google Claude/GPT 5h",
+      "family": "opus",
+      "models": ["opus"],
+      "serves": ["opus"],
+      "only": ["agy"],
+      "cost_tier": 2,
+      "pace": true,
+      "near_cap": true,
+      "lose_it": false,
+      "variant": "-",
+      "usage": {
+        "used": "google_claudegpt_5h",
+        "reset": "google_claudegpt_5h_reset_ts",
+        "window_s": 18000,
+        "as_of": "google"
+      },
+      "facts": {"context": 200000, "limits": "Google AI plan, Claude and GPT models, 5h", "window": "5h"}
+    },
+    "google_opus_week": {
+      "enabled": true,
+      "seat": "google",
+      "label": "google claude/gpt weekly",
+      "ask_label": "Google Claude/GPT weekly",
+      "family": "opus",
+      "models": ["opus"],
+      "serves": ["opus"],
+      "only": ["agy"],
+      "cost_tier": 2,
+      "pace": true,
+      "near_cap": true,
+      "lose_it": true,
+      "burn": "claude/gpt weekly",
+      "blocked_by": ["google_opus_5h"],
+      "variant": "-",
+      "effort": "-",
+      "effort_by_role": {"builder": "low", "chair": "high"},
+      "burn_effort_by_role": {"builder": "high", "chair": "high"},
+      "usage": {
+        "used": "google_claudegpt_week",
+        "reset": "google_claudegpt_week_reset_ts",
+        "window_s": 604800,
+        "as_of": "google"
+      },
+      "facts": {"context": 200000, "limits": "Google AI plan, Claude and GPT models, weekly", "window": "7d"},
+      "strengths": {
+        "builder": {"provider": 0.38, "prior": 0.38},
+        "chair": {"provider": 0.35, "prior": 0.35}
       }
     },
     "grokbot": {

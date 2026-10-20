@@ -195,6 +195,10 @@ def command_role(command):
         if _model_arg(args) == "fable":
             return "bounded-question"
         return "builder"
+    if base == "agy":
+        if not any(t in ("-p", "--print", "--prompt") for t in args):
+            return None
+        return "builder"
     if base == "grok" and any(
         t == "-p" or t == "--prompt-file" or t.startswith("--prompt-file=") for t in args
     ):
