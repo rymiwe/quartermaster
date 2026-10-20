@@ -9,9 +9,21 @@ is secret (unlisted), so anyone holding its id can read these numbers.
   seat-usage-push --setup     create the secret gist, print its id
   seat-usage-push             refresh a stale cache, then push if it changed
   seat-usage-push --dry-run   print the payload, push nothing
+  seat-usage-push --pull      reader side: copy the gist's numbers into this
+                              machine's cache; never runs seat-usage
+  seat-usage-push --dry-run --cache   print the cache copy, push nothing
 
 A systemd --user timer runs it every 5 minutes (systemd/ in quartermaster).
 The widget is quartermaster's android/ and reads the gist through api.github.com.
+
+The same gist also carries CACHE_FILE, a copy of latest.json cut to
+CACHE_NUMBERS (numbers only), CACHE_FLAGS (true/false only) and as_of stamps
+for known seats. No string from the cache is copied: no plan, status, lines,
+errors, cookie flag or burn text. One machine (BLD) does every reading and
+pushes; a reader (the shared VM) runs --pull and draws meters from that copy
+without any vendor login. --pull filters again, so a gist edited by hand
+still cannot put a string into the reader's cache. It also writes Muse's
+muse-usage.json from the muse_* numbers so seat-meters can draw Muse.
 """
 import hashlib, json, os, subprocess, sys, time
 
@@ -23,6 +35,8 @@ SEAT_USAGE = f"{H}/.local/bin/seat-usage"
 CONFIG = f"{H}/.config/seat-usage/gist.json"
 STATE = f"{H}/.local/state/seat-usage/push.json"
 FILE = "seats.json"
+CACHE_FILE = "latest.json"
+MUSE_FILE = os.environ.get("SEAT_USAGE_MUSE_FILE") or f"{H}/.cache/quartermaster/muse-usage.json"
 STALE_S = 600          # same threshold as the status line
 HEARTBEAT_S = 1800     # push an unchanged payload this often so the widget's age stays honest
 WEEK = 7 * 86400
@@ -57,6 +71,55 @@ POOLS = [
              exhausted="grok_exhausted"),
     ]),
 ]
+
+
+# The reader's copy of latest.json: an allowlist, numbers only. Anything not
+# named here, and any value of the wrong type, is dropped.
+_GOOGLE = [f"google_{p}_{s}" for p in ("argon", "gemini", "claudegpt")
+           for s in ("week", "week_reset_ts", "5h", "5h_reset_ts")]
+CACHE_NUMBERS = frozenset([
+    "ts", "v",
+    "claude_5h", "claude_5h_reset_ts", "claude_week", "claude_week_reset_ts",
+    "fable", "fable_reset_ts", "claude_renews_ts",
+    "codex", "codex_reset_ts", "codex_window_s", "codex_5h", "codex_5h_reset_ts",
+    "codex_age_h", "codex_renews_ts",
+    "cursor_pct", "cursor_auto_pct", "cursor_api_pct", "cursor_reset_ts", "cursor_window_s",
+    "cursor_ondemand", "cursor_ondemand_limit",
+    "bot_pct", "bot_reset_ts", "bot_window_s",
+    "grok_pct", "grok_reset_ts", "grok_window_s", "grok_402_h", "grok_renews_ts",
+    "muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts",
+] + _GOOGLE)
+CACHE_FLAGS = frozenset(["bot_exhausted", "grok_exhausted", "claude_renews", "codex_renews",
+                         "cursor_renews", "grok_renews"])
+AS_OF_SEATS = frozenset(["claude", "chatgpt", "cursor", "grokbot", "grok", "muse", "google"])
+
+
+def _finite(v):
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and v == v and v not in (float("inf"), float("-inf")))
+
+
+def build_cache_copy(cache):
+    """latest.json cut to the allowlist. Pure. Strings never survive."""
+    cache = cache if isinstance(cache, dict) else {}
+    out = {k: cache[k] for k in CACHE_NUMBERS if _finite(cache.get(k))}
+    out.update({k: cache[k] for k in CACHE_FLAGS if isinstance(cache.get(k), bool)})
+    as_of = cache.get("as_of") if isinstance(cache.get("as_of"), dict) else {}
+    out["as_of"] = {k: v for k, v in as_of.items() if k in AS_OF_SEATS and _finite(v)}
+    out["v"] = 1
+    return out
+
+
+def muse_doc(copy):
+    """Muse's own file, rebuilt from the copied muse_* numbers. None without both windows."""
+    p5, r5, pw, rw = (copy.get(k) for k in ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts"))
+    if not all(_finite(v) for v in (p5, r5, pw, rw)):
+        return None
+    at = (copy.get("as_of") or {}).get("muse") or copy.get("ts")
+    iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+    return {"captured_at": iso(at) if _finite(at) else None,
+            "window": {"used_percent": p5, "window_duration_mins": 300, "resets_at": iso(r5)},
+            "weekly": {"used_percent": pw, "resets_at": iso(rw)}}
 
 
 def num(v):
@@ -168,7 +231,8 @@ def push():
         print("seat-usage-push: no seat-usage cache", file=sys.stderr)
         return 1
     body = content(build_payload(cache))
-    digest = hashlib.sha256(body.encode()).hexdigest()
+    copy = content(build_cache_copy(cache))
+    digest = hashlib.sha256((body + "\n" + copy).encode()).hexdigest()
     state = read_json(STATE) or {}
     now = time.time()
     if state.get("sha") == digest and now - (state.get("pushed_at") or 0) < HEARTBEAT_S:
@@ -176,7 +240,8 @@ def push():
     payload = json.loads(body)
     payload["pushed_at"] = now
     try:
-        gh_api("PATCH", f"gists/{cfg['id']}", {"files": {FILE: {"content": content(payload)}}})
+        gh_api("PATCH", f"gists/{cfg['id']}", {"files": {FILE: {"content": content(payload)},
+                                                         CACHE_FILE: {"content": copy}}})
     except Exception as e:
         print(f"seat-usage-push: push failed: {e}", file=sys.stderr)
         return 1
@@ -184,11 +249,51 @@ def push():
     return 0
 
 
+def gh_get(path):
+    r = subprocess.run(["gh", "api", path], capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout).strip().splitlines()
+        raise RuntimeError(msg[-1] if msg else f"gh exited {r.returncode}")
+    return json.loads(r.stdout or "{}")
+
+
+def land(raw):
+    """Write the filtered copy (and Muse's file) on the reader. Returns the copy."""
+    copy = build_cache_copy(raw)
+    write_json(CACHE, copy)
+    m = muse_doc(copy)
+    if m is not None:
+        write_json(MUSE_FILE, m)
+    return copy
+
+
+def pull():
+    """Reader side. Never runs seat-usage and never needs a vendor login."""
+    cfg = read_json(CONFIG)
+    if not cfg or not cfg.get("id"):
+        print(f"seat-usage-push: no gist id; put {{\"id\": \"<gist id>\"}} in {CONFIG}", file=sys.stderr)
+        return 1
+    try:
+        f = (gh_get(f"gists/{cfg['id']}").get("files") or {}).get(CACHE_FILE) or {}
+        raw = json.loads(f.get("content") or "null")
+    except Exception as e:
+        print(f"seat-usage-push: pull failed: {e}", file=sys.stderr)
+        return 1
+    if not isinstance(raw, dict) or not _finite(raw.get("ts")):
+        print(f"seat-usage-push: gist has no {CACHE_FILE} yet; the pushing machine has not run", file=sys.stderr)
+        return 1
+    land(raw)
+    return 0
+
+
 def main():
     if "--setup" in sys.argv:
         return setup()
+    if "--pull" in sys.argv:
+        return pull()
     if "--dry-run" in sys.argv:
-        print(json.dumps(build_payload(read_json(CACHE) or {}), indent=2))
+        cache = read_json(CACHE) or {}
+        print(json.dumps(build_cache_copy(cache) if "--cache" in sys.argv else build_payload(cache), indent=2))
         return 0
     return push()
 

@@ -117,6 +117,145 @@ def empty_cache_still_has_vendor_seats():
     assert p["ts"] is None
 
 
+# --- reader copy: latest.json cut to numbers for the shared VM ---
+
+def strings_in(v, path="$"):
+    if isinstance(v, str):
+        return [path]
+    if isinstance(v, dict):
+        return [x for k, w in v.items() for x in strings_in(w, f"{path}.{k}")]
+    if isinstance(v, list):
+        return [path + "[]"]
+    return []
+
+
+def google_cache(**over):
+    c = full_cache(**{
+        "claude_plan": "max_5x", "claude_status": "active", "cursor": "pro+", "codex_source": "api",
+        "errors": {"google": "agy: not signed in as someone@example.com", "grok": "cookie expired"},
+        "burn": [{"seat": "claude", "pool": "fable"}], "grok_cookie_ok": True,
+        "google_gemini_week": 40, "google_gemini_week_reset_ts": NOW + 86400, "google_gemini_week_pace": "on",
+        "google_gemini_5h": 20, "google_gemini_5h_reset_ts": NOW + 3600,
+        "google_argon_week": 10, "google_argon_week_reset_ts": NOW + 5 * 86400,
+        "muse_5h": 35, "muse_5h_reset_ts": NOW + 7200, "muse_week": 50, "muse_week_reset_ts": NOW + 3 * 86400,
+        "cookie": "sso=SECRET", "token": "sk-SECRET", "email": "ryan@example.com",
+    })
+    c["as_of"] = dict(c["as_of"], google=NOW - 10, muse=NOW - 20, session="SECRET", bogus=NOW)
+    c.update(over)
+    return c
+
+
+@test
+def cache_copy_is_an_allowlist_of_numbers_and_flags():
+    c = sp.build_cache_copy(google_cache())
+    assert strings_in(c) == [], strings_in(c)
+    allowed = sp.CACHE_NUMBERS | sp.CACHE_FLAGS | {"as_of"}
+    assert set(c) <= allowed, sorted(set(c) - allowed)
+    for k, v in c.items():
+        if k == "as_of":
+            continue
+        if k in sp.CACHE_FLAGS:
+            assert isinstance(v, bool), (k, v)
+        else:
+            assert isinstance(v, (int, float)) and not isinstance(v, bool), (k, v)
+    body = json.dumps(c)
+    for leaked in ("SECRET", "example.com", "max_5x", "active", "pro+", "cookie", "token", "email", "lines",
+                   "errors", "burn", "codex_plan", "grok_cookie_ok", "_pace", "not signed in", "session"):
+        assert leaked not in body, leaked
+
+
+@test
+def cache_copy_keeps_the_numbers_meters_and_routing_need():
+    c = sp.build_cache_copy(google_cache())
+    assert c["claude_week"] == 40 and c["claude_week_reset_ts"] == NOW + 3 * 86400
+    assert c["google_gemini_week"] == 40 and c["google_gemini_5h_reset_ts"] == NOW + 3600
+    assert c["google_argon_week"] == 10 and c["cursor_api_pct"] == 61.2 and c["codex_window_s"] == WEEK
+    assert c["bot_exhausted"] is False and c["muse_week"] == 50 and c["ts"] == NOW and c["v"] == 1
+    assert c["as_of"] == {"claude": NOW - 60, "chatgpt": NOW - 120, "cursor": NOW - 30, "grokbot": NOW - 30,
+                          "grok": NOW - 90, "google": NOW - 10, "muse": NOW - 20}, c["as_of"]
+
+
+@test
+def cache_copy_drops_wrong_types():
+    c = sp.build_cache_copy(google_cache(claude_week="40", codex=True, grok_pct=float("nan"),
+                                         bot_exhausted="yes", cursor_api_pct=None))
+    for k in ("claude_week", "codex", "grok_pct", "bot_exhausted", "cursor_api_pct"):
+        assert k not in c, (k, c.get(k))
+    assert sp.build_cache_copy("not a dict") == {"as_of": {}, "v": 1}
+
+
+def _with_paths(t):
+    sp.CACHE, sp.MUSE_FILE = f"{t}/c/latest.json", f"{t}/q/muse-usage.json"
+    sp.CONFIG, sp.STATE = f"{t}/gist.json", f"{t}/push.json"
+
+
+@test
+def pull_lands_a_refiltered_copy_and_muse_file():
+    import tempfile
+    saved = (sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_get)
+    with tempfile.TemporaryDirectory() as t:
+        try:
+            _with_paths(t)
+            sp.write_json(sp.CONFIG, {"id": "abc123"})
+            hand_edited = google_cache()   # strings put straight into the gist file
+            calls = []
+            sp.gh_get = lambda path: calls.append(path) or {"files": {sp.CACHE_FILE: {"content": json.dumps(hand_edited)}}}
+            assert sp.pull() == 0
+            assert calls == ["gists/abc123"], calls
+            landed = json.load(open(sp.CACHE))
+            assert strings_in(landed) == [], strings_in(landed)
+            assert landed == sp.build_cache_copy(hand_edited)
+            m = json.load(open(sp.MUSE_FILE))
+            assert m["window"]["used_percent"] == 35 and m["window"]["window_duration_mins"] == 300
+            assert m["weekly"]["used_percent"] == 50
+            from datetime import datetime
+            for ts, want in ((m["window"]["resets_at"], NOW + 7200), (m["weekly"]["resets_at"], NOW + 3 * 86400),
+                             (m["captured_at"], NOW - 20)):
+                assert datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() == want, (ts, want)
+        finally:
+            sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_get = saved
+
+
+@test
+def pull_without_a_pushed_copy_changes_nothing():
+    import tempfile
+    saved = (sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_get)
+    with tempfile.TemporaryDirectory() as t:
+        try:
+            _with_paths(t)
+            assert sp.pull() == 1   # no gist id
+            sp.write_json(sp.CONFIG, {"id": "abc123"})
+            sp.gh_get = lambda path: {"files": {"seats.json": {"content": "{}"}}}
+            assert sp.pull() == 1
+            assert not os.path.exists(sp.CACHE) and not os.path.exists(sp.MUSE_FILE)
+        finally:
+            sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_get = saved
+
+
+@test
+def push_sends_the_widget_file_and_the_numbers_copy():
+    import tempfile
+    saved = (sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_api, sp.refresh_if_stale)
+    with tempfile.TemporaryDirectory() as t:
+        try:
+            _with_paths(t)
+            sp.write_json(sp.CONFIG, {"id": "abc123"})
+            sp.write_json(sp.CACHE, google_cache())
+            sent = []
+            sp.gh_api = lambda method, path, body: sent.append((method, path, body)) or {}
+            sp.refresh_if_stale = lambda: None
+            assert sp.push() == 0
+            (method, path, body), = sent
+            assert (method, path) == ("PATCH", "gists/abc123")
+            assert set(body["files"]) == {"seats.json", "latest.json"}, body
+            copy = json.loads(body["files"]["latest.json"]["content"])
+            assert copy == sp.build_cache_copy(google_cache())
+            assert "SECRET" not in json.dumps(body) and "example.com" not in json.dumps(body)
+            assert sp.push() == 0 and len(sent) == 1   # unchanged: no second push inside the heartbeat
+        finally:
+            sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_api, sp.refresh_if_stale = saved
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:
