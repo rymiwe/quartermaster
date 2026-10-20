@@ -14,7 +14,7 @@ except ImportError:
         import pytest
         pytest.skip("Pillow not installed", allow_module_level=True)
 NOW = time.time()
-BLUE, TRACK = (0x5b, 0x8f, 0xd6), (0x2a, 0x33, 0x40)
+BLUE, TRACK, RED = (0x5b, 0x8f, 0xd6), (0x2a, 0x33, 0x40), (0xc4, 0x3c, 0x3c)
 iso = lambda ts: datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def muse_doc(now=NOW):
@@ -106,6 +106,77 @@ def test_expired_5h_window_draws_no_bar():
         expired = Image.open(out).size[1]
         render(t, {**cache, "claude_5h_reset_ts": NOW + 3600}, muse_doc())
         assert expired < Image.open(out).size[1]   # the 5h line is gone
+
+def _epoch(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+def test_google_group_is_its_own_color_in_both_layouts():
+    """Numbers match tests/fixtures/agy-usage.tsv: remaining 100/100/99 -> used 0/0/1."""
+    week = _epoch("2026-10-27T01:39:26Z")
+    five = _epoch("2026-10-20T06:39:26Z")
+    argon = _epoch("2026-10-27T01:38:40Z")
+    google = {
+        "google_argon_week": 1, "google_argon_week_reset_ts": argon,
+        "google_gemini_week": 0, "google_gemini_week_reset_ts": week,
+        "google_gemini_5h": 0, "google_gemini_5h_reset_ts": five,
+        "google_claudegpt_week": 0, "google_claudegpt_week_reset_ts": week,
+        "google_claudegpt_5h": 0, "google_claudegpt_5h_reset_ts": five,
+    }
+    GOOGLE = (0x54, 0x68, 0xf0)
+    with tempfile.TemporaryDirectory() as t:
+        base = {"ts": NOW}
+        plain, plain_out = render(t, base)
+        assert plain.returncode == 0, plain.stderr
+        def colors(path):
+            im = Image.open(path).convert("RGB")
+            w, h = im.size
+            return im, {im.getpixel((x, y)) for y in range(h) for x in range(w)}
+        plain_im, plain_px = colors(plain_out)
+        plain_h = plain_im.size[1]
+        wide, wide_out = render(t, {**base, **google})
+        assert wide.returncode == 0, wide.stderr
+        wide_im, wide_px = colors(wide_out)
+        wide_h = wide_im.size[1]
+        phone, phone_out = render(t, {**base, **google}, None, "--phone")
+        assert phone.returncode == 0, phone.stderr
+        phone_im, phone_px = colors(phone_out)
+        assert GOOGLE in wide_px
+        assert GOOGLE in phone_px
+        assert GOOGLE not in plain_px
+        assert wide_h > plain_h
+        assert phone_im.size[0] == 3 * 390
+        weekly_only = {k: v for k, v in google.items() if not k.endswith("_5h") and "5h_reset" not in k}
+        short, short_out = render(t, {**base, **weekly_only})
+        assert short.returncode == 0, short.stderr
+        assert Image.open(short_out).size[1] < wide_h
+
+
+def test_phone_5h_track_stops_before_its_label():
+    """A weekly window near its reset used to push the 5h track under its "5h N%" text."""
+    cache = {"ts": NOW, "google_gemini_week": 5, "google_gemini_week_reset_ts": NOW + 86400,
+             "google_gemini_5h": 20, "google_gemini_5h_reset_ts": NOW + 3 * 3600}
+    with tempfile.TemporaryDirectory() as t:
+        r, out = render(t, cache, None, "--phone")
+        assert r.returncode == 0, r.stderr
+        im = Image.open(out).convert("RGB"); w, h = im.size
+        # track rows form two bands, weekly then 5h; the 5h band is the lower one
+        rows = [y for y in range(h) if any(im.getpixel((x, y)) in (TRACK, BLUE) for x in range(0, w, 2))]
+        bands = [[rows[0]]] if rows else []
+        for y in rows[1:]:
+            (bands[-1].append(y) if y - bands[-1][-1] <= 1 else bands.append([y]))
+        assert len(bands) == 2, bands
+        five = bands[1]
+        S, PAD, W = 3, 18, 390  # phone layout: 3x scale, 18px pad, 390px wide
+        lo, hi = (PAD - 8 + 4) * S, (W - PAD + 8 - 6) * S  # inside the card: skip its left stripe and right edge
+        INK = (0xe6, 0xeb, 0xf2)
+        bar = {x for y in five for x in range(lo, hi) if im.getpixel((x, y)) in (TRACK, BLUE, RED)}
+        assert bar, "no 5h track drawn"
+        def dim_text(p):  # DIM (#8a96a8) label text, antialiased against the card: grey and clearly lit
+            return p not in (TRACK, BLUE, RED, INK) and max(p) - min(p) < 48 and sum(p) / 3 > 90
+        ink = {x for y in five for x in range(lo, hi) if dim_text(im.getpixel((x, y)))}
+        assert ink, "no 5h label drawn"
+        assert max(bar) < min(ink) or max(ink) < min(bar), (min(bar), max(bar), min(ink), max(ink))
 
 if __name__ == "__main__":
     if Image is None:

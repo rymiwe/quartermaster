@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Draw seat-usage meters as a PNG from the cached summary, laid out like orderly:
-one shared time scale, every row's pace tick on a single "now" line. No network calls."""
+one shared time scale, every row's pace tick on a single "now" line. No network calls.
+Google AI Pro is its own group: Argon weekly, plus Gemini and Claude/GPT."""
 import json, os, sys, time
 from datetime import datetime
 try:
@@ -12,7 +13,8 @@ CACHE = os.environ.get("SEAT_USAGE_CACHE", os.path.expanduser("~/.cache/seat-usa
 ARGS = [a for a in sys.argv[1:] if a != "--phone"]; PHONE = "--phone" in sys.argv[1:]
 OUT = ARGS[0] if ARGS else os.path.join(os.environ.get("TMPDIR") or "/tmp", "seat-meters.png")
 BG, INK, DIM, TRACK = "#141a22", "#e6ebf2", "#8a96a8", "#2a3340"
-BLUE, RED = "#5b8fd6", "#c43c3c"
+BLUE, RED, GOOGLE = "#5b8fd6", "#c43c3c", "#5468f0"
+GOOGLE_LABELS = {"Argon", "Gemini", "Claude/GPT"}
 H5, WK = 5 * 3600, 7 * 86400
 d = json.load(open(CACHE)); now = time.time()
 
@@ -30,6 +32,12 @@ add("Cursor other", seat(d.get("cursor_api_pct"), d.get("cursor_reset_ts"), d.ge
 add("Cursor models", seat(d.get("cursor_auto_pct"), d.get("cursor_reset_ts"), d.get("cursor_window_s")))
 add("Grok Bot", seat(d.get("bot_pct"), d.get("bot_reset_ts"), d.get("bot_window_s") or WK))
 add("SuperGrok", seat(d.get("grok_pct"), d.get("grok_reset_ts"), d.get("grok_window_s") or WK))
+# Google AI Pro. Percents in the cache are already used (100 - agy's remaining).
+add("Argon", seat(d.get("google_argon_week"), d.get("google_argon_week_reset_ts"), WK))
+add("Gemini", seat(d.get("google_gemini_week"), d.get("google_gemini_week_reset_ts"), WK),
+    seat(d.get("google_gemini_5h"), d.get("google_gemini_5h_reset_ts"), H5))
+add("Claude/GPT", seat(d.get("google_claudegpt_week"), d.get("google_claudegpt_week_reset_ts"), WK),
+    seat(d.get("google_claudegpt_5h"), d.get("google_claudegpt_5h_reset_ts"), H5))
 
 # Muse is not in the main cache: read seat-usage's own Muse file. A missing,
 # unreadable or stale file (a reset already passed) draws a "no reading" row.
@@ -73,22 +81,26 @@ else:
     W, PAD, LBL, MW, VAL = 600, 14, 112, 330, 120
     row_h = lambda r: 40 if r[2] else 26
 X0 = PAD + LBL
-NGROUPS = len({{"Cursor models": "c", "Cursor other": "c", "Grok Bot": "c"}.get(r[0], r[0]) for r in rows}) if PHONE else 0
-Ht = PAD * 2 + 26 + 32 * NGROUPS + sum(row_h(r) for r in rows) + (16 * len(errs) + 8 if errs else 0)
+_PHONE_GROUP = {"Cursor models": "Cursor", "Cursor other": "Cursor", "Grok Bot": "Cursor",
+                "Argon": "Google", "Gemini": "Google", "Claude/GPT": "Google"}
+NGROUPS = len({_PHONE_GROUP.get(r[0], r[0]) for r in rows}) if PHONE else 0
+ghead = 16 if (not PHONE and any(r[0] in GOOGLE_LABELS for r in rows)) else 0
+Ht = PAD * 2 + 26 + 32 * NGROUPS + ghead + sum(row_h(r) for r in rows) + (16 * len(errs) + 8 if errs else 0)
 img = Image.new("RGB", (W * S, Ht * S), BG); g = ImageDraw.Draw(img)
 P = lambda v: int(v * S)
 
 def left_txt(s):
     return f"{s/3600:.1f}h" if s < 2 * 86400 else f"{s/86400:.1f}d"
 
-def track(st, y, h, width_frac):
+def track(st, y, h, width_frac, right=None, left=None):
     """Draw one track whose own tick lands on the shared now line."""
     nx = X0 + MW * nowfrac
     tw = MW * width_frac
     # Keep the track inside the meter area: shrink it (tick still on now) if it would spill.
-    if st["e"] > 0: tw = min(tw, (nx - X0) / st["e"])
-    if st["e"] < 1: tw = min(tw, (X0 + MW - nx) / (1 - st["e"]))
+    if st["e"] > 0: tw = min(tw, (nx - (left if left is not None else X0)) / st["e"])
+    if st["e"] < 1: tw = min(tw, ((right if right is not None else X0 + MW) - nx) / (1 - st["e"]))
     tx = nx - tw * st["e"]
+    if tw < h: return  # no room left for a track that keeps its tick on now
     g.rounded_rectangle((P(tx), P(y), P(tx + tw), P(y + h)), radius=P(h / 2), fill=TRACK)
     fw = tw * min(st["pct"], 100) / 100
     if fw > 0:
@@ -109,7 +121,12 @@ def track(st, y, h, width_frac):
 g.text((P(PAD), P(PAD)), "Seat usage", font=FB, fill=INK)
 g.text((P(W - PAD), P(PAD)), f"as of {int((now - d.get('ts', now)) / 60)} min ago", font=FS, fill=DIM, anchor="ra")
 y = PAD + 30; top = y
+g0 = g1 = None
 for label, m, f in (rows if not PHONE else []):
+    if label in GOOGLE_LABELS and g0 is None:
+        g.text((P(PAD), P(y + 8)), "GOOGLE AI PRO", font=FS, fill=GOOGLE, anchor="lm")
+        y += 16
+        g0 = y
     h = row_h((label, m, f)); cy = y + 10
     g.text((P(PAD), P(cy)), label, font=F, fill=INK, anchor="lm")
     wf = m["w"] / span if m else 0.5
@@ -126,16 +143,24 @@ for label, m, f in (rows if not PHONE else []):
         g.text((P(X0 + MW + 12), P(cy + 14)), f"5h {f['pct']:.0f}%", font=FS, fill=DIM, anchor="lm")
         g.text((P(W - PAD), P(cy + 14)), left_txt(f["left"]), font=FS, fill=DIM, anchor="rm")
     y += h
+    if label in GOOGLE_LABELS:
+        g1 = y
+if g0 is not None and g1 is not None:
+    g.rectangle((P(4), P(g0), P(7), P(g1 - 4)), fill=GOOGLE)
 # Phone layout groups pools by subscription, like orderly (Grok Bot bills the Cursor seat).
 CPLAN = {"plus": "Plus", "pro": "Pro"}.get(str(d.get("codex_plan") or ""), str(d.get("codex_plan") or "").title())
 GROUP = {"Claude": ("Claude", "Weekly"), "ChatGPT": (("ChatGPT " + CPLAN).strip(), "Weekly"),
          "Cursor models": ("Cursor Pro+", "Cursor Models"), "Cursor other": ("Cursor Pro+", "Other Models"),
-         "Grok Bot": ("Cursor Pro+", "Grok Bot"), "SuperGrok": ("SuperGrok", "Weekly"), "Muse": ("Muse", "Weekly")}
-ORDER = ["Claude", "ChatGPT", "Cursor models", "Cursor other", "Grok Bot", "SuperGrok", "Muse"]
+         "Grok Bot": ("Cursor Pro+", "Grok Bot"), "SuperGrok": ("SuperGrok", "Weekly"),
+         "Argon": ("Google AI Pro", "Argon"), "Gemini": ("Google AI Pro", "Gemini"),
+         "Claude/GPT": ("Google AI Pro", "Claude/GPT"), "Muse": ("Muse", "Weekly")}
+ORDER = ["Claude", "ChatGPT", "Cursor models", "Cursor other", "Grok Bot", "SuperGrok",
+         "Argon", "Gemini", "Claude/GPT", "Muse"]
 if PHONE:
     rows.sort(key=lambda r: ORDER.index(r[0]) if r[0] in ORDER else 99)
     # orderly's dark-theme vendor hues: 3px left rule, 16% tint on the header, 9% on the rows
-    HUE = {"Claude": "#ff8700", "ChatGPT": "#af87ff", "Cursor": "#00d7af", "SuperGrok": "#5fafff", "Muse": "#ff87d7"}
+    HUE = {"Claude": "#ff8700", "ChatGPT": "#af87ff", "Cursor": "#00d7af", "SuperGrok": "#5fafff",
+           "Google": GOOGLE, "Muse": "#ff87d7"}
     def hue(grp): return next((v for k, v in HUE.items() if grp.startswith(k)), DIM)
     def mix(c, a):
         c, b = [int(c[i:i + 2], 16) for i in (1, 3, 5)], [int(BG[i:i + 2], 16) for i in (1, 3, 5)]
@@ -168,8 +193,16 @@ if PHONE:
             g.text((P(W - PAD), P(ty)), "no reading", font=FS, fill=DIM, anchor="rm")
         if f:
             wf = m["w"] / span if m else 0.5
-            track(f, ty + 34, 6, wf)
-            g.text((P(W - PAD), P(ty + 37)), f"5h {f['pct']:.0f}%  \u00b7  {left_txt(f['left'])}", font=FS, fill=DIM, anchor="rm")
+            ftxt = f"5h {f['pct']:.0f}%  \u00b7  {left_txt(f['left'])}"
+            # keep the 5h track and its label apart: label on the right unless
+            # the now line is too close to it, then label on the left
+            lw = g.textlength(ftxt, font=FS) / S + 10
+            if W - PAD - lw - (X0 + MW * nowfrac) >= 12:
+                track(f, ty + 34, 6, wf, right=W - PAD - lw)
+                g.text((P(W - PAD), P(ty + 37)), ftxt, font=FS, fill=DIM, anchor="rm")
+            else:
+                track(f, ty + 34, 6, wf, left=PAD + lw)
+                g.text((P(PAD), P(ty + 37)), ftxt, font=FS, fill=DIM, anchor="lm")
         nxr = X0 + MW * nowfrac  # tick only through this row's bars, never over text
         g.line((P(nxr), P(ty + 14), P(nxr), P(ty + (44 if f else 32))), fill=INK, width=P(1.5))
         y += h
