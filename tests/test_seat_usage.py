@@ -933,11 +933,14 @@ def seat_http_sandbox(profile_url, usage_url):
         "ANTHROPIC_PROFILE_URL": su.ANTHROPIC_PROFILE_URL,
         "ANTHROPIC_USAGE_URL": su.ANTHROPIC_USAGE_URL,
         "USAGE_MIN_INTERVAL_S": su.USAGE_MIN_INTERVAL_S,
+        "RENEWALS_FILE": su.RENEWALS_FILE,
     }
     fns = {name: getattr(su, name) for name in ("codex", "cursor", "grok")}
-    old_env = {key: os.environ.get(key) for key in ("NO_PROXY", "no_proxy")}
+    old_env = {key: os.environ.get(key) for key in ("NO_PROXY", "no_proxy", "SEAT_USAGE_SKIP_GOOGLE")}
     os.environ["NO_PROXY"] = "*"
     os.environ["no_proxy"] = "*"
+    # Never run the real agy from a test.
+    os.environ["SEAT_USAGE_SKIP_GOOGLE"] = "1"
     try:
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as cache:
             os.makedirs(os.path.join(home, ".claude"))
@@ -945,6 +948,8 @@ def seat_http_sandbox(profile_url, usage_url):
                 json.dump({"claudeAiOauth": {"accessToken": "fixture-token"}}, f)
             su.H = home
             su.HISTORY = os.path.join(home, "history.jsonl")
+            # RENEWALS_FILE is resolved from the real home at import; a real term end would cap every Claude pool.
+            su.RENEWALS_FILE = os.path.join(home, ".config", "seat-usage", "renewals.json")
             su.CACHE_DIR = cache
             su.CACHE = os.path.join(cache, "latest.json")
             su.ANTHROPIC_PROFILE_URL = profile_url
