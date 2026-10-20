@@ -107,6 +107,51 @@ def test_expired_5h_window_draws_no_bar():
         render(t, {**cache, "claude_5h_reset_ts": NOW + 3600}, muse_doc())
         assert expired < Image.open(out).size[1]   # the 5h line is gone
 
+def _epoch(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+def test_google_group_is_its_own_color_in_both_layouts():
+    """Numbers match tests/fixtures/agy-usage.tsv: remaining 100/100/99 -> used 0/0/1."""
+    week = _epoch("2026-10-27T01:39:26Z")
+    five = _epoch("2026-10-20T06:39:26Z")
+    argon = _epoch("2026-10-27T01:38:40Z")
+    google = {
+        "google_argon_week": 1, "google_argon_week_reset_ts": argon,
+        "google_gemini_week": 0, "google_gemini_week_reset_ts": week,
+        "google_gemini_5h": 0, "google_gemini_5h_reset_ts": five,
+        "google_claudegpt_week": 0, "google_claudegpt_week_reset_ts": week,
+        "google_claudegpt_5h": 0, "google_claudegpt_5h_reset_ts": five,
+    }
+    GOOGLE = (0x42, 0x85, 0xf4)
+    with tempfile.TemporaryDirectory() as t:
+        base = {"ts": NOW}
+        plain, plain_out = render(t, base)
+        assert plain.returncode == 0, plain.stderr
+        def colors(path):
+            im = Image.open(path).convert("RGB")
+            w, h = im.size
+            return im, {im.getpixel((x, y)) for y in range(h) for x in range(w)}
+        plain_im, plain_px = colors(plain_out)
+        plain_h = plain_im.size[1]
+        wide, wide_out = render(t, {**base, **google})
+        assert wide.returncode == 0, wide.stderr
+        wide_im, wide_px = colors(wide_out)
+        wide_h = wide_im.size[1]
+        phone, phone_out = render(t, {**base, **google}, None, "--phone")
+        assert phone.returncode == 0, phone.stderr
+        phone_im, phone_px = colors(phone_out)
+        assert GOOGLE in wide_px
+        assert GOOGLE in phone_px
+        assert GOOGLE not in plain_px
+        assert wide_h > plain_h
+        assert phone_im.size[0] == 3 * 390
+        weekly_only = {k: v for k, v in google.items() if not k.endswith("_5h") and "5h_reset" not in k}
+        short, short_out = render(t, {**base, **weekly_only})
+        assert short.returncode == 0, short.stderr
+        assert Image.open(short_out).size[1] < wide_h
+
+
 if __name__ == "__main__":
     if Image is None:
         print("skip: Pillow not installed"); sys.exit(0)

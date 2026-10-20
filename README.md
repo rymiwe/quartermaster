@@ -15,7 +15,7 @@ Snapshot of Ryan's "router core": `seat-usage` (reads per-seat/pool usage for Cl
 | `tests/test_seat_usage.py` | test suite (only the two path constants changed, see Tests) |
 | `renewals.example.json` | placeholder for `~/.config/seat-usage/renewals.json` (same schema, placeholder values) |
 | `install.sh` | links or copies the two commands into the frozen paths |
-| `bin/seat-meters` | optional: draws the cached reading as an orderly-style PNG (needs Pillow; no network). `seat-meters [--phone] [out.png]` (`--phone`: tall layout grouped by subscription), cache path from `SEAT_USAGE_CACHE` |
+| `bin/seat-meters` | optional: draws the cached reading as an orderly-style PNG (needs Pillow; no network). `seat-meters [--phone] [out.png]` (`--phone`: tall layout grouped by subscription), cache path from `SEAT_USAGE_CACHE`. Google AI Pro is its own group in both layouts |
 | `bin/seat-usage-push` | optional: copies an allowlist of the cache to a secret gist for the phone widget |
 | `systemd/` | the `seat-usage-push` timer (every 5 minutes) |
 | `android/` | Seats, the Android home-screen widget that reads that gist |
@@ -76,6 +76,14 @@ On Windows, run the script from Git Bash. Command Prompt and PowerShell cannot r
 Off by default. With `QUARTERMASTER_AUTO_UPDATE=1`, a run from a clean checkout of `main` fetches and fast-forwards at most once every 24 hours, then starts again so the new code runs. The timestamp is `~/.cache/quartermaster/seat-usage-update`, beside Conclave's `muse-usage.json`. The command prints `[seat-usage] updated` when the checkout moves.
 
 The check does not stash, reset, or overwrite local changes. A dirty tree, a branch other than `main`, a detached HEAD, a missing network, or any git error skips it and prints nothing. `--route`, `--quiet`, `--cached`, `COUNCIL_VOTER=1`, and `CONCLAVE_VOTER=1` skip it. Without the opt-in, `seat-usage` never fetches. `QUARTERMASTER_NO_UPDATE=1` turns it off and wins over the opt-in. There is no background task.
+
+## Google AI Pro (Antigravity)
+
+`seat-usage` reads quota from the signed-in Antigravity CLI: `agy -p "/usage"`. The binary is `agy` on `PATH`, or `~/.local/bin/agy`. `SEAT_USAGE_AGY` overrides that path. The CLI prints one tab-separated row per window: pool, window label, percent remaining, reset time in UTC. The seat stores percent used (`100 - remaining`) for the Argon weekly window and for the Gemini and Claude/GPT weekly and 5-hour windows. Pace uses the same weekly and 5-hour windows as the other seats. A live check waits `SEAT_USAGE_MIN_INTERVAL_S` (default 10 minutes) before it runs `agy` again.
+
+A missing `agy`, a session that is not signed in, a non-zero exit, a timeout, or output that does not parse is an error line. No percent is invented. Numbers already in the cache stay until a later reading replaces them. `--cached` does not run `agy`. `SEAT_USAGE_SKIP_GOOGLE=1` skips the live check, as do `COUNCIL_VOTER=1` and `CONCLAVE_VOTER=1`.
+
+`seat-meters` draws those pools as their own Google AI Pro group, in Google blue (`#4285f4`), in the wide layout and in `--phone`. Argon is the weekly row. Gemini and Claude/GPT each have a weekly bar and a 5-hour bar. There is no Antigravity API call.
 
 ## Phone widget (optional)
 

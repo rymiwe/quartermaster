@@ -2907,6 +2907,154 @@ def cursor_fresh_cycle_without_total_spend():
     assert "$0.00 spent" in out[0], out
 
 
+AGY_FIXTURE = HERE / "fixtures" / "agy-usage.tsv"
+AGY_NOW = datetime.fromisoformat("2026-10-20T01:39:26+00:00").timestamp()
+
+
+def _agy_epoch(text):
+    return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+
+
+@contextlib.contextmanager
+def google_sandbox(interval=0):
+    saved = {name: getattr(su, name) for name in ("CACHE", "CACHE_DIR", "HISTORY", "USAGE_MIN_INTERVAL_S", "SUMMARY")}
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            su.CACHE_DIR = d
+            su.CACHE = os.path.join(d, "latest.json")
+            su.HISTORY = os.path.join(d, "history.jsonl")
+            su.USAGE_MIN_INTERVAL_S = interval
+            su.SUMMARY = {"ts": AGY_NOW, "as_of": {}, "v": 1}
+            yield d
+    finally:
+        for name, value in saved.items():
+            setattr(su, name, value)
+
+
+def _write_agy(directory, text, code=0):
+    path = Path(directory) / "agy"
+    path.write_text("#!/bin/sh\ncat <<'END'\n%s\nEND\nexit %d\n" % (text, code))
+    path.chmod(0o755)
+    return str(path)
+
+
+@test
+def agy_fixture_converts_remaining_to_used():
+    text = AGY_FIXTURE.read_text()
+    rows = {(item["pool"], item["window"]): item for item in su.parse_agy_usage(text)}
+    assert set(rows) == {
+        ("gemini", "week"), ("gemini", "5h"),
+        ("claudegpt", "week"), ("claudegpt", "5h"),
+        ("argon", "week"),
+    }, rows
+    assert rows[("gemini", "week")]["used"] == 0
+    assert rows[("gemini", "5h")]["used"] == 0
+    assert rows[("claudegpt", "week")]["used"] == 0
+    assert rows[("claudegpt", "5h")]["used"] == 0
+    assert rows[("argon", "week")]["used"] == 1
+    assert rows[("gemini", "week")]["reset"] == _agy_epoch("2026-10-27T01:39:26Z")
+    assert rows[("gemini", "5h")]["reset"] == _agy_epoch("2026-10-20T06:39:26Z")
+    assert rows[("argon", "week")]["reset"] == _agy_epoch("2026-10-27T01:38:40Z")
+    # A percent outside 0-100 is not a reading, and it does not replace a real row.
+    junk = text + "Gemini Models\tWeekly Limit Remaining\t150%\t2026-10-27T01:39:26Z\n"
+    again = {(item["pool"], item["window"]): item for item in su.parse_agy_usage(junk)}
+    assert again[("gemini", "week")]["used"] == 0
+    assert su.parse_agy_usage("") == []
+    assert su.parse_agy_usage("not a table\n") == []
+
+
+@test
+def missing_agy_is_an_error_and_invents_no_number():
+    with google_sandbox():
+        fresh = {"v": 1, "as_of": {}, "errors": {}}
+        su.apply_google(fresh, AGY_NOW, binary="/no/such/agy")
+        assert fresh["errors"]["google"] == "agy not found", fresh
+        assert "google" not in fresh["as_of"], fresh
+        assert not any(key.startswith("google_") for key in fresh), fresh
+        assert su.google_line(fresh, AGY_NOW) == "google   | usage failed: agy not found"
+        # A later failure keeps the last real numbers and does not write a new one.
+        kept = {"v": 1, "as_of": {"google": AGY_NOW}, "google_argon_week": 1, "google_gemini_week": 0}
+        su.apply_google(kept, AGY_NOW, binary="/no/such/agy")
+        assert kept["google_argon_week"] == 1 and kept["google_gemini_week"] == 0, kept
+        assert "google" not in kept["as_of"], kept
+        assert kept["errors"]["google"] == "agy not found", kept
+
+
+@test
+def agy_not_signed_in_and_nonzero_exit_are_errors():
+    with google_sandbox() as d:
+        signed_out = Path(d) / "signed-out"
+        signed_out.write_text("#!/bin/sh\necho 'You are currently not signed in.' >&2\nexit 1\n")
+        signed_out.chmod(0o755)
+        summary = {"v": 1, "as_of": {}}
+        su.apply_google(summary, AGY_NOW, binary=str(signed_out))
+        assert summary["errors"]["google"] == "not signed in", summary
+        assert not any(key.startswith("google_") for key in summary), summary
+        failed = Path(d) / "failed"
+        failed.write_text("#!/bin/sh\necho 'quota service down' >&2\nexit 3\n")
+        failed.chmod(0o755)
+        other = {"v": 1, "as_of": {}}
+        su.apply_google(other, AGY_NOW, binary=str(failed))
+        assert other["errors"]["google"] == "exit 3: quota service down", other
+        assert not any(key.startswith("google_") for key in other), other
+
+
+@test
+def agy_fixture_fills_the_cache_and_the_floor_skips_the_next_call():
+    with google_sandbox(interval=600) as d:
+        calls = Path(d) / "calls"
+        script = Path(d) / "agy"
+        script.write_text("#!/bin/sh\necho x >> %s\ncat %s\n" % (calls, AGY_FIXTURE))
+        script.chmod(0o755)
+        summary = {"v": 1, "as_of": {}, "errors": {"google": "stale"}}
+        su.apply_google(summary, AGY_NOW, binary=str(script))
+        assert calls.read_text().count("x") == 1, calls.read_text()
+        assert summary["google_argon_week"] == 1, summary
+        assert summary["google_gemini_week"] == 0 and summary["google_gemini_5h"] == 0, summary
+        assert summary["google_claudegpt_week"] == 0 and summary["google_claudegpt_5h"] == 0, summary
+        assert summary["google_argon_week_reset_ts"] == _agy_epoch("2026-10-27T01:38:40Z")
+        assert summary["google_gemini_5h_reset_ts"] == _agy_epoch("2026-10-20T06:39:26Z")
+        assert summary["as_of"]["google"] == AGY_NOW, summary["as_of"]
+        assert "google" not in summary["errors"], summary
+        assert summary["google_argon_week_pace"] == "on", summary["google_argon_week_pace"]
+        line = su.google_line(summary, AGY_NOW)
+        assert line.startswith("google   | AI Pro | Argon weekly 1%:"), line
+        assert "Gemini weekly 0%:" in line and "Gemini 5h 0% (resets in 5.0h)" in line, line
+        assert "Claude/GPT weekly 0%:" in line and "Claude/GPT 5h 0% (resets in 5.0h)" in line, line
+        su.apply_google(summary, AGY_NOW + 10, binary=str(script))
+        assert calls.read_text().count("x") == 1, "live check ran inside the floor"
+        stored = json.load(open(su._agy_rate_path()))
+        stored["next"] = AGY_NOW - 1
+        with open(su._agy_rate_path(), "w") as handle:
+            json.dump(stored, handle)
+        su.apply_google(summary, AGY_NOW + 20, binary=str(script))
+        assert calls.read_text().count("x") == 2, calls.read_text()
+
+
+@test
+def cached_output_does_not_run_agy():
+    with tempfile.TemporaryDirectory() as d:
+        script = Path(d) / "agy"
+        marker = Path(d) / "ran"
+        script.write_text("#!/bin/sh\necho ran > %s\n" % marker)
+        script.chmod(0o755)
+        cache = Path(d) / "cache"
+        cache.mkdir()
+        (cache / "latest.json").write_text(json.dumps({
+            "ts": time.time(), "v": 1, "as_of": {}, "lines": ["claude   | cached"], "burn": [],
+        }))
+        env = os.environ.copy()
+        env["SEAT_USAGE_AGY"] = str(script)
+        env["SEAT_USAGE_CACHE_DIR"] = str(cache)
+        env["QUARTERMASTER_NO_UPDATE"] = "1"
+        env.pop("COUNCIL_VOTER", None)
+        proc = subprocess.run([sys.executable, str(BIN), "--cached"], capture_output=True, text=True, env=env, timeout=15)
+        assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
+        assert "claude   | cached" in proc.stdout, proc.stdout
+        assert "google" not in proc.stdout, proc.stdout
+        assert not marker.exists(), "cached run executed agy"
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:

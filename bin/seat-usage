@@ -15,6 +15,15 @@ as_of["muse"]), including one whose 5h window has already reset. It is
 display-only and is not a routing input. A missing or unreadable file
 drops that stamp and records the reason. SEAT_USAGE_SKIP_MUSE=1 skips the
 ask. --cached never asks.
+Google AI Pro is read from the signed-in Antigravity CLI: `agy -p "/usage"`
+(binary `agy` on PATH, else ~/.local/bin/agy; SEAT_USAGE_AGY overrides).
+The table's percent is remaining; stored percents are used (100 - remaining)
+for Argon weekly and for the Gemini and Claude/GPT weekly and 5-hour pools.
+A missing binary, a not-signed-in session, a non-zero exit, a timeout, or
+output that does not parse is an error line. No number is invented. The
+live check waits USAGE_MIN_INTERVAL_S between calls, the same floor as the
+other seats. SEAT_USAGE_SKIP_GOOGLE=1, COUNCIL_VOTER=1, and CONCLAVE_VOTER=1
+skip the call. --cached never runs agy.
 Self-update is off by default. With QUARTERMASTER_AUTO_UPDATE=1, a run
 from a clean checkout of main fetches and fast-forwards at most once a
 day, prints one updated line, and starts again on the new code.
@@ -1899,6 +1908,7 @@ def _store_merged(base, lines, seats, now, stamp_now):
     fresh["ts"] = now
     merged = merge_summary(base, fresh, seats, now=now)
     apply_muse(merged, now)
+    apply_google(merged, now)
     if stamp_now:
         merged["ts"] = now
     SUMMARY = merged
@@ -3355,6 +3365,313 @@ def apply_muse(summary, now, path=None):
     summary["errors"] = errors
     return summary
 
+# Antigravity `agy -p "/usage"`. One tab-separated row per window:
+# pool, window label, percent REMAINING, reset time (UTC ISO-8601).
+# Remaining is converted to used. Unknown pools and unreadable rows are
+# skipped; they are not stored as zero.
+AGY_TIMEOUT_S = 15
+_AGY_POOL_NAMES = {
+    "gemini models": "gemini",
+    "claude and gpt models": "claudegpt",
+    "gemini 4 argon": "argon",
+}
+# Printed and drawn in this order: Argon weekly, then Gemini, then Claude/GPT.
+GOOGLE_POOLS = (
+    ("argon", "Argon", False),
+    ("gemini", "Gemini", True),
+    ("claudegpt", "Claude/GPT", True),
+)
+_NOT_SIGNED_IN = re.compile(r"not signed in", re.I)
+
+def agy_binary():
+    """agy on PATH, else ~/.local/bin/agy. SEAT_USAGE_AGY wins when set."""
+    override = os.environ.get("SEAT_USAGE_AGY")
+    if override:
+        return override
+    found = shutil.which("agy")
+    if found:
+        return found
+    default = os.path.join(H, ".local", "bin", "agy")
+    if os.path.isfile(default) and os.access(default, os.X_OK):
+        return default
+    return None
+
+def _agy_window(label):
+    text = (label or "").casefold()
+    if "five hour" in text or "5 hour" in text or "5h" in text:
+        return "5h"
+    if "week" in text:
+        return "week"
+    return None
+
+def _agy_remaining(text):
+    """Remaining percent, 0 to 100, or None when the cell is not a percent."""
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*%?\s*", text or "")
+    if not match:
+        return None
+    number = float(match.group(1))
+    if number != number or number < 0 or number > 100:
+        return None
+    return number
+
+def _agy_used(remaining):
+    used = round(100 - remaining, 4)
+    if used == int(used):
+        return int(used)
+    return used
+
+def parse_agy_usage(text):
+    """Pools from agy output. Each item is pool, window ('week' or '5h'), used, reset.
+
+    The percent column is remaining. used is 100 - remaining. A row that does
+    not match a known pool, a known window, a percent, and an ISO reset is
+    left out. An empty result is not a zero reading.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return []
+    found = {}
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        parts = raw.split("\t")
+        if len(parts) < 4:
+            continue
+        name, label, pct_s, reset_s = (part.strip() for part in parts[:4])
+        pool = _AGY_POOL_NAMES.get(name.casefold())
+        window = _agy_window(label)
+        remaining = _agy_remaining(pct_s)
+        if pool is None or window is None or remaining is None:
+            continue
+        try:
+            reset = iso_to_ts(reset_s)
+        except (ValueError, TypeError, OSError, OverflowError):
+            continue
+        found[(pool, window)] = {"pool": pool, "window": window, "used": _agy_used(remaining), "reset": reset}
+    return list(found.values())
+
+def _agy_snippet(text):
+    text = re.sub(r"\s+", " ", text or "").strip()
+    if len(text) > 80:
+        text = text[:79].rstrip() + "…"
+    return text
+
+def _run_agy_proc(binary, timeout):
+    """(returncode, stdout, stderr, launch_error). launch_error is set when agy did not finish."""
+    try:
+        proc = subprocess.Popen(
+            [binary, "-p", "/usage"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return None, "", "", "agy not found"
+    except OSError as e:
+        return None, "", "", e.__class__.__name__
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _stop_git(proc)
+        return None, "", "", "timeout"
+    return proc.returncode, out or "", err or "", None
+
+def _google_skipped():
+    return (os.environ.get("SEAT_USAGE_SKIP_GOOGLE") == "1"
+            or os.environ.get("COUNCIL_VOTER") == "1"
+            or os.environ.get("CONCLAVE_VOTER") == "1")
+
+def _google_fail(summary, reason):
+    """Record the failure. Leave any numbers already stored; do not write a new one."""
+    as_of = summary.get("as_of")
+    as_of = dict(as_of) if isinstance(as_of, dict) else {}
+    as_of.pop("google", None)
+    summary["as_of"] = as_of
+    errors = summary.get("errors")
+    errors = dict(errors) if isinstance(errors, dict) else {}
+    errors["google"] = re.sub(r"\s+", " ", str(reason)).strip()[:120]
+    summary["errors"] = errors
+
+def _clear_google_numbers(summary):
+    for pool, _label, _has5 in GOOGLE_POOLS:
+        for suffix in ("week", "week_reset_ts", "week_pace", "5h", "5h_reset_ts"):
+            summary.pop(f"google_{pool}_{suffix}", None)
+
+def _store_google_pools(summary, pools, now):
+    """Replace this seat's numbers with the rows agy actually returned."""
+    by = {(item["pool"], item["window"]): item for item in pools}
+    _clear_google_numbers(summary)
+    week_s, five_s = 7 * 86400, 5 * 3600
+    for pool, label, has5 in GOOGLE_POOLS:
+        week = by.get((pool, "week"))
+        if week is not None:
+            used, reset = week["used"], week["reset"]
+            summary[f"google_{pool}_week"] = used
+            summary[f"google_{pool}_week_reset_ts"] = reset
+            summary[f"google_{pool}_week_pace"] = pace_code(used, reset, week_s, now)
+            record_pool("google", f"google {label} weekly", used, reset, week_s, "agy")
+        if not has5:
+            continue
+        five = by.get((pool, "5h"))
+        if five is not None:
+            used, reset = five["used"], five["reset"]
+            summary[f"google_{pool}_5h"] = used
+            summary[f"google_{pool}_5h_reset_ts"] = reset
+            record_pool("google", f"google {label} 5h", used, reset, five_s, "agy")
+    as_of = summary.get("as_of")
+    as_of = dict(as_of) if isinstance(as_of, dict) else {}
+    as_of["google"] = now
+    summary["as_of"] = as_of
+    errors = summary.get("errors")
+    errors = dict(errors) if isinstance(errors, dict) else {}
+    errors.pop("google", None)
+    summary["errors"] = errors
+
+def _agy_rate_path():
+    """The agy floor lives beside the usage rate-limit file, not inside it."""
+    return f"{CACHE_DIR}/agy-rate.json"
+
+def _load_agy_rate():
+    try:
+        with open(_agy_rate_path()) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+def _store_agy_rate(limits):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = _agy_rate_path() + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(limits, f)
+        os.replace(tmp, _agy_rate_path())
+    except Exception:
+        pass
+
+def _agy_limited(now):
+    raw = _load_agy_rate().get("next")
+    return isinstance(raw, (int, float)) and not isinstance(raw, bool) and now < raw
+
+def _arm_google(now):
+    """Hold the next agy call until USAGE_MIN_INTERVAL_S has passed. Tests set that to 0."""
+    try:
+        if USAGE_MIN_INTERVAL_S <= 0:
+            try:
+                os.remove(_agy_rate_path())
+            except OSError:
+                pass
+            return
+        limits = _load_agy_rate()
+        nxt = now + USAGE_MIN_INTERVAL_S
+        prev = limits.get("next")
+        if isinstance(prev, (int, float)) and not isinstance(prev, bool) and prev > nxt:
+            nxt = prev
+        if limits.get("next") == nxt:
+            return
+        limits["next"] = nxt
+        _store_agy_rate(limits)
+    except Exception:
+        pass
+
+def _classify_agy(code, out, err, launch_error):
+    """('ok', pools) or ('error', reason). A non-zero exit is not a reading."""
+    if launch_error:
+        return "error", launch_error
+    parsed = parse_agy_usage(out)
+    blob = f"{out}\n{err}"
+    if code != 0:
+        if _NOT_SIGNED_IN.search(blob):
+            return "error", "not signed in"
+        reason = f"exit {code}"
+        snippet = _agy_snippet(err or out)
+        if snippet:
+            reason = f"{reason}: {snippet}"
+        return "error", reason
+    if _NOT_SIGNED_IN.search(blob) and not parsed:
+        return "error", "not signed in"
+    if not parsed:
+        return "error", "unreadable output"
+    return "ok", parsed
+
+def apply_google(summary, now=None, binary=None):
+    """Read agy and copy used percents into summary, unless the live-check floor is active.
+
+    A missing binary, a not-signed-in session, or any non-zero exit sets
+    errors['google'] and drops as_of['google']. Numbers already in summary
+    stay; nothing new is written. A parsed reading replaces this seat's
+    numbers and clears the error. SEAT_USAGE_SKIP_GOOGLE=1 leaves summary
+    unchanged. --cached does not call this.
+    """
+    if not isinstance(summary, dict) or _google_skipped():
+        return summary
+    if now is None:
+        now = time.time()
+    try:
+        if _agy_limited(now):
+            return summary
+        if binary is None:
+            binary = agy_binary()
+        if not binary:
+            _google_fail(summary, "agy not found")
+            _arm_google(now)
+            return summary
+        kind, payload = _classify_agy(*_run_agy_proc(binary, AGY_TIMEOUT_S))
+        if kind == "ok":
+            _store_google_pools(summary, payload, now)
+        else:
+            _google_fail(summary, payload)
+        _arm_google(now)
+    except Exception as e:
+        _google_fail(summary, e.__class__.__name__)
+    return summary
+
+def _when_at(ts, now):
+    if not ts:
+        return "?"
+    delta = ts - now
+    if delta < 0:
+        return "reset due"
+    if delta < 86400:
+        return f"resets in {delta / 3600:.1f}h"
+    return f"resets in {delta / 86400:.1f}d"
+
+def _google_usage_line(summary, now):
+    parts = []
+    for pool, label, has5 in GOOGLE_POOLS:
+        used = summary.get(f"google_{pool}_week")
+        reset = summary.get(f"google_{pool}_week_reset_ts")
+        if _is_number(used) and _is_number(reset):
+            parts.append(
+                f"{label} weekly {_fmt_pct(used)}%: {pace(used, reset, 7 * 86400, now)}, {_when_at(reset, now)}")
+        if not has5:
+            continue
+        five = summary.get(f"google_{pool}_5h")
+        five_reset = summary.get(f"google_{pool}_5h_reset_ts")
+        if _is_number(five) and _is_number(five_reset):
+            parts.append(f"{label} 5h {_fmt_pct(five)}% ({_when_at(five_reset, now)})")
+    if not parts:
+        return None
+    return f"google   | AI Pro | " + " | ".join(parts)
+
+def google_line(summary, now=None):
+    """The Google row, or None when this cache has no Google reading and no error.
+
+    An error wins over leftover numbers so a failed reread is visible. The
+    meters still draw the leftover numbers; this line does not invent one.
+    """
+    if not isinstance(summary, dict):
+        return None
+    if now is None:
+        now = time.time()
+    err = (summary.get("errors") or {}).get("google") if isinstance(summary.get("errors"), dict) else None
+    if isinstance(err, str) and err.strip():
+        return f"google   | usage failed: {err.strip()}"
+    return _google_usage_line(summary, now)
+
 def print_cached():
     """--cached: print the last run's lines from the cache, no network. For the
     synchronous SessionStart hook; the async hook refreshes the cache."""
@@ -3378,6 +3695,10 @@ def print_cached():
     print(header)
     for line in seats:
         print(line)
+    # Cached Google row only. --cached does not run agy.
+    gline = google_line(d, NOW)
+    if gline:
+        print("  " + gline)
     # Conclave's file, not the seat cache. Sits with the usage lines, ahead of burn nudges.
     print("  " + muse_line())
     for line in burns:
@@ -3387,6 +3708,9 @@ def _print_full(lines, burn):
     print("[seat-usage] " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%MZ"))
     for l in lines:
         print("  " + l)
+    gline = google_line(SUMMARY)
+    if gline:
+        print("  " + gline)
     print("  " + muse_line())
     for e in burn:
         print("  " + burn_line(e))
