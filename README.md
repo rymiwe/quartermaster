@@ -83,7 +83,7 @@ The check does not stash, reset, or overwrite local changes. A dirty tree, a bra
 
 A missing `agy`, a session that is not signed in, a non-zero exit, a timeout, or output that does not parse is an error line. No percent is invented. Numbers already in the cache stay until a later reading replaces them. `--cached` does not run `agy`. `SEAT_USAGE_SKIP_GOOGLE=1` skips the live check, as do `COUNCIL_VOTER=1` and `CONCLAVE_VOTER=1`.
 
-`seat-meters` draws those pools as their own Google AI Pro group, in Google blue (`#4285f4`), in the wide layout and in `--phone`. Argon is the weekly row. Gemini and Claude/GPT each have a weekly bar and a 5-hour bar. There is no Antigravity API call.
+`seat-meters` draws those pools as their own Google AI Pro group, in a deep indigo blue (`#5468f0`) kept apart from SuperGrok's sky blue, in the wide layout and in `--phone`. Argon is the weekly row. Gemini and Claude/GPT each have a weekly bar and a 5-hour bar. There is no Antigravity API call.
 
 ## Phone widget (optional)
 
