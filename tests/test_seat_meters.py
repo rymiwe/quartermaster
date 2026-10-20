@@ -415,6 +415,24 @@ def test_phone_google_chips_are_data_in_pools_json():
     assert _pool(edited, "Google AI Pro \u00b7 Argon")["chips"] == [["Test fam", "dashed"]]  # read, not hard-coded
     assert _pool(edited, "Google AI Pro \u00b7 Claude/GPT")["chips"] == []
     assert all(p["chips"] == [] for p in _card(none, "Google AI Pro \u00b7 Argon")["pools"])
+    assert doc["notes"] == []  # no Claude row: no Claude plan footnote
+
+def test_phone_chips_that_do_not_fit_wrap_and_the_card_grows():
+    with tempfile.TemporaryDirectory() as t:
+        conf = json.load(open(os.path.join(ROOT, "config", "pools.json")))
+        alt = os.path.join(t, "pools.json")
+        heights = []
+        for fams in (["A"], ["Family %d" % i for i in range(12)]):
+            conf["google_ai_pro"]["pools"]["argon"] = {"families": fams}
+            json.dump(conf, open(alt, "w"))
+            doc = phone_text(t, GOOGLE_CACHE, pools=alt)
+            p = _pool(doc, "Google AI Pro \u00b7 Argon")
+            assert p["chips_drawn"] == len(fams), p
+            heights.append(Image.open(os.path.join(t, "p.png")).size[1])
+        conf["google_ai_pro"]["pools"] = ["not", "a", "dict"]  # a bad block: no chips, no crash
+        json.dump(conf, open(alt, "w"))
+        assert _pool(phone_text(t, GOOGLE_CACHE, pools=alt), "Google AI Pro \u00b7 Argon")["chips"] == []
+    assert heights[1] > heights[0], heights
 
 def test_phone_caps_wording_comes_from_the_cached_projection():
     cache = {"ts": NOW, "as_of": FRESH, "claude_week": 60, "claude_week_reset_ts": NOW + 4 * 86400,
@@ -429,14 +447,19 @@ def test_phone_caps_wording_comes_from_the_cached_projection():
              "codex_caps_early_s": True,                                      # a bool is not a number
              "cursor_api_pct": 20, "cursor_reset_ts": NOW - 60, "cursor_window_s": 31 * 86400,
              "cursor_other_caps_early_s": 86400,                              # pool already reset
-             "claude_5h": 10, "claude_5h_reset_ts": NOW + 3600, "claude_5h_caps_early_s": 1800}
+             "claude_5h": 10, "claude_5h_reset_ts": NOW + 3600, "claude_5h_caps_early_s": 1800,
+             "google_gemini_week": 50, "google_gemini_week_reset_ts": NOW + 5 * 86400,
+             "google_gemini_week_caps_early_s": 2.5 * 3600,                   # half up, as JS: "3h"
+             "google_claudegpt_week": 50, "google_claudegpt_week_reset_ts": NOW + 5 * 86400,
+             "google_claudegpt_week_caps_early_s": float("inf")}              # not finite: nothing
     with tempfile.TemporaryDirectory() as t:
         doc = phone_text(t, cache)
     cl = _pool(doc, "Claude \u00b7 weekly")
     assert cl["stats"].startswith("60% \u00b7 caps 2d early \u00b7 5h 10%"), cl  # after the pct, weekly only
     assert cl["red"] == ["caps 2d early"], cl
     assert _pool(doc, "SuperGrok \u00b7 weekly")["red"] == ["caps 40m early"]
-    for title in ("Grok Bot \u00b7 weekly", "Google AI Pro \u00b7 Argon", "Codex \u00b7 weekly", "Cursor \u00b7 Other Models"):
+    assert _pool(doc, "Google AI Pro \u00b7 Gemini")["red"] == ["caps 3h early"]
+    for title in ("Grok Bot \u00b7 weekly", "Google AI Pro \u00b7 Argon", "Google AI Pro \u00b7 Claude/GPT", "Codex \u00b7 weekly", "Cursor \u00b7 Other Models"):
         assert "caps" not in _pool(doc, title)["stats"], _pool(doc, title)
 
 if __name__ == "__main__":

@@ -255,9 +255,9 @@ if PHONE:
     PLAN = d.get("claude_plan") if isinstance(d.get("claude_plan"), str) else ""
     if "claude_max" in d:
         CLAUDE_MAX = d["claude_max"] if isinstance(d["claude_max"], bool) else None
-    elif "max" in PLAN.lower(): CLAUDE_MAX = True
-    elif PLAN.lower().replace("default_", "", 1) in ("claude_ai", "claude_pro"): CLAUDE_MAX = False
-    else: CLAUDE_MAX = None
+    else:
+        tier = PLAN.strip().lower().replace("default_", "")
+        CLAUDE_MAX = True if "max" in tier else False if tier in ("claude_ai", "claude_pro") else None
     # Subscription each card belongs to: (paid-through key, will-renew key), as orderly's quota_renewal.
     SUBS = {"claude": ("claude_renews_ts", "claude_renews"), "codex": ("codex_renews_ts", "codex_renews"),
             "cursor": ("cursor_reset_ts", "cursor_renews"), "grok": ("grok_renews_ts", "grok_renews")}
@@ -283,10 +283,13 @@ if PHONE:
         """{orderly-style seat id: [(family, style)]} from pools.json's google_ai_pro block."""
         path = os.environ.get("SEAT_USAGE_POOLS") or os.path.join(
             os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config", "pools.json")
-        try: block = json.load(open(path)).get("google_ai_pro") or {}
+        try:
+            with open(path) as fh: block = json.load(fh).get("google_ai_pro")
         except (OSError, ValueError, AttributeError): return {}
+        pools = block.get("pools") if isinstance(block, dict) else None
+        if not isinstance(pools, dict): return {}
         out = {}
-        for pool, rec in (block.get("pools") or {}).items() if isinstance(block, dict) else ():
+        for pool, rec in pools.items():
             if not isinstance(rec, dict) or not isinstance(rec.get("families"), list): continue
             style = rec.get("style") if rec.get("style") in ("solid", "dashed", "dotted") else "solid"
             out["google_" + pool] = [(f, style) for f in rec["families"] if isinstance(f, str) and f]
@@ -330,7 +333,7 @@ if PHONE:
                 "Argon": "google_argon_week", "Gemini": "google_gemini_week",
                 "Claude/GPT": "google_claudegpt_week", "Muse": "muse_week"}
     def roughspan(secs):  # orderly roughSpan
-        return fspan(secs if secs < 3600 else round(secs / 3600) * 3600)
+        return fspan(secs if secs < 3600 else math.floor(secs / 3600 + 0.5) * 3600)  # JS Math.round
 
     def stats(label, m, f):
         """orderly's .v line: percent, 5h, reset, and an old reading. [(text, red)]."""
@@ -339,7 +342,8 @@ if PHONE:
         if m: parts.append((f"{rnd(m['pct'])}%", False))
         early = d.get(CAPS_KEY[label] + "_caps_early_s") if label in CAPS_KEY else None
         # Right after the percentage, as orderly, so a narrow row cuts the reset, not this.
-        if m and m["left"] > 0 and isinstance(early, (int, float)) and not isinstance(early, bool) and early > 0:
+        if m and m["left"] > 0 and isinstance(early, (int, float)) and not isinstance(early, bool) \
+                and math.isfinite(early) and early > 0:
             parts.append((f"caps {roughspan(early)} early", True))
         if f:
             hot = f["pct"] >= 100 or f["pct"] > f["e"] * 100
