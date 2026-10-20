@@ -16,7 +16,7 @@ Snapshot of Ryan's "router core": `seat-usage` (reads per-seat/pool usage for Cl
 | `renewals.example.json` | placeholder for `~/.config/seat-usage/renewals.json` (same schema, placeholder values) |
 | `install.sh` | links or copies the two commands into the frozen paths |
 | `bin/seat-meters` | optional: draws the cached reading as an orderly-style PNG (needs Pillow; no network). `seat-meters [--phone] [out.png]` (`--phone`: tall layout grouped by subscription), cache path from `SEAT_USAGE_CACHE`. Google AI Pro is its own group in both layouts |
-| `bin/seat-usage-push` | optional: copies an allowlist of the cache to a secret gist for the phone widget |
+| `bin/seat-usage-push` | optional: copies an allowlist of the cache to a secret gist for the phone widget, plus a numbers-only cache copy that `--pull` lands on a reader |
 | `systemd/` | the `seat-usage-push` timer (every 5 minutes) |
 | `android/` | Seats, the Android home-screen widget that reads that gist |
 
@@ -99,6 +99,8 @@ Desktop setup. `install.sh` does not install these; link them by hand:
     systemctl --user link "$PWD/systemd/seat-usage-push.service" "$PWD/systemd/seat-usage-push.timer"
     systemctl --user enable --now seat-usage-push.timer
     seat-usage-push --dry-run                 # print the payload, push nothing
+
+One reader, one gatherer: the same gist also gets `latest.json`, a copy of the cache cut to an allowlist of numbers (percents, reset times, windows, ages, on-demand dollars, `as_of` stamps) and a few true/false flags (exhausted, renews). No string is copied: no plan or status text, `lines`, `errors`, `burn`, or cookie flag. On the machine that does every reading (BLD) nothing changes beyond installing the timer above. On a reader with no vendor logins (the shared VM), put `{"id": "<gist id>"}` in `~/.config/seat-usage/gist.json` and run `seat-usage-push --pull`. It refilters, writes `~/.cache/seat-usage/latest.json` and Muse's `~/.cache/quartermaster/muse-usage.json`, and never runs `seat-usage`. `seat-meters` and `seat-usage --route ... --cached` then read that copy. The reader's meters show no plan name in the ChatGPT header and no error footer, because those are strings. `seat-usage-push --dry-run --cache` prints the copy.
 
 Phone setup: install `seats.apk` from the `seats-latest` release, add the Seats widget, and paste the gist id or URL. CI (`.github/workflows/seats-widget.yml`) rebuilds that release on every push to `main` that touches `android/`.
 
