@@ -1760,6 +1760,35 @@ def host_live_cache_11m_old_still_asks():
 
 
 @test
+def route_freshness_comes_from_the_pool_config():
+    def host(age_m, pulled):
+        s = snap(pulled_ts=NOW - 60) if pulled else snap()
+        s["as_of"] = {k: NOW - age_m * 60 for k in s["as_of"]}
+        return su.route_host(s, NOW)
+    with tempfile.TemporaryDirectory() as d:
+        src = json.loads(Path(su.pools_file()).read_text())
+        path = os.path.join(d, "pools.json")
+        try:
+            src["route_freshness_s"] = {"live": 30 * 60, "pulled": 5 * 60}
+            Path(path).write_text(json.dumps(src))
+            su.load_config(pools_path=path)
+            live = host(15, pulled=False)
+            assert live["mode"] != "ask" and live["suggestion"], live
+            pulled = host(15, pulled=True)
+            assert pulled["mode"] == "ask" and "15m old" in pulled["reason"], pulled
+            del src["route_freshness_s"]   # missing key: 10 min live, 20 min pulled
+            Path(path).write_text(json.dumps(src))
+            su.load_config(pools_path=path)
+            live = host(11, pulled=False)
+            assert live["mode"] == "ask" and "11m old" in live["reason"], live
+            pulled = host(15, pulled=True)
+            assert pulled["mode"] != "ask" and pulled["suggestion"], pulled
+            assert host(25, pulled=True)["mode"] == "ask"
+        finally:
+            su.load_config()
+
+
+@test
 def live_merge_drops_the_pulled_marker():
     base = snap(pulled_ts=NOW - 60)
     fresh = {"ts": NOW, "as_of": {"claude": NOW}, "v": 1, "claude_week": 41}
