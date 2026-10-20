@@ -751,13 +751,48 @@ def grok_bot(tok):
     except Exception as e:
         return f"grokbot  | usage failed: {_err(e)}"
 
-DEFAULT_OP_REF = "op://grok/grok web cookie/credential"
+DEFAULT_OP_REF = "op://seat-usage/grok web cookie/credential"
+DEFAULT_OP_TOKEN_FILE = "~/.config/seat-usage/op-token"
 COOKIE_TRIED = []   # why each cookie source failed, for the grok line
 
 COOKIE_TTL_S = 6 * 3600
 
 def op_ref():
     return os.environ.get("SEAT_USAGE_OP_REF") or DEFAULT_OP_REF
+
+def op_token_file():
+    return os.path.expanduser(os.environ.get("SEAT_USAGE_OP_TOKEN_FILE") or DEFAULT_OP_TOKEN_FILE)
+
+def op_env():
+    """Env for `op`: a copy of os.environ with OP_SERVICE_ACCOUNT_TOKEN from
+    op_token_file() when that file is non-empty, else None (inherit, as before).
+    The token is never printed, logged or put in argv."""
+    p = op_token_file()
+    try:
+        if not os.path.isfile(p):   # missing, or a FIFO/device that open() could block on
+            return None
+        with open(p, encoding="utf-8-sig") as f:   # utf-8-sig: drop a Windows editor's BOM
+            mode = os.fstat(f.fileno()).st_mode
+            tok = f.read().strip()
+    except Exception:
+        return None
+    if not tok:
+        return None
+    if mode & 0o077:
+        print(f"seat-usage: {p} is mode {mode & 0o777:o}; chmod 600 it", file=sys.stderr)
+    env = os.environ.copy()
+    env["OP_SERVICE_ACCOUNT_TOKEN"] = tok
+    return env
+
+def wsl_env(env, path):
+    """WSL hands a Windows .exe only the variables named in $WSLENV, so add the
+    token's name there for op.exe. env None (no token file) stays None."""
+    if env is None or not path.lower().endswith(".exe"):
+        return env
+    names = [x for x in env.get("WSLENV", "").split(":") if x]
+    if "OP_SERVICE_ACCOUNT_TOKEN" in (x.split("/")[0] for x in names):
+        return env
+    return dict(env, WSLENV=":".join(names + ["OP_SERVICE_ACCOUNT_TOKEN"]))
 
 def cookie_cache_path():
     return f"{CACHE_DIR}/grok-cookie"
@@ -787,7 +822,8 @@ def grok_cookie():
     COOKIE_TTL_S first, so live runs do not each spend a 1Password read: the
     service account's daily read cap is shared by every machine and tool.
     Then 1Password (`op read` of op_ref(): $SEAT_USAGE_OP_REF, else
-    DEFAULT_OP_REF), then the stale cached copy, then
+    DEFAULT_OP_REF; authenticated with the service-account token in
+    op_token_file() when that file is non-empty), then the stale cached copy, then
     ~/.grok/web-cookie.
     The op binary is found by name: $SEAT_USAGE_OP if set, else op.exe (Windows
     1Password from WSL), else op. The first one that returns a value wins.
@@ -799,6 +835,7 @@ def grok_cookie():
         return cached
     override = os.environ.get("SEAT_USAGE_OP")
     winget = sorted(glob.glob("/mnt/c/Users/*/AppData/Local/Microsoft/WinGet/Packages/AgileBits.1Password.CLI_*/op.exe"))
+    env = op_env()   # $SEAT_USAGE_OP_TOKEN_FILE, else ~/.config/seat-usage/op-token
     for name in ([override] if override else ["op.exe", "op"]):
         path = shutil.which(name) or (winget[-1] if name == "op.exe" and winget else None)
         if not path:
@@ -806,7 +843,7 @@ def grok_cookie():
         try:
             # Own session, no stdin: under a terminal, op could otherwise stop this whole group.
             r = subprocess.run([path, "read", op_ref()], capture_output=True, text=True, timeout=20,
-                               stdin=subprocess.DEVNULL, start_new_session=True)
+                               stdin=subprocess.DEVNULL, start_new_session=True, env=wsl_env(env, path))
             v = r.stdout.replace("\r", "").strip()
             if r.returncode == 0 and v:
                 write_cookie_cache(v)
