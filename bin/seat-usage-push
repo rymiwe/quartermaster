@@ -89,8 +89,10 @@ CACHE_NUMBERS = frozenset([
     "grok_pct", "grok_reset_ts", "grok_window_s", "grok_402_h", "grok_renews_ts",
     "muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts",
 ] + _GOOGLE)
+# claude_max is the Claude plan as one bit (seat-usage derives it from the plan
+# name on the reading machine), so a reader can route Fable without the name.
 CACHE_FLAGS = frozenset(["bot_exhausted", "grok_exhausted", "claude_renews", "codex_renews",
-                         "cursor_renews", "grok_renews"])
+                         "cursor_renews", "grok_renews", "claude_max"])
 AS_OF_SEATS = frozenset(["claude", "chatgpt", "cursor", "grokbot", "grok", "muse", "google"])
 
 

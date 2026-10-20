@@ -1311,6 +1311,7 @@ def usage_good_read_sets_a_floor():
             assert server.usage_hits == 2, server.usage_hits
             assert server.profile_hits == 1, server.profile_hits
             assert third["claude_plan"] == "max" and third["claude_status"] == "active", third
+            assert third["claude_max"] is True, third
 
 
 @test
@@ -1949,6 +1950,52 @@ def absent_fable_slice_seats_the_optimal_frontier_pool():
     other = su.route_lineup(snap(fable=80, cursor_api_pct=10, claude_plan="claude_ai"), NOW, kind="design")
     other_fable = next(v for v in other["lineup"]["voters"] if v["family"] == "fable")
     assert other_fable["seat"] == "cursor", other_fable
+
+
+def _off_max(**kw):
+    s = snap(**kw)
+    s.pop("fable", None)
+    s.pop("fable_reset_ts", None)
+    return s
+
+
+@test
+def bounded_question_off_max_never_seats_fable_on_claude():
+    """Claude Pro has no Fable slice. The role's hold default used to seat Fable on Claude anyway."""
+    for s in (_off_max(claude_max=False), _off_max(claude_plan="claude_ai"),
+              snap(claude_max=False, fable=10)):  # the flag wins over a stray Fable number
+        r = su.route("bounded-question", s, NOW)
+        assert r["seat"] == "cursor" and r["family"] == "fable", r
+        assert r["mode"] in ("default", "suggest") and r["reason"].startswith("Other Models"), r
+    capped = su.route("bounded-question", _off_max(claude_max=False, cursor_api_pct=100), NOW)
+    assert capped["mode"] == "ask" and capped["reason"] == "Other Models capped: ask Ryan", capped
+    unknown = _off_max(claude_max=False)
+    del unknown["cursor_api_pct"]
+    asked = su.route("bounded-question", unknown, NOW)
+    assert asked["mode"] == "ask" and "Other Models reading unknown" in asked["reason"], asked
+    # Plan unknown (no flag, no plan name): unchanged, the hold default stays on Claude.
+    held = su.route("bounded-question", _off_max(), NOW)
+    assert held["seat"] == "claude" and held["family"] == "fable" and held["reason"] == "Fable: no used %", held
+    on_max = su.route("bounded-question", _off_max(claude_max=True), NOW)
+    assert on_max["seat"] == "claude" and on_max["reason"] == "Fable: no used %", on_max
+
+
+@test
+def claude_max_flag_from_plan_and_fable_slice():
+    f = su.claude_max_flag
+    assert f("claude_max_5x", False) is True and f("default_claude_max_20x", True) is True
+    assert f("claude_ai", False) is False and f("claude_ai", True) is False   # the tier name decides
+    assert f("?", True) is True          # profile failed, but this reading had a weekly Fable slice
+    assert f("?", False) is None and f(None, False) is None and f("", False) is None
+    assert su.claude_max(snap(claude_max=False, claude_plan="claude_max_5x")) is False   # flag first
+    assert su.claude_max(snap(claude_plan="claude_ai")) is False
+    assert su.claude_max(snap(claude_plan="?")) is None and su.claude_max(snap()) is None
+    assert su.claude_max(snap(claude_max=1)) is None    # flags are booleans only
+    absent = _off_max(claude_max=False)
+    absent.pop("claude_plan", None)
+    lineup = su.route_lineup(absent, NOW, kind="design")   # a pulled copy: flag, no plan name
+    fable = next(v for v in lineup["lineup"]["voters"] if v["family"] == "fable")
+    assert fable["seat"] == "cursor", fable
 
 
 @test
