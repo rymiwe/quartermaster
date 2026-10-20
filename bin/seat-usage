@@ -30,6 +30,13 @@ day, prints one updated line, and starts again on the new code.
 --route, --quiet, --cached, COUNCIL_VOTER=1, and CONCLAVE_VOTER=1 skip that check.
 QUARTERMASTER_NO_UPDATE=1 turns it off and wins over the opt-in.
 The check never stashes or resets.
+Pull-only host mode: with SEAT_USAGE_PULL_ONLY=1 in the environment, or the
+marker file ~/.config/seat-usage/pull-only present (SEAT_USAGE_PULL_ONLY_FILE
+overrides the path), this host never reads a seat live. Every path (plain run,
+--quiet, --route without --cached, refresh) serves the cache that
+seat-usage-push --pull wrote, with no reader, no op/op.exe or cookie lookup,
+no Muse or agy ask, and no cache write. Output says "pull-only" and the cache
+age. For a VM that only renders a reader host's pushed copy.
 Sources are documented in the Delegation Routing section of ~/.claude/CLAUDE.md.
 """
 import base64, fcntl, glob, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
@@ -870,6 +877,9 @@ def grok_cookie():
     Hooks and the status line's background refresh can run without the Windows
     dirs on PATH, so op.exe falls back to its WinGet install path."""
     import glob, shutil, subprocess
+    if pull_only():
+        COOKIE_TRIED.append("pull-only host")
+        return None
     cached, age = read_cookie_cache()
     if cached and age < COOKIE_TTL_S:
         return cached
@@ -1867,6 +1877,13 @@ def merge_summary(base, fresh, seats, now=None):
     out["v"] = 1
     return out
 
+def pull_only():
+    """True on a pull-only host: SEAT_USAGE_PULL_ONLY=1, or the marker file exists."""
+    if os.environ.get("SEAT_USAGE_PULL_ONLY") == "1":
+        return True
+    marker = os.environ.get("SEAT_USAGE_PULL_ONLY_FILE") or f"{H}/.config/seat-usage/pull-only"
+    return os.path.exists(marker)
+
 def _load_cache():
     try:
         with open(CACHE) as f:
@@ -2037,6 +2054,8 @@ def refresh(seats):
     for ~/.cache/seat-usage/.lock; on timeout returns the cache unchanged.
     """
     global SUMMARY
+    if pull_only():
+        return _load_cache()
     wanted = set(seats)
     lock = _acquire_lock(LOCK_TIMEOUT)
     base = _load_cache()
@@ -3018,7 +3037,7 @@ def _opt(argv, name):
 def cmd_route():
     argv = sys.argv[1:]
     as_json = "--json" in argv
-    cached = "--cached" in argv
+    cached = "--cached" in argv or pull_only()
     # A bare --route, or --route followed by a flag, routes every launch role.
     # Do not call _opt first: a missing value used to exit 2, and the launch
     # hook treats that as silence.
@@ -3056,6 +3075,11 @@ def cmd_route():
         builder = {"role": "builder", "family": _opt(argv, "--builder-family")}
     if cached:
         summary = _load_cache()
+        if pull_only():
+            # stderr only: stdout (text and --json) stays the parsed route.
+            ts = summary.get("ts") or 0
+            age = f"{round((time.time() - ts) / 60)}m ago" if ts else "age unknown"
+            print(f"[seat-usage] pull-only cached {age}", file=sys.stderr)
     elif role == "lineup":
         summary = refresh(list(LINEUP_SEATS))
     elif role == "host":
@@ -3461,7 +3485,10 @@ def refresh_muse_usage(now=None, path=None, binary=None, timeout=40):
 
     Returns True when a new file was written. A current file, a missing muse
     binary, or a failed ask leaves the file as it was and returns False.
+    A pull-only host never asks.
     """
+    if pull_only():
+        return False
     if now is None:
         now = time.time()
     if path is None:
@@ -3835,7 +3862,10 @@ def print_cached():
     try:
         d = json.load(open(CACHE))
         age_m = round((NOW - d["ts"]) / 60)
-        header = f"[seat-usage] cached {age_m}m ago; run ~/.local/bin/seat-usage for live numbers"
+        if pull_only():
+            header = f"[seat-usage] pull-only cached {age_m}m ago; numbers from seat-usage-push --pull"
+        else:
+            header = f"[seat-usage] cached {age_m}m ago; run ~/.local/bin/seat-usage for live numbers"
         seats = []
         for l in d["lines"]:
             seat = l.split("|")[0].strip()
@@ -3846,7 +3876,10 @@ def print_cached():
         # Recomputed against the current time, so a reset that already passed drops its line.
         burns = ["  " + burn_line(e) for e in burn_entries(d, NOW)]
     except Exception as e:
-        print(f"[seat-usage] no cached line ({e.__class__.__name__}); run ~/.local/bin/seat-usage")
+        if pull_only():
+            print(f"[seat-usage] pull-only: no cached line ({e.__class__.__name__}); run seat-usage-push --pull")
+        else:
+            print(f"[seat-usage] no cached line ({e.__class__.__name__}); run ~/.local/bin/seat-usage")
         print("  " + muse_line())
         return
     print(header)
@@ -3882,6 +3915,10 @@ def full_run(quiet=False, timeout=LOCK_TIMEOUT):
     fd is not unlocked.
     """
     global SUMMARY
+    if pull_only():
+        if not quiet:
+            print_cached()
+        return _load_cache()
     now = time.time()
     lock = _acquire_lock(timeout)
     if lock is None:
@@ -3912,6 +3949,8 @@ _GIT_ENV_DROP = (
 
 def _update_skipped():
     if os.environ.get("QUARTERMASTER_NO_UPDATE") == "1":
+        return True
+    if pull_only():
         return True
     if os.environ.get("QUARTERMASTER_AUTO_UPDATE") != "1":
         return True
@@ -4117,6 +4156,10 @@ def main():
         if os.environ.get("COUNCIL_VOTER") == "1":
             return
         return print_cached()
+    if pull_only():
+        if "--quiet" not in sys.argv:
+            print_cached()
+        return
     if os.environ.get("SEAT_USAGE_SKIP_MUSE") != "1" and os.environ.get("COUNCIL_VOTER") != "1" and os.environ.get("CONCLAVE_VOTER") != "1":
         try:
             refresh_muse_usage(time.time())
