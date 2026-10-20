@@ -94,19 +94,25 @@ def left_txt(s):
     return f"{s/3600:.1f}h" if s < 2 * 86400 else f"{s/86400:.1f}d"
 
 SS = 4  # supersample factor for bar shapes: Pillow's rounded_rectangle has no antialiasing
-def pill(x0, y0, x1, y1, color, alpha=1.0, split=None, color2=None):
+def pill(x0, y0, x1, y1, color, alpha=1.0, split=None, color2=None, alpha2=1.0):
     """Antialiased rounded bar like orderly's (border-radius 3px, clamped to a pill),
-    composited onto the image at `alpha`. Past x `split` it is `color2`, a hard stop."""
+    composited onto the image at `alpha`. Past x `split` it is `color2` at `alpha2`, a hard stop."""
     X0, Y0, X1, Y1 = x0 * S, y0 * S, x1 * S, y1 * S
     ox, oy = int(X0), int(Y0); w, h = int(X1 + 1) - ox, int(Y1 + 1) - oy
-    if X1 - X0 <= 0 or Y1 - Y0 <= 0 or w <= 0 or h <= 0: return
+    # under one supersampled pixel there is nothing to draw (and Pillow rejects the inverted box)
+    if (X1 - X0) * SS < 1 or (Y1 - Y0) * SS < 1 or w <= 0 or h <= 0: return
     r = min(3 * S, (X1 - X0) / 2, (Y1 - Y0) / 2) * SS
     m = Image.new("L", (w * SS, h * SS), 0)
     box = ((X0 - ox) * SS, (Y0 - oy) * SS, (X1 - ox) * SS - 1, (Y1 - oy) * SS - 1)
     ImageDraw.Draw(m).rounded_rectangle(box, radius=max(0, r - 0.5), fill=round(255 * alpha))
     c = Image.new("RGB", (w * SS, h * SS), color)
     if split is not None:
-        c.paste(color2, (max(0, int((split * S - ox) * SS)), 0, w * SS, h * SS))
+        sx = max(0, int((split * S - ox) * SS))
+        c.paste(color2, (sx, 0, w * SS, h * SS))
+        if alpha2 != alpha:  # the shape past the split, at its own opacity
+            m2 = Image.new("L", (w * SS, h * SS), 0)
+            ImageDraw.Draw(m2).rounded_rectangle(box, radius=max(0, r - 0.5), fill=round(255 * alpha2))
+            m.paste(m2.crop((sx, 0, w * SS, h * SS)), (sx, 0))
     img.paste(c.resize((w, h), Image.BOX), (ox, oy), m.resize((w, h), Image.LANCZOS))
 
 def track(st, y, h, width_frac, right=None, left=None, fill_alpha=1.0):
@@ -127,7 +133,7 @@ def track(st, y, h, width_frac, right=None, left=None, fill_alpha=1.0):
         if st["pct"] >= 100:
             pill(tx, y, tx + fw, y + h, RED)
         elif fw > tw * st["e"]:  # the part past the pace tick is red, at full strength
-            pill(tx, y, tx + fw, y + h, BLUE, split=split, color2=RED)
+            pill(tx, y, tx + fw, y + h, BLUE, fill_alpha, split=split, color2=RED)
         else:
             pill(tx, y, tx + fw, y + h, BLUE, fill_alpha)
     return tw

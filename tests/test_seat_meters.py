@@ -214,6 +214,29 @@ def test_phone_over_pace_segment_is_red_on_both_tracks():
     assert len(red_bands(60, 90)) == 2   # weekly 60% at 43% elapsed, 5h 90% at 50% elapsed
     assert red_bands(10, 10) == []       # both under pace: no red
 
+def test_tiny_nonzero_fill_still_renders():
+    """A fill thinner than a supersampled pixel draws nothing rather than crashing Pillow."""
+    for flags in ((), ("--phone",)):
+        with tempfile.TemporaryDirectory() as t:
+            r, _ = render(t, {"ts": NOW, "claude_week": 0.02, "claude_week_reset_ts": NOW + 4 * 86400,
+                              "claude_5h": 0.02, "claude_5h_reset_ts": NOW + 3600}, None, *flags)
+            assert r.returncode == 0, r.stderr
+
+def test_phone_over_pace_5h_blue_stays_dim():
+    """Over pace, the 5h fill's blue head keeps the 5h track's 55% strength; only the red tail is full."""
+    cache = {"ts": NOW, "claude_week": 10, "claude_week_reset_ts": NOW + 4 * 86400,
+             "claude_5h": 90, "claude_5h_reset_ts": NOW + 2.5 * 3600}
+    with tempfile.TemporaryDirectory() as t:
+        r, out = render(t, cache, None, "--phone")
+        assert r.returncode == 0, r.stderr
+        im = Image.open(out).convert("RGB"); w, h = im.size
+        red_rows = [y for y in range(h) if any(im.getpixel((x, y)) == RED for x in range(w))]
+        assert red_rows, "no over-pace red on the 5h track"
+        five = [[im.getpixel((x, y)) for x in range(w)] for y in red_rows]
+        assert not any(BLUE in row for row in five), "5h blue drawn at full strength"
+        dim_blue = lambda p: p[2] - p[0] > 40 and p[2] < BLUE[2] - 30  # blue over the tinted panel's track
+        assert any(has_run(row, dim_blue, 6) for row in five), "no dim blue head on the 5h track"
+
 if __name__ == "__main__":
     if Image is None:
         print("skip: Pillow not installed"); sys.exit(0)
