@@ -370,5 +370,17 @@
       },
       "facts": {"context": null, "limits": "Muse weekly", "window": "7d"}
     }
+  },
+  "google_ai_pro": {
+    "note": "Model families per Google AI Pro pool, for seat-meters chips only; not routed. Model ids as the Antigravity CLI listed them on the date seen.",
+    "seen": "2026-10-19",
+    "pools": {
+      "argon": {"families": ["Argon"], "style": "solid",
+                "models": ["gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high"]},
+      "gemini": {"families": ["Argon", "Gemini Flash"], "style": "solid",
+                 "models": ["gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high", "gemini-3.8-flash"]},
+      "claudegpt": {"families": ["Opus", "Sonnet", "GPT-OSS"], "style": "solid",
+                    "models": ["Claude Opus 5.5", "Claude Sonnet 5.5", "GPT-OSS 120B"]}
+    }
   }
 }

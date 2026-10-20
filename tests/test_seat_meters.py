@@ -49,7 +49,7 @@ def render(t, cache, muse=None, *flags):
 O_INK, O_PANEL2 = (0xe4, 0xe8, 0xee), (0x20, 0x26, 0x2e)  # orderly's dark palette, used by --phone
 PHONE_CX0 = 6 + 14 * 1.3  # phone: frame inset plus the rail's 14px padding, at K = 1.3
 
-def phone_text(t, cache, muse=None, name="latest.json"):
+def phone_text(t, cache, muse=None, name="latest.json", pools=None):
     """The phone layout's words, from --text: host line, card headers, pool titles, chips, stats."""
     cp, mp, out = os.path.join(t, name), os.path.join(t, "muse-usage.json"), os.path.join(t, "p.png")
     json.dump(cache, open(cp, "w"))
@@ -59,6 +59,8 @@ def phone_text(t, cache, muse=None, name="latest.json"):
         os.remove(mp)
     env = {**{k: v for k, v in os.environ.items() if not k.startswith("SEAT_USAGE_")},
            "SEAT_USAGE_CACHE": cp, "SEAT_USAGE_MUSE_FILE": mp}
+    if pools is not None:
+        env["SEAT_USAGE_POOLS"] = pools
     r = subprocess.run([sys.executable, BIN, "--phone", "--text", out], env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert open(out, "rb").read(8) == b"\x89PNG\r\n\x1a\n"
@@ -284,8 +286,8 @@ def test_phone_stats_line_reads_like_orderly():
     assert _pool(doc, "Cursor \u00b7 Other Models")["stats"] == "21%"  # half up, like orderly; reset is the header's
     assert _pool(doc, "Muse \u00b7 weekly")["stats"] == "no reading"
 
-def test_phone_hot_5h_is_red_and_there_is_no_caps_projection():
-    """quartermaster computes no time-to-cap, so no 'caps ... early' even far over pace."""
+def test_phone_hot_5h_is_red_and_no_cached_projection_means_no_caps():
+    """Caps wording comes only from seat-usage's <pool>_caps_early_s; far over pace without it says nothing."""
     cache = {"ts": NOW, "as_of": FRESH, "claude_week": 90, "claude_week_reset_ts": NOW + 6 * 86400,
              "claude_5h": 90, "claude_5h_reset_ts": NOW + 4 * 3600}
     with tempfile.TemporaryDirectory() as t:
@@ -332,20 +334,28 @@ def test_phone_chips_follow_orderly_and_the_claude_plan():
             "google_argon_week": 0, "google_argon_week_reset_ts": NOW + 6 * 86400}
     with tempfile.TemporaryDirectory() as t:
         unknown = phone_text(t, base, muse_doc())
-        pro = phone_text(t, {**base, "claude_plan": "pro"})
+        pro = phone_text(t, {**base, "claude_plan": "claude_ai"})
         mx = phone_text(t, {**base, "claude_plan": "max_5x", "fable": 12, "fable_reset_ts": NOW + 4 * 86400})
-    assert _pool(unknown, "Claude \u00b7 weekly")["chips"] == [["Opus", "solid"]]
-    assert any("Claude plan" in n for n in unknown["notes"])
-    assert _pool(pro, "Claude \u00b7 weekly")["chips"] == [["Opus", "solid"]] and pro["notes"] == []
-    assert not any(p["title"] == "Claude \u00b7 Fable slice" for c in pro["cards"] for p in c["pools"])
-    assert _pool(mx, "Claude \u00b7 weekly")["chips"] == [["Fable", "solid"], ["Opus", "solid"]]
-    assert _pool(mx, "Claude \u00b7 Fable slice")["chips"] == [["Fable", "solid"]]
-    for doc in (unknown, pro, mx):  # every chip the text lists is drawn in the PNG too
+        flag_pro = phone_text(t, {**base, "claude_max": False, "claude_plan": "max_5x"})  # the flag wins
+        flag_max = phone_text(t, {**base, "claude_max": True, "fable": 12, "fable_reset_ts": NOW + 4 * 86400})
+        bad_flag = phone_text(t, {**base, "claude_max": "yes", "claude_plan": "max_5x"})  # not a bool: unknown
+        odd_tier = phone_text(t, {**base, "claude_plan": "enterprise"})
+    fable_slice = lambda doc: any(p["title"] == "Claude \u00b7 Fable slice" for c in doc["cards"] for p in c["pools"])
+    for doc in (unknown, bad_flag, odd_tier):
+        assert _pool(doc, "Claude \u00b7 weekly")["chips"] == [["Opus", "solid"]] and not fable_slice(doc)
+        assert any("whether the Claude plan is Max" in n for n in doc["notes"]), doc["notes"]
+    for doc in (pro, flag_pro):  # Pro: no Fable, and nothing to explain
+        assert _pool(doc, "Claude \u00b7 weekly")["chips"] == [["Opus", "solid"]] and doc["notes"] == []
+        assert not fable_slice(doc)
+    for doc in (mx, flag_max):
+        assert _pool(doc, "Claude \u00b7 weekly")["chips"] == [["Fable", "solid"], ["Opus", "solid"]]
+        assert _pool(doc, "Claude \u00b7 Fable slice")["chips"] == [["Fable", "solid"]] and doc["notes"] == []
+    for doc in (unknown, pro, mx, flag_max):  # every chip the text lists is drawn in the PNG too
         assert all(p["chips_drawn"] == len(p["chips"]) for c in doc["cards"] for p in c["pools"]), doc
     assert _pool(unknown, "Cursor \u00b7 Other Models")["chips"] == [["Fable", "dashed"], ["Opus", "dashed"], ["Sol", "dashed"]]
     assert _pool(unknown, "SuperGrok \u00b7 weekly")["chips"] == [["Grok", "dotted"]]
     assert _pool(unknown, "Muse \u00b7 weekly")["chips"] == [["Wonder full", "solid"], ["Wonder", "solid"]]
-    assert _pool(unknown, "Google AI Pro \u00b7 Argon")["chips"] == []          # no family map for Google
+    assert _pool(unknown, "Google AI Pro \u00b7 Argon")["chips"] == [["Argon", "solid"]]  # config/pools.json
     assert unknown["legend"] == "dashed = metered \u00b7 dotted = builder only \u00b7 \u2605 first usable pool for the family"
 
 def test_phone_errors_wrap_inside_the_frame():
@@ -382,6 +392,52 @@ def test_text_flag_prints_json_not_the_path():
         doc = phone_text(t, {"ts": NOW})
         assert doc["host"].startswith("Next host:")
 
+
+GOOGLE_CACHE = {"ts": NOW, "as_of": FRESH,
+                "google_argon_week": 5, "google_argon_week_reset_ts": NOW + 6 * 86400,
+                "google_gemini_week": 5, "google_gemini_week_reset_ts": NOW + 6 * 86400,
+                "google_claudegpt_week": 5, "google_claudegpt_week_reset_ts": NOW + 6 * 86400}
+
+def test_phone_google_chips_are_data_in_pools_json():
+    with tempfile.TemporaryDirectory() as t:
+        doc = phone_text(t, GOOGLE_CACHE)
+        conf = json.load(open(os.path.join(ROOT, "config", "pools.json")))
+        conf["google_ai_pro"]["pools"]["argon"] = {"families": ["Test fam"], "style": "dashed"}
+        del conf["google_ai_pro"]["pools"]["claudegpt"]
+        alt = os.path.join(t, "pools.json"); json.dump(conf, open(alt, "w"))
+        edited = phone_text(t, GOOGLE_CACHE, pools=alt)
+        json.dump({k: v for k, v in conf.items() if k != "google_ai_pro"}, open(alt, "w"))
+        none = phone_text(t, GOOGLE_CACHE, pools=alt)
+    assert _pool(doc, "Google AI Pro \u00b7 Argon")["chips"] == [["Argon", "solid"]]
+    assert _pool(doc, "Google AI Pro \u00b7 Gemini")["chips"] == [["Argon", "solid"], ["Gemini Flash", "solid"]]
+    assert _pool(doc, "Google AI Pro \u00b7 Claude/GPT")["chips"] == [["Opus", "solid"], ["Sonnet", "solid"], ["GPT-OSS", "solid"]]
+    assert all(p["chips_drawn"] == len(p["chips"]) for c in doc["cards"] for p in c["pools"]), doc
+    assert _pool(edited, "Google AI Pro \u00b7 Argon")["chips"] == [["Test fam", "dashed"]]  # read, not hard-coded
+    assert _pool(edited, "Google AI Pro \u00b7 Claude/GPT")["chips"] == []
+    assert all(p["chips"] == [] for p in _card(none, "Google AI Pro \u00b7 Argon")["pools"])
+
+def test_phone_caps_wording_comes_from_the_cached_projection():
+    cache = {"ts": NOW, "as_of": FRESH, "claude_week": 60, "claude_week_reset_ts": NOW + 4 * 86400,
+             "claude_week_caps_early_s": 2 * 86400 + 600,                     # orderly roughSpan: "2d"
+             "grok_pct": 19, "grok_reset_ts": NOW + 3 * 86400, "grok_window_s": 7 * 86400,
+             "grok_caps_early_s": 40 * 60,                                    # under an hour: minutes
+             "bot_pct": 30, "bot_reset_ts": NOW + 2 * 86400, "bot_window_s": 7 * 86400,
+             "bot_caps_early_s": 3600,                                        # not this row's key
+             "google_argon_week": 50, "google_argon_week_reset_ts": NOW + 5 * 86400,
+             "google_argon_week_caps_early_s": 0,                             # zero: nothing
+             "codex": 50, "codex_reset_ts": NOW + 5 * 86400, "codex_window_s": 7 * 86400,
+             "codex_caps_early_s": True,                                      # a bool is not a number
+             "cursor_api_pct": 20, "cursor_reset_ts": NOW - 60, "cursor_window_s": 31 * 86400,
+             "cursor_other_caps_early_s": 86400,                              # pool already reset
+             "claude_5h": 10, "claude_5h_reset_ts": NOW + 3600, "claude_5h_caps_early_s": 1800}
+    with tempfile.TemporaryDirectory() as t:
+        doc = phone_text(t, cache)
+    cl = _pool(doc, "Claude \u00b7 weekly")
+    assert cl["stats"].startswith("60% \u00b7 caps 2d early \u00b7 5h 10%"), cl  # after the pct, weekly only
+    assert cl["red"] == ["caps 2d early"], cl
+    assert _pool(doc, "SuperGrok \u00b7 weekly")["red"] == ["caps 40m early"]
+    for title in ("Grok Bot \u00b7 weekly", "Google AI Pro \u00b7 Argon", "Codex \u00b7 weekly", "Cursor \u00b7 Other Models"):
+        assert "caps" not in _pool(doc, title)["stats"], _pool(doc, title)
 
 if __name__ == "__main__":
     if Image is None:
