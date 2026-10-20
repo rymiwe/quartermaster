@@ -14,7 +14,20 @@ except ImportError:
         import pytest
         pytest.skip("Pillow not installed", allow_module_level=True)
 NOW = time.time()
-BLUE, TRACK, RED = (0x5b, 0x8f, 0xd6), (0x2a, 0x33, 0x40), (0xc4, 0x3c, 0x3c)
+BLUE, RED, INK, BG = (0x5b, 0x8f, 0xd6), (0xc4, 0x3c, 0x3c), (0xe6, 0xeb, 0xf2), (0x14, 0x1a, 0x22)
+over = lambda c, under, a: tuple(round(u + (x - u) * a) for x, u in zip(c, under))
+TRACK = over(INK, BG, 0.14)  # the track is ink at 14% over the page, like orderly's
+near = lambda p, q, tol=2: all(abs(a - b) <= tol for a, b in zip(p, q))
+
+def runs(px, ok, run=12):
+    """Indexes in runs of `run` or more pixels that satisfy `ok`: a bar, not antialiased text."""
+    out, n = set(), 0
+    for i, p in enumerate(px + [None]):
+        if p is not None and ok(p): n += 1; continue
+        if n >= run: out.update(range(i - n, i))
+        n = 0
+    return out
+has_run = lambda px, ok, run=12: bool(runs(px, ok, run))
 iso = lambda ts: datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def muse_doc(now=NOW):
@@ -35,7 +48,7 @@ def render(t, cache, muse=None, *flags):
 def muse_band(out):
     """Pixels of the Muse row, the only row when the cache is empty (y 44.. in 1x units)."""
     im = Image.open(out).convert("RGB"); w, h = im.size
-    return im, [im.getpixel((x, y)) for y in range(88, h - 28) for x in range(0, w, 2)]
+    return im, [[im.getpixel((x, y)) for x in range(w)] for y in range(88, h - 28)]
 
 def test_renders_full_cache():
     with tempfile.TemporaryDirectory() as t:
@@ -59,7 +72,7 @@ def test_muse_file_draws_a_muse_track():
         assert r.returncode == 0, r.stderr
         im, band = muse_band(out)
         assert im.size[1] == 2 * (14 * 2 + 26 + 40)   # one Muse row with its 5h track
-        assert BLUE in band and TRACK in band
+        assert any(BLUE in row for row in band) and any(has_run(row, lambda p: near(p, TRACK)) for row in band)
 
 def test_missing_or_stale_muse_file_says_no_reading():
     stale = muse_doc(); stale["window"]["resets_at"] = iso(NOW - 60)
@@ -69,7 +82,8 @@ def test_missing_or_stale_muse_file_says_no_reading():
             assert r.returncode == 0, r.stderr
             im, band = muse_band(out)
             assert im.size[1] == 2 * (14 * 2 + 26 + 26)   # a Muse row, text only
-            assert BLUE not in band and TRACK not in band
+            assert not any(BLUE in row for row in band)
+            assert not any(has_run(row, lambda p: near(p, TRACK)) for row in band)
 
 def test_phone_layout_is_tall_and_narrow():
     cache = {"ts": NOW, "claude_week": 42, "claude_week_reset_ts": NOW + 4 * 86400,
@@ -160,8 +174,11 @@ def test_phone_5h_track_stops_before_its_label():
         r, out = render(t, cache, None, "--phone")
         assert r.returncode == 0, r.stderr
         im = Image.open(out).convert("RGB"); w, h = im.size
+        # the track is ink at 14% over the Google card's 9% tint
+        track = over(INK, over((0x54, 0x68, 0xf0), BG, 0.09), 0.14)
+        is_bar = lambda p: near(p, track) or p in (BLUE, RED)
         # track rows form two bands, weekly then 5h; the 5h band is the lower one
-        rows = [y for y in range(h) if any(im.getpixel((x, y)) in (TRACK, BLUE) for x in range(0, w, 2))]
+        rows = [y for y in range(h) if has_run([im.getpixel((x, y)) for x in range(w)], is_bar)]
         bands = [[rows[0]]] if rows else []
         for y in rows[1:]:
             (bands[-1].append(y) if y - bands[-1][-1] <= 1 else bands.append([y]))
@@ -169,14 +186,33 @@ def test_phone_5h_track_stops_before_its_label():
         five = bands[1]
         S, PAD, W = 3, 18, 390  # phone layout: 3x scale, 18px pad, 390px wide
         lo, hi = (PAD - 8 + 4) * S, (W - PAD + 8 - 6) * S  # inside the card: skip its left stripe and right edge
-        INK = (0xe6, 0xeb, 0xf2)
-        bar = {x for y in five for x in range(lo, hi) if im.getpixel((x, y)) in (TRACK, BLUE, RED)}
+        bar = {x for y in five for x in runs([im.getpixel((x, y)) for x in range(w)], is_bar) if lo <= x < hi}
         assert bar, "no 5h track drawn"
         def dim_text(p):  # DIM (#8a96a8) label text, antialiased against the card: grey and clearly lit
-            return p not in (TRACK, BLUE, RED, INK) and max(p) - min(p) < 48 and sum(p) / 3 > 90
-        ink = {x for y in five for x in range(lo, hi) if dim_text(im.getpixel((x, y)))}
+            return not is_bar(p) and p != INK and max(p) - min(p) < 48 and sum(p) / 3 > 90
+        # the now tick is antialiased too: its grey edge pixels are not label text
+        tick = {x for x in range(lo, hi) if all(near(im.getpixel((x, y)), INK, 8) for y in five)}
+        ink = {x for y in five for x in range(lo, hi)
+               if dim_text(im.getpixel((x, y))) and not any(abs(x - t) <= 3 for t in tick)}
         assert ink, "no 5h label drawn"
         assert max(bar) < min(ink) or max(ink) < min(bar), (min(bar), max(bar), min(ink), max(ink))
+
+def test_phone_over_pace_segment_is_red_on_both_tracks():
+    """Use past the pace tick draws red on the weekly track and, at full strength, on the 5h one."""
+    def red_bands(week, five):
+        cache = {"ts": NOW, "claude_week": week, "claude_week_reset_ts": NOW + 4 * 86400,
+                 "claude_5h": five, "claude_5h_reset_ts": NOW + 2.5 * 3600}
+        with tempfile.TemporaryDirectory() as t:
+            r, out = render(t, cache, None, "--phone")
+            assert r.returncode == 0, r.stderr
+            im = Image.open(out).convert("RGB"); w, h = im.size
+            rows = [y for y in range(h) if any(im.getpixel((x, y)) == RED for x in range(0, w, 2))]
+            bands = [[rows[0]]] if rows else []
+            for y in rows[1:]:
+                (bands[-1].append(y) if y - bands[-1][-1] <= 1 else bands.append([y]))
+            return bands
+    assert len(red_bands(60, 90)) == 2   # weekly 60% at 43% elapsed, 5h 90% at 50% elapsed
+    assert red_bands(10, 10) == []       # both under pace: no red
 
 if __name__ == "__main__":
     if Image is None:

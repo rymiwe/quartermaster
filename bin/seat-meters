@@ -12,7 +12,8 @@ except ImportError:
 CACHE = os.environ.get("SEAT_USAGE_CACHE", os.path.expanduser("~/.cache/seat-usage/latest.json"))
 ARGS = [a for a in sys.argv[1:] if a != "--phone"]; PHONE = "--phone" in sys.argv[1:]
 OUT = ARGS[0] if ARGS else os.path.join(os.environ.get("TMPDIR") or "/tmp", "seat-meters.png")
-BG, INK, DIM, TRACK = "#141a22", "#e6ebf2", "#8a96a8", "#2a3340"
+BG, INK, DIM = "#141a22", "#e6ebf2", "#8a96a8"
+TRACK_A = 0.14  # orderly: color-mix(in srgb, var(--ink) 14%, transparent)
 BLUE, RED, GOOGLE = "#5b8fd6", "#c43c3c", "#5468f0"
 GOOGLE_LABELS = {"Argon", "Gemini", "Claude/GPT"}
 H5, WK = 5 * 3600, 7 * 86400
@@ -92,8 +93,26 @@ P = lambda v: int(v * S)
 def left_txt(s):
     return f"{s/3600:.1f}h" if s < 2 * 86400 else f"{s/86400:.1f}d"
 
-def track(st, y, h, width_frac, right=None, left=None):
-    """Draw one track whose own tick lands on the shared now line."""
+SS = 4  # supersample factor for bar shapes: Pillow's rounded_rectangle has no antialiasing
+def pill(x0, y0, x1, y1, color, alpha=1.0, split=None, color2=None):
+    """Antialiased rounded bar like orderly's (border-radius 3px, clamped to a pill),
+    composited onto the image at `alpha`. Past x `split` it is `color2`, a hard stop."""
+    X0, Y0, X1, Y1 = x0 * S, y0 * S, x1 * S, y1 * S
+    ox, oy = int(X0), int(Y0); w, h = int(X1 + 1) - ox, int(Y1 + 1) - oy
+    if X1 - X0 <= 0 or Y1 - Y0 <= 0 or w <= 0 or h <= 0: return
+    r = min(3 * S, (X1 - X0) / 2, (Y1 - Y0) / 2) * SS
+    m = Image.new("L", (w * SS, h * SS), 0)
+    box = ((X0 - ox) * SS, (Y0 - oy) * SS, (X1 - ox) * SS - 1, (Y1 - oy) * SS - 1)
+    ImageDraw.Draw(m).rounded_rectangle(box, radius=max(0, r - 0.5), fill=round(255 * alpha))
+    c = Image.new("RGB", (w * SS, h * SS), color)
+    if split is not None:
+        c.paste(color2, (max(0, int((split * S - ox) * SS)), 0, w * SS, h * SS))
+    img.paste(c.resize((w, h), Image.BOX), (ox, oy), m.resize((w, h), Image.LANCZOS))
+
+def track(st, y, h, width_frac, right=None, left=None, fill_alpha=1.0):
+    """Draw one track whose own tick lands on the shared now line. Styled after
+    orderly's .meter: a translucent ink track (14%), a blue fill that turns red
+    past the pace tick, and red throughout when the pool is full."""
     nx = X0 + MW * nowfrac
     tw = MW * width_frac
     # Keep the track inside the meter area: shrink it (tick still on now) if it would spill.
@@ -101,22 +120,21 @@ def track(st, y, h, width_frac, right=None, left=None):
     if st["e"] < 1: tw = min(tw, ((right if right is not None else X0 + MW) - nx) / (1 - st["e"]))
     tx = nx - tw * st["e"]
     if tw < h: return  # no room left for a track that keeps its tick on now
-    g.rounded_rectangle((P(tx), P(y), P(tx + tw), P(y + h)), radius=P(h / 2), fill=TRACK)
+    pill(tx, y, tx + tw, y + h, INK, TRACK_A)
     fw = tw * min(st["pct"], 100) / 100
     if fw > 0:
-        col_split = tw * st["e"]
+        split = tx + tw * st["e"]
         if st["pct"] >= 100:
-            g.rounded_rectangle((P(tx), P(y), P(tx + fw), P(y + h)), radius=P(h / 2), fill=RED)
+            pill(tx, y, tx + fw, y + h, RED)
+        elif fw > tw * st["e"]:  # the part past the pace tick is red, at full strength
+            pill(tx, y, tx + fw, y + h, BLUE, split=split, color2=RED)
         else:
-            g.rounded_rectangle((P(tx), P(y), P(tx + fw), P(y + h)), radius=P(h / 2), fill=BLUE)
-            if fw > col_split:  # the part past the pace tick is red
-                a, b = tx + col_split, tx + fw
-                if b - a >= h:
-                    g.rounded_rectangle((P(a), P(y), P(b), P(y + h)), radius=P(h / 2), fill=RED)
-                    g.rectangle((P(a), P(y), P(a + h / 2), P(y + h)), fill=RED)
-                else:
-                    g.rectangle((P(a), P(y), P(b), P(y + h)), fill=RED)
+            pill(tx, y, tx + fw, y + h, BLUE, fill_alpha)
     return tw
+
+def tick(x, y0, y1):
+    """orderly's now marker: 2px ink, rounded, 3px past the bars above and below."""
+    pill(x - 1, y0 - 3, x + 1, y1 + 3, INK)
 
 g.text((P(PAD), P(PAD)), "Seat usage", font=FB, fill=INK)
 g.text((P(W - PAD), P(PAD)), f"as of {int((now - d.get('ts', now)) / 60)} min ago", font=FS, fill=DIM, anchor="ra")
@@ -131,9 +149,9 @@ for label, m, f in (rows if not PHONE else []):
     g.text((P(PAD), P(cy)), label, font=F, fill=INK, anchor="lm")
     wf = m["w"] / span if m else 0.5
     if m:
-        track(m, cy - 3, 6, wf)
+        track(m, cy - 3, 5 if f else 6, wf)
     if f:
-        track(f, cy + 8, 4, wf if m else 0.5)
+        track(f, cy + 5, 3, wf if m else 0.5, fill_alpha=.55)
     if not m and not f:
         g.text((P(X0 + MW + 12), P(cy)), "no reading", font=FS, fill=DIM, anchor="lm")
     val = f"{m['pct']:.0f}%" if m else ""
@@ -188,7 +206,7 @@ if PHONE:
         g.text((P(PAD), P(ty)), sub, font=F, fill=INK, anchor="lm")
         if m:
             g.text((P(W - PAD), P(ty)), f"{m['pct']:.0f}%  \u00b7  {left_txt(m['left'])}", font=FB, fill=INK, anchor="rm")
-            track(m, ty + 18, 10, m["w"] / span)
+            track(m, ty + (20.5 if f else 20), 5 if f else 6, m["w"] / span)
         else:
             g.text((P(W - PAD), P(ty)), "no reading", font=FS, fill=DIM, anchor="rm")
         if f:
@@ -198,16 +216,16 @@ if PHONE:
             # the now line is too close to it, then label on the left
             lw = g.textlength(ftxt, font=FS) / S + 10
             if W - PAD - lw - (X0 + MW * nowfrac) >= 12:
-                track(f, ty + 34, 6, wf, right=W - PAD - lw)
+                track(f, ty + 35.5, 3, wf, right=W - PAD - lw, fill_alpha=.55)
                 g.text((P(W - PAD), P(ty + 37)), ftxt, font=FS, fill=DIM, anchor="rm")
             else:
-                track(f, ty + 34, 6, wf, left=PAD + lw)
+                track(f, ty + 35.5, 3, wf, left=PAD + lw, fill_alpha=.55)
                 g.text((P(PAD), P(ty + 37)), ftxt, font=FS, fill=DIM, anchor="lm")
         nxr = X0 + MW * nowfrac  # tick only through this row's bars, never over text
-        g.line((P(nxr), P(ty + 14), P(nxr), P(ty + (44 if f else 32))), fill=INK, width=P(1.5))
+        tick(nxr, ty + 35.5 if f and not m else ty + (20.5 if f else 20), ty + (38.5 if f else 26))
         y += h
 nx = X0 + MW * nowfrac
-if not PHONE: g.line((P(nx), P(top - 4), P(nx), P(y - 6)), fill=INK, width=P(1.5))
+if not PHONE: pill(nx - 1, top - 4, nx + 1, y - 6, INK)
 if not PHONE: g.text((P(nx), P(top - 6)), "now", font=FS, fill=DIM, anchor="mb")
 if errs:
     y += 8
