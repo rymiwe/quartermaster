@@ -7,7 +7,8 @@ No token, cookie, email, plan line or `lines` text leaves the machine. The gist
 is secret (unlisted), so anyone holding its id can read these numbers.
 
   seat-usage-push --setup     create the secret gist, print its id
-  seat-usage-push             refresh a stale cache, then push if it changed
+  seat-usage-push             refresh a stale cache, then push if it changed;
+                              logs one 'refresh' line to stderr per run
   seat-usage-push --dry-run   print the payload, push nothing
   seat-usage-push --pull      reader side: copy the gist's numbers into this
                               machine's cache; never runs seat-usage
@@ -25,7 +26,7 @@ without any vendor login. --pull filters again, so a gist edited by hand
 still cannot put a string into the reader's cache. It also writes Muse's
 muse-usage.json from the muse_* numbers so seat-meters can draw Muse.
 """
-import hashlib, json, os, subprocess, sys, time
+import hashlib, json, os, re, signal, subprocess, sys, tempfile, time
 
 H = os.path.expanduser("~")
 CACHE_DIR = os.environ.get("SEAT_USAGE_CACHE_DIR") or f"{H}/.cache/seat-usage"
@@ -176,17 +177,149 @@ def write_json(path, d):
     os.replace(tmp, path)
 
 
-def refresh_if_stale():
-    """Run seat-usage under the status line's lock when the cache is old. Waits for it."""
+LOCK_WAIT_S = 60       # flock -w: wait this long for the status line's run, then give up
+RUN_TIMEOUT_S = 90     # timeout(1) around seat-usage once the lock is held
+KILL_AFTER_S = 10      # then SIGKILL, so a child ignoring SIGTERM cannot keep the lock
+FUTURE_TS_S = 300      # a ts further ahead than this is unusable (skew, wrong unit); use mtime
+
+# Shapes that may be a credential in seat-usage's stderr tail: cookie and
+# authorization headers (to the end of the line), URL query values, key=value or "key": "value"
+# pairs named like one, bearer/basic values, known token prefixes, JWTs, and any
+# long run of token characters.
+_KEY = (r"[\w.-]*(?:token|cookie|session|secret|passw\w*|api[_-]?key|sso|csrf)[\w.-]*"
+        r"|auth|authorization|key|sid|pat")
+_SECRET_RES = [re.compile(p, re.I) for p in (
+    r"\b(?:set-)?cookie\b\s*[=:].*$",
+    r"\b(?:proxy-)?authorization\b\s*[=:].*$",
+    r"\b(?:bearer|basic)\s+\S+",
+    r"[\"']?\b(?:" + _KEY + r")\b[\"']?\s*[=:]\s*(?:\"[^\"]*\"?|'[^']*'?|[^\s,;&}]+)",
+    r"\b(?:sk|pk|rk|ops|ghp|gho|ghs|ghu|ghr|github_pat|xox[a-z])[-_][\w-]+",
+    r"\beyJ[\w-]{10,}(?:\.[\w-]*)*",
+    r"(?<=[?&])[^=\s&#]+=[^\s&#]*",         # URL query values
+    r"(?<=://)[^/\s@]+@",                    # URL userinfo
+    r"[A-Za-z0-9_\-+/=.%]{24,}",
+)]
+
+
+def scrub(line, cap=160):
+    """One stderr line with anything token-shaped replaced by <redacted>, cut to cap."""
+    line = "".join(c if c.isprintable() else " " for c in line).strip()
+    for r in _SECRET_RES:
+        line = r.sub("<redacted>", line)
+    return line[:cap]
+
+
+def cache_age(now=None):
+    """(age of the reading in seconds or None, where it came from, age of the file's mtime or None).
+
+    The reading's own ts wins; a cache without a usable ts falls back to mtime.
+    """
+    now = time.time() if now is None else now
     try:
-        age = time.time() - os.stat(CACHE).st_mtime
+        mtime_age = now - os.stat(CACHE).st_mtime
     except OSError:
-        age = None
-    if age is not None and age <= STALE_S or not os.access(SEAT_USAGE, os.X_OK):
-        return
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    subprocess.run(["flock", "-n", LOCK, "timeout", "90", SEAT_USAGE, "--quiet"],
-                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        mtime_age = None
+    d = read_json(CACHE)
+    ts = d.get("ts") if d else None
+    if _finite(ts) and 0 < ts <= now + FUTURE_TS_S:
+        return now - ts, "ts", mtime_age
+    by = "mtime(bad-ts)" if _finite(ts) and ts > now + FUTURE_TS_S else "mtime"
+    return mtime_age, (by if mtime_age is not None else "none"), mtime_age
+
+
+def _s(v):
+    return "none" if v is None else f"{v:.0f}s"
+
+
+def _log(msg):
+    print(f"seat-usage-push: refresh {msg}", file=sys.stderr, flush=True)
+
+
+def refresh_if_stale():
+    """Refresh a stale cache under the status line's lock. Logs one line per call.
+
+    Waits up to LOCK_WAIT_S (flock -w) for a status-line run holding the lock,
+    then rechecks the age so a run that just landed a reading is not repeated.
+    seat-usage inherits the held lock descriptor and adopts it. Only seat-usage's
+    exit code and a scrubbed last stderr line are logged; stdout is discarded.
+    """
+    seen = "age=? by=?"
+    try:
+        age, by, mage = cache_age()
+        seen = f"age={_s(age)} by={by} mtime_age={_s(mage)} stale_after={STALE_S}s"
+        _refresh(age, seen)
+    except Exception as e:   # still one line, and the push goes on with whatever cache there is
+        _log(f"skip why=error exc={type(e).__name__} {seen}")
+
+
+def _refresh(age, seen):
+    if age is not None and age <= STALE_S:
+        return _log(f"skip why=fresh {seen}")
+    if not os.access(SEAT_USAGE, os.X_OK):
+        return _log(f"skip why=not-executable {seen}")
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        fd = os.open(LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as e:
+        return _log(f"skip why=lock-open-failed errno={e.errno} {seen}")
+    try:
+        t0 = time.monotonic()
+        try:
+            r = subprocess.run(["flock", "-w", str(LOCK_WAIT_S), "-E", "75", str(fd)], pass_fds=(fd,),
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               timeout=LOCK_WAIT_S + 15)
+            frc = r.returncode
+        except (OSError, subprocess.TimeoutExpired) as e:
+            frc = type(e).__name__
+        wait = f"wait={time.monotonic() - t0:.1f}s"
+        if frc != 0:
+            if frc == 75:
+                return _log(f"skip why=lock-busy lock=timeout {wait} {seen}")
+            return _log(f"skip why=lock-error lock=error({frc}) {wait} {seen}")
+        age2, by2, mage2 = cache_age()
+        if age2 is not None and age2 <= STALE_S:
+            return _log(f"skip why=fresh-after-wait lock=got {wait} {seen} new_age={_s(age2)} new_by={by2}")
+        t1 = time.monotonic()
+        tail = ""
+        with tempfile.TemporaryFile() as err:   # a file, not a pipe: a lingering child cannot hang us
+            try:
+                # Its own session, so the backstop below can kill seat-usage too, not just timeout(1);
+                # a survivor would keep the inherited lock and starve the status line.
+                p = subprocess.Popen(["timeout", "-k", str(KILL_AFTER_S), str(RUN_TIMEOUT_S), SEAT_USAGE, "--quiet"],
+                                     pass_fds=(fd,), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                     stderr=err, start_new_session=True)
+                try:
+                    rc = p.wait(timeout=RUN_TIMEOUT_S + KILL_AFTER_S + 15)
+                except subprocess.TimeoutExpired as e:
+                    try:
+                        os.killpg(p.pid, signal.SIGKILL)
+                    except OSError:
+                        pass
+                    p.wait()
+                    rc = type(e).__name__
+            except OSError as e:
+                rc = type(e).__name__
+            err.seek(0, os.SEEK_END)
+            start = max(0, err.tell() - 4096)
+            err.seek(start)
+            lines = err.read().decode("utf-8", "replace").splitlines()
+            if start > 0 and lines:
+                lines = lines[1:]   # a cut line may have lost the key that marks its value secret
+            lines = [ln for ln in lines if ln.strip()]
+            if lines:
+                tail = scrub(lines[-1])
+            elif start > 0:
+                tail = "<truncated>"
+        dur = f"dur={time.monotonic() - t1:.1f}s"
+        # 124: timeout sent TERM; 137 or -9: it had to KILL the process group.
+        timed = " timed-out" if rc == 124 else " killed" if rc in (137, -9) else ""
+        age3, by3, _ = cache_age()
+        msg = (f"ran rc={rc}{timed} {dur} lock=got {wait} {seen} new_age={_s(age3)} new_by={by3}")
+        if tail:
+            msg += f" stderr={json.dumps(tail)}"
+        _log(msg)
+    finally:
+        os.close(fd)
 
 
 def gh_api(method, path, body):
@@ -239,6 +372,10 @@ def push():
         return 0
     payload = json.loads(body)
     payload["pushed_at"] = now
+    # Seconds between the reading and this push; null without a usable reading time.
+    # Kept out of the digest, like pushed_at, so it alone never forces a push.
+    ts = payload.get("ts")
+    payload["age_s"] = round(now - ts) if _finite(ts) and 0 < ts <= now + FUTURE_TS_S else None
     try:
         gh_api("PATCH", f"gists/{cfg['id']}", {"files": {FILE: {"content": content(payload)},
                                                          CACHE_FILE: {"content": copy}}})
