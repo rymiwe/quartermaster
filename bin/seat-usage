@@ -574,17 +574,30 @@ def claude():
     return out
 
 def claude_max_flag(plan, scoped):
-    """True on a Max plan, False on another known plan, None when unknown.
+    """True on a Max plan, False on Pro, None when unknown.
 
-    The OAuth profile's organization.rate_limit_tier names the plan
-    (default_claude_max_5x, default_claude_ai for Pro); claude_plan is that
-    name without "default_". A failed profile read leaves "?", and then a
-    weekly_scoped (Fable) limit in this usage reading still says Max, since
-    only Max has one. Its absence proves nothing: a read can omit it.
+    A weekly_scoped (Fable) limit in this usage reading says Max outright:
+    only Max has one. Otherwise the OAuth profile's organization.rate_limit_tier
+    decides (claude_plan is that name without "default_"): "max" in it is Max,
+    claude_ai (Pro, seen 2026-10) is not, and any other name (team, enterprise,
+    a new tier, or "?" from a failed profile read) is unknown.
     """
-    if isinstance(plan, str) and plan.strip() and plan.strip() != "?":
-        return "max" in plan.lower()
-    return True if scoped else None
+    if scoped:
+        return True
+    return _plan_is_max(plan)
+
+# Tier names seen without a Fable slice. Any other tier without "max" is unknown.
+NON_MAX_TIERS = ("claude_ai", "claude_pro")
+
+def _plan_is_max(plan):
+    if not isinstance(plan, str):
+        return None
+    name = plan.strip().lower().replace("default_", "")
+    if "max" in name:
+        return True
+    if name in NON_MAX_TIERS:
+        return False
+    return None
 
 def claude_max(s):
     """The cached claude_max flag, or the plan name on a cache written before it. None when unknown."""
@@ -593,10 +606,7 @@ def claude_max(s):
         return flag
     if "claude_max" in s:
         return None
-    plan = s.get("claude_plan")
-    if isinstance(plan, str) and plan.strip() and plan.strip() != "?":
-        return "max" in plan.lower()
-    return None
+    return _plan_is_max(s.get("claude_plan"))
 
 def claude_renewal():
     """Neither the OAuth profile nor usage endpoint carries a billing date (checked
@@ -1628,6 +1638,8 @@ def score_route(role, s, now, states=None):
     if missing:
         return _row(role, s, now, "ask", missing)
     ranked = _ranked(role, track)
+    if claude_max(s) is False:  # no slice off Max, whatever the role
+        ranked = [r for r in ranked if r[2] != "fable"]
     if off_max:
         frontier = set(_fable_frontier_ids(True))
         ranked = [r for r in ranked if r[2] in frontier]

@@ -856,8 +856,10 @@ class _AnthropicHandler(BaseHTTPRequestHandler):
                 mode = self.server.profile_mode
             if mode == "expired":
                 self._send(401, {"Content-Type": "application/json"}, _EXPIRED_BODY)
+            elif mode == "error":
+                self._send(500, {"Content-Type": "application/json"}, b"{}")
             else:
-                self._send(200, {"Content-Type": "application/json"}, _PROFILE_OK)
+                self._send(200, {"Content-Type": "application/json"}, self.server.profile_body or _PROFILE_OK)
             return
         if self.path.endswith("/api/oauth/usage"):
             with self.server.hits_lock:
@@ -875,7 +877,7 @@ class _AnthropicHandler(BaseHTTPRequestHandler):
             elif mode == "denied":
                 self._send(401, {"Content-Type": "application/json"}, _EXPIRED_BODY)
             else:
-                self._send(200, {"Content-Type": "application/json"}, _USAGE_OK)
+                self._send(200, {"Content-Type": "application/json"}, self.server.usage_body or _USAGE_OK)
             return
         self._send(404, {}, b"")
 
@@ -899,6 +901,8 @@ def anthropic_server():
     server.bad_auth = 0
     server.profile_mode = "ok"
     server.usage_mode = "ok"
+    server.profile_body = None
+    server.usage_body = None
     server.retry_sent = []
     server.hit_gate = threading.Event()
     server.release_gate = threading.Event()
@@ -968,6 +972,44 @@ def _quiet_cache():
     su.full_run(quiet=True, timeout=5)
     with open(su.CACHE) as f:
         return json.load(f)
+
+
+_PROFILE_PRO = json.dumps({
+    "organization": {"rate_limit_tier": "default_claude_ai", "subscription_status": "active"},
+}).encode()
+_USAGE_PRO = json.dumps({"limits": [
+    {"kind": "session", "percent": 11, "resets_at": "2099-01-01T00:00:00Z"},
+    {"kind": "weekly_all", "percent": 22, "resets_at": "2099-01-01T00:00:00Z"},
+]}).encode()
+
+
+@test
+def pro_reading_sets_claude_max_false_and_the_pulled_copy_routes_off_claude():
+    push = load("seat_usage_push", HERE.parents[0] / "bin" / "seat-usage-push")
+    with anthropic_server() as server:
+        profile, usage = server_urls(server)
+        with seat_http_sandbox(profile, usage):
+            server.profile_body, server.usage_body = _PROFILE_PRO, _USAGE_PRO
+            cache = _quiet_cache()
+    assert cache["claude_plan"] == "claude_ai" and cache["claude_max"] is False, cache
+    assert "fable" not in cache, cache
+    copy = push.build_cache_copy(cache)
+    assert copy["claude_max"] is False and "claude_plan" not in copy, copy
+    pulled = snap(claude_max=False, cursor_api_pct=10)
+    pulled.update({k: v for k, v in copy.items() if k.startswith("claude_")})
+    pulled.pop("fable", None); pulled.pop("fable_reset_ts", None); pulled["pulled_ts"] = NOW
+    r = su.route("bounded-question", pulled, NOW)
+    assert r["seat"] == "cursor" and r["family"] == "fable", r
+
+
+@test
+def failed_profile_with_a_fable_slice_is_max():
+    with anthropic_server() as server:
+        profile, usage = server_urls(server)
+        with seat_http_sandbox(profile, usage):
+            server.profile_mode = "error"
+            cache = _quiet_cache()
+    assert cache["claude_plan"] == "?" and cache["claude_max"] is True, cache
 
 
 _RATE_CHILD = r"""
@@ -1983,10 +2025,13 @@ def bounded_question_off_max_never_seats_fable_on_claude():
 @test
 def claude_max_flag_from_plan_and_fable_slice():
     f = su.claude_max_flag
-    assert f("claude_max_5x", False) is True and f("default_claude_max_20x", True) is True
-    assert f("claude_ai", False) is False and f("claude_ai", True) is False   # the tier name decides
-    assert f("?", True) is True          # profile failed, but this reading had a weekly Fable slice
+    assert f("claude_max_5x", False) is True and f("default_claude_max_20x", False) is True
+    assert f("claude_ai", False) is False and f("default_claude_ai", False) is False
+    assert f("claude_ai", True) is True   # a Fable slice in the reading is Max, whatever the name
+    assert f("?", True) is True           # profile failed, but this reading had a weekly Fable slice
     assert f("?", False) is None and f(None, False) is None and f("", False) is None
+    assert f("claude_team", False) is None and f("claude_enterprise", False) is None   # not a known tier
+    assert su.claude_max(snap(claude_plan="claude_team")) is None
     assert su.claude_max(snap(claude_max=False, claude_plan="claude_max_5x")) is False   # flag first
     assert su.claude_max(snap(claude_plan="claude_ai")) is False
     assert su.claude_max(snap(claude_plan="?")) is None and su.claude_max(snap()) is None
