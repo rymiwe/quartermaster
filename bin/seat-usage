@@ -3139,16 +3139,24 @@ def caps_early_s(used, reset, window, now):
     return early if early > 0 else None
 
 def caps_sources():
-    """(cache key prefix, used key, reset key, window seconds or window key) for every projected pool."""
-    out = [(pid, meta["used"], meta["reset"], meta["window"]) for pid, meta in POOLS.items()]
-    return out + [(used, used, reset, secs) for used, reset, secs in _GOOGLE_CAPS]
+    """(key prefix, used key, reset key, window seconds or window key, as_of seat) per projected pool."""
+    out = [(pid, meta["used"], meta["reset"], meta["window"], meta["seat"]) for pid, meta in POOLS.items()]
+    return out + [(used, used, reset, secs, "google") for used, reset, secs in _GOOGLE_CAPS]
 
 def apply_caps(summary, now):
+    """Project each pool at its own reading's time (as_of), so a carried-over
+    reading keeps the projection it had rather than one diluted by time that
+    saw no new reading. A reset already past drops the key."""
     for k in [k for k in summary if k.endswith("_caps_early_s")]:
         del summary[k]
-    for name, used, reset, window in caps_sources():
+    as_of = summary.get("as_of") if isinstance(summary.get("as_of"), dict) else {}
+    for name, used, reset, window, seat in caps_sources():
         win = summary.get(window) if isinstance(window, str) else window
-        early = caps_early_s(summary.get(used), summary.get(reset), win, now)
+        at = as_of.get(seat) if _is_number(as_of.get(seat)) else now
+        rts = summary.get(reset)
+        if not _is_number(rts) or rts <= now:
+            continue
+        early = caps_early_s(summary.get(used), rts, win, min(at, now))
         if early is not None:
             summary[f"{name}_caps_early_s"] = early
 

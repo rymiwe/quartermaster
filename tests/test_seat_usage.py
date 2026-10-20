@@ -1041,6 +1041,15 @@ def apply_caps_writes_one_key_per_projected_pool_and_drops_old_ones():
     assert s["claude_week_caps_early_s"] == 2 * 86400, s
     assert s["google_gemini_5h_caps_early_s"] == 6000, s
     assert "codex_caps_early_s" not in s and "grokbot_caps_early_s" not in s, s   # stale key gone; under pace
+    # A carried-over reading keeps its projection: measured at its as_of, not at write time.
+    old = snap(claude_week=60, claude_week_reset_ts=NOW + 4 * 86400)
+    old["as_of"] = dict(old["as_of"], claude=NOW - 3600)
+    su.apply_caps(old, NOW)
+    assert old["claude_week_caps_early_s"] == su.caps_early_s(60, NOW + 4 * 86400, WEEK, NOW - 3600), old
+    gone = snap(claude_week=60, claude_week_reset_ts=NOW + 4 * 86400)
+    gone["as_of"] = dict(gone["as_of"], claude=NOW - 5 * 86400)
+    su.apply_caps(gone, NOW)
+    assert "claude_week_caps_early_s" not in gone, gone   # at that reading the reset was > one window off
     push = load("seat_usage_push", HERE.parents[0] / "bin" / "seat-usage-push")
     keys = {f"{name}_caps_early_s" for name, *_ in su.caps_sources()}
     assert keys <= push.CACHE_NUMBERS, sorted(keys - push.CACHE_NUMBERS)
