@@ -804,7 +804,9 @@ def grok_cookie():
         if not path:
             COOKIE_TRIED.append(f"{name} not on PATH"); continue
         try:
-            r = subprocess.run([path, "read", op_ref()], capture_output=True, text=True, timeout=20)
+            # Own session, no stdin: under a terminal, op could otherwise stop this whole group.
+            r = subprocess.run([path, "read", op_ref()], capture_output=True, text=True, timeout=20,
+                               stdin=subprocess.DEVNULL, start_new_session=True)
             v = r.stdout.replace("\r", "").strip()
             if r.returncode == 0 and v:
                 write_cookie_cache(v)
