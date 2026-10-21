@@ -3980,17 +3980,19 @@ def plans_line(summary, now=None):
         parts.append("google AI Pro (label, not read)")
     return "plans    | " + " | ".join(parts)
 
-# Status-line groups, in drawing order. Hues are xterm-256 indexes. Google's
-# 63 is the nearest to seat-meters' indigo #5468f0.
-_ROW_GROUPS = (("cl", 208), ("cx", 141), ("cu", 43), ("gk", 75), ("mu", 212), ("gg", 63))
+# Status-line groups, in drawing order: id, hue, label. Hues are xterm-256
+# indexes. Google's 63 is the nearest to seat-meters' indigo #5468f0. The label
+# names the vendor for a reader with no status-line legend (orderly's rail).
+_ROW_GROUPS = (("cl", 208, "Claude"), ("cx", 141, "Codex"), ("cu", 43, "Cursor"), ("gk", 75, "SuperGrok"),
+               ("mu", 212, "Muse"), ("gg", 63, "Google"))
 
 def seat_rows(s, now=None):
     """What a status line draws, from the cache numbers. Pure; written into latest.json.
 
-    A list of {"id", "hue", "tag"?, "ondemand_over"?, "bars"}. A bar is
+    A list of {"id", "hue", "label", "tag"?, "ondemand_over"?, "bars"}. A bar is
     {"kind": "seat"|"failed"|"empty"|"off", "name", "seat", ...}; a "seat" bar adds
-    pool, hue, pct, reset_ts, window_s, notify (may name its reset), and on Claude
-    term_ts/term_verb/term_day. "stdin" names the Claude Code rate_limits key that
+    pool, hue, pct, reset_ts, window_s, notify (may name its reset), "label"? (a
+    longer name than the status line's), and on Claude term_ts/term_verb/term_day. "stdin" names the Claude Code rate_limits key that
     overrides it live. "stale_name" sits on the first bar of each seat, for the
     renderer's old-reading note. Staleness and wording stay with the renderer.
     """
@@ -4001,7 +4003,7 @@ def seat_rows(s, now=None):
     def bar(name, seat, pool, hue, pct, reset, window, notify=True, **extra):
         return {"kind": "seat", "name": name, "seat": seat, "pool": pool, "hue": hue, "pct": pct,
                 "reset_ts": reset, "window_s": window, "notify": notify, **extra}
-    groups = {gid: {"id": gid, "hue": hue, "bars": []} for gid, hue in _ROW_GROUPS}
+    groups = {gid: {"id": gid, "hue": hue, "label": label, "bars": []} for gid, hue, label in _ROW_GROUPS}
 
     cl = groups["cl"]
     if isinstance(s.get("claude_max"), bool):
@@ -4079,11 +4081,12 @@ def seat_rows(s, now=None):
         if not ok("google"):
             gg["bars"].append({"kind": "failed", "name": "gg", "seat": "google"})
         else:
-            for i, (pool, name, hue) in enumerate((("argon", "argon", 63), ("gemini", "gemini", 69),
-                                                   ("claudegpt", "c/g", 105))):
+            for pool, name, label, hue in (("argon", "argon", "Argon weekly", 63),
+                                           ("gemini", "gemini", "Gemini weekly", 69),
+                                           ("claudegpt", "c/g", "Claude/GPT weekly", 105)):
                 if num(f"google_{pool}_week") is not None:
                     gg["bars"].append(bar(name, "google", f"google_{pool}_week", hue, num(f"google_{pool}_week"),
-                                          num(f"google_{pool}_week_reset_ts"), 7 * 86400,
+                                          num(f"google_{pool}_week_reset_ts"), 7 * 86400, label=label,
                                           **({} if gg["bars"] else {"stale_name": "gg"})))
     return [g for g in groups.values() if g["bars"] or g.get("tag")]
 
