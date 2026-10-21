@@ -209,8 +209,8 @@ def test_phone_5h_track_has_no_text_beside_it():
         ink = {x for y in five for x in range(lo, hi)
                if dim_text(im.getpixel((x, y))) and not any(abs(x - t) <= 4 for t in tick)}
         assert not ink, sorted(ink)[:5]
-        pools = phone_text(t, cache)["cards"][0]["pools"]
-        assert pools[0]["stats"].startswith("5% \u00b7 5h 20%"), pools[0]["stats"]
+        gem = _pool(phone_text(t, cache), "Google AI Pro \u00b7 Gemini")
+        assert gem["stats"].startswith("5% \u00b7 5h 20%"), gem["stats"]
 
 def test_phone_over_pace_segment_is_red_on_both_tracks():
     """Use past the pace tick draws red on the weekly track and, at full strength, on the 5h one."""
@@ -357,36 +357,148 @@ def test_phone_card_headers_use_cached_renewals_only():
     assert _card(doc, "Google AI Pro \u00b7 Argon")["header"] is None          # no renewal in the cache
     assert _card(doc, "Muse \u00b7 weekly")["header"] is None
 
-def test_phone_chips_follow_orderly_and_the_claude_plan():
+def test_phone_chips_follow_orderly_whatever_the_claude_plan():
+    """orderly seatLabel: every family whose sources include the seat. The plan hides no chip;
+    only the Fable slice row itself still needs a Max cache."""
     base = {"ts": NOW, "as_of": FRESH, "claude_week": 10, "claude_week_reset_ts": NOW + 4 * 86400,
             "cursor_api_pct": 20, "cursor_reset_ts": NOW + 20 * 86400, "cursor_window_s": 31 * 86400,
             "grok_pct": 19, "grok_reset_ts": NOW + 3 * 86400, "grok_window_s": 7 * 86400,
             "google_argon_week": 0, "google_argon_week_reset_ts": NOW + 6 * 86400}
     with tempfile.TemporaryDirectory() as t:
         unknown = phone_text(t, base, muse_doc())
-        pro = phone_text(t, {**base, "claude_plan": "claude_ai"})
-        mx = phone_text(t, {**base, "claude_plan": "max_5x", "fable": 12, "fable_reset_ts": NOW + 4 * 86400})
-        flag_pro = phone_text(t, {**base, "claude_max": False, "claude_plan": "max_5x"})  # the flag wins
+        pro = phone_text(t, {**base, "claude_max": False})
         flag_max = phone_text(t, {**base, "claude_max": True, "fable": 12, "fable_reset_ts": NOW + 4 * 86400})
-        bad_flag = phone_text(t, {**base, "claude_max": "yes", "claude_plan": "max_5x"})  # not a bool: unknown
-        odd_tier = phone_text(t, {**base, "claude_plan": "enterprise"})
+        capped = phone_text(t, {**base, "claude_week": 100, "grok_pct": 100, "grok_exhausted": True})
     fable_slice = lambda doc: any(p["title"] == "Claude \u00b7 Fable slice" for c in doc["cards"] for p in c["pools"])
-    for doc in (unknown, bad_flag, odd_tier):
-        assert _pool(doc, "Claude \u00b7 weekly")["chips"] == [["Opus", "solid"]] and not fable_slice(doc)
-        assert any("whether the Claude plan is Max" in n for n in doc["notes"]), doc["notes"]
-    for doc in (pro, flag_pro):  # Pro: no Fable, and nothing to explain
-        assert _pool(doc, "Claude \u00b7 weekly")["chips"] == [["Opus", "solid"]] and doc["notes"] == []
-        assert not fable_slice(doc)
-    for doc in (mx, flag_max):
-        assert _pool(doc, "Claude \u00b7 weekly")["chips"] == [["Fable", "solid"], ["Opus", "solid"]]
-        assert _pool(doc, "Claude \u00b7 Fable slice")["chips"] == [["Fable", "solid"]] and doc["notes"] == []
-    for doc in (unknown, pro, mx, flag_max):  # every chip the text lists is drawn in the PNG too
+    for doc in (unknown, pro, flag_max, capped):
+        assert _pool(doc, "Claude \u00b7 weekly")["chips"] == [["Fable", "solid"], ["Opus", "solid"]], doc
+        assert doc["notes"] == [], doc["notes"]  # no "missing Fable chip" footnote any more
         assert all(p["chips_drawn"] == len(p["chips"]) for c in doc["cards"] for p in c["pools"]), doc
+        assert _pool(doc, "SuperGrok \u00b7 weekly")["chips"] == [["Grok", "dotted"]]  # a full pool keeps its chip
+    for doc in (unknown, pro, flag_max, capped):  # orderly always draws the Fable slice row, with its chip
+        assert fable_slice(doc) and _pool(doc, "Claude \u00b7 Fable slice")["chips"] == [["Fable", "solid"]]
     assert _pool(unknown, "Cursor \u00b7 Other Models")["chips"] == [["Fable", "dashed"], ["Opus", "dashed"], ["Sol", "dashed"]]
-    assert _pool(unknown, "SuperGrok \u00b7 weekly")["chips"] == [["Grok", "dotted"]]
     assert _pool(unknown, "Muse \u00b7 weekly")["chips"] == [["Wonder full", "solid"], ["Wonder", "solid"]]
     assert _pool(unknown, "Google AI Pro \u00b7 Argon")["chips"] == [["Argon", "solid"]]  # config/pools.json
     assert unknown["legend"] == "dashed = metered \u00b7 dotted = builder only \u00b7 \u2605 first usable pool for the family"
+
+def test_phone_fable_slice_row_follows_orderly():
+    """quota_claude_fable (orderly server.rb:2031-2047) and renderRail (newtab.js:1205-1243):
+    live with a percent; absent ("not on <plan>") when the plan is known not to be Max and the
+    Claude read finished; otherwise unknown. Always drawn, always with its Fable chip."""
+    now = time.time()
+    base = {"ts": now, "as_of": {"claude": now - 120}, "claude_week": 10, "claude_week_reset_ts": now + 4 * 86400}
+    fab = lambda doc: _pool(doc, "Claude \u00b7 Fable slice")
+    with tempfile.TemporaryDirectory() as t:
+        pro = phone_text(t, {**base, "claude_max": False})            # the pulled copy: only the bit
+        pro_png = os.path.join(t, "p.png"); pro_im = Image.open(pro_png).convert("RGB"); pro_im.load()
+        named = phone_text(t, {**base, "claude_plan": "claude_ai"})    # orderly's own input: the plan name
+        odd = phone_text(t, {**base, "claude_plan": "enterprise"})
+        old = phone_text(t, {**base, "claude_max": False, "as_of": {"claude": now - 3600 - 5}})
+        no_read = phone_text(t, {**base, "claude_max": False, "as_of": {}})   # no finished read: not absent
+        unknown = phone_text(t, base)
+        mx = phone_text(t, {**base, "claude_max": True})
+        live = phone_text(t, {**base, "claude_max": True, "fable": 12, "fable_reset_ts": now + 3 * 86400})
+        bare = phone_text(t, {**base, "claude_max": True, "fable": 60})  # a percent with no reset
+        # a plan name wins over the bit, as orderly reads only the name: Max named, not absent
+        named_max = phone_text(t, {**base, "claude_plan": "default_claude_max_5x", "claude_max": False})
+        # a kept percent with no as_of.claude: orderly's red "read failed" after the percent
+        kept = phone_text(t, {**base, "as_of": {}, "fable": 12, "fable_reset_ts": now + 3 * 86400,
+                              "fable_caps_early_s": 86400, "errors": {"claude": "HTTPError 401: bad"}})
+        kept_bare = phone_text(t, {**base, "as_of": {}, "fable": 60})
+    assert (fab(pro)["state"], fab(pro)["stats"]) == ("absent", "not on this plan"), fab(pro)
+    assert fab(named)["stats"] == "not on Pro" and fab(odd)["stats"] == "not on enterprise"
+    assert fab(old)["stats"] == "not on this plan \u00b7 stale 1h", fab(old)
+    for doc in (pro, named, odd, old):
+        assert fab(doc)["chips"] == [["Fable", "solid"]] and fab(doc)["state"] == "absent"
+    for doc in (unknown, mx):
+        assert fab(doc)["state"] == "unknown"
+        assert fab(doc)["stats"] == "unknown \u00b7 seat-usage has no value \u00b7 verified 2m", fab(doc)
+    assert fab(no_read)["stats"] == "read failed \u00b7 unknown \u00b7 seat-usage has no value", fab(no_read)
+    assert fab(no_read)["red"] == ["read failed"]
+    assert fab(live)["state"] == "live" and fab(live)["stats"].startswith("12%"), fab(live)
+    assert (fab(bare)["state"], fab(bare)["stats"]) == ("live", "60%"), fab(bare)
+    assert fab(named_max)["state"] == "unknown", fab(named_max)
+    assert fab(kept)["stats"].startswith("12% \u00b7 caps 1d early \u00b7 read failed: HTTPError 401 \u00b7 resets"), fab(kept)
+    assert fab(kept)["red"] == ["caps 1d early", "read failed: HTTPError 401"], fab(kept)
+    assert fab(kept_bare)["stats"] == "60% \u00b7 read failed", fab(kept_bare)
+    # absent styling: the title in orderly's --muted, and a track the card's full content width
+    # at ink 8% over the Claude card (.track.absent); no other row is muted
+    assert fab(pro)["muted"] and not fab(unknown)["muted"] and not fab(live)["muted"]
+    assert not any(p["muted"] for c in pro["cards"] for p in c["pools"] if p["title"] != "Claude \u00b7 Fable slice")
+    track = over(O_INK, over((0xff, 0x87, 0x00), O_PANEL2, 0.09), 0.08)
+    w, h = pro_im.size
+    tx0, tx1 = (PHONE_CX0 + 11 * 1.3) * 3, (390 - 6 - 14 * 1.3 - 10 * 1.3) * 3  # card content edges
+    lo, hi = int(tx0) + 6, int(tx1) - 6
+    full = [y for y in range(h) if all(near(pro_im.getpixel((x, y)), track, 3) for x in range(lo, hi))]
+    assert full, "no full-width absent track"
+
+def test_phone_fable_track_shares_the_weekly_scale():
+    """A Fable window that ends before Claude weekly's still gets a full weekly-width track,
+    not one shrunk to fit a scale computed without it."""
+    now = time.time()
+    cache = {"ts": now, "as_of": {"claude": now}, "claude_max": True,
+             "claude_week": 10, "claude_week_reset_ts": now + 6 * 86400,      # 1 day in
+             "fable": 10, "fable_reset_ts": now + 1 * 86400}                  # 6 days in
+    with tempfile.TemporaryDirectory() as t:
+        r, out = render(t, cache, None)
+        assert r.returncode == 0, r.stderr
+        im = Image.open(out).convert("RGB"); w, h = im.size
+    track = over(O_INK, over((0xff, 0x87, 0x00), O_PANEL2, 0.09), 0.14)
+    is_bar = lambda p: near(p, track, 3) or near(p, BLUE, 3)
+    rows = {}
+    for y in range(h):
+        xs = [x for x in range(w) if is_bar(im.getpixel((x, y)))]
+        if len(xs) > 30: rows[y] = max(xs) - min(xs)
+    bands = []
+    for y in sorted(rows):
+        (bands[-1].append(y) if bands and y - bands[-1][-1] <= 1 else bands.append([y]))
+    assert len(bands) == 2, bands  # Claude weekly and the Fable slice
+    mid = [rows[b[len(b) // 2]] for b in bands]
+    assert abs(mid[0] - mid[1]) <= 4, mid  # same weekly window, same width
+
+def test_phone_spend_chip_follows_orderly():
+    """orderly spendChip: "$" after the family chips on the Cursor rows when spend is above zero,
+    on any of them (Grok Bot included) when the pool is capped; amber when capped, red past the limit."""
+    base = {"ts": NOW, "as_of": FRESH, "cursor_api_pct": 20, "cursor_auto_pct": 5, "cursor_reset_ts": NOW + 20 * 86400,
+            "cursor_window_s": 31 * 86400, "bot_pct": 30, "bot_reset_ts": NOW + 5 * 86400, "bot_window_s": 7 * 86400}
+    sp = lambda doc, title: (_pool(doc, title)["spend"], _pool(doc, title)["chips"][-1])
+    OM, CM, GB = "Cursor \u00b7 Other Models", "Cursor \u00b7 Cursor Models", "Grok Bot \u00b7 weekly"
+    with tempfile.TemporaryDirectory() as t:
+        none = phone_text(t, base)                                       # no spend number: no chip
+        zero = phone_text(t, {**base, "cursor_ondemand": 0})            # zero, nothing capped: no chip
+        spent = phone_text(t, {**base, "cursor_ondemand": 4.5})
+        over = phone_text(t, {**base, "cursor_ondemand": 30, "cursor_ondemand_limit": 20})
+        capped = phone_text(t, {**base, "cursor_ondemand": 0, "cursor_api_pct": 100, "bot_exhausted": True})
+    for doc in (none, zero):
+        assert all(p["spend"] is None and ["$", "solid"] not in p["chips"] for c in doc["cards"] for p in c["pools"]), doc
+    assert sp(spent, OM) == ("plain", ["$", "solid"]) and sp(spent, CM) == ("plain", ["$", "solid"])
+    assert _pool(spent, OM)["chips"][:3] == [["Fable", "dashed"], ["Opus", "dashed"], ["Sol", "dashed"]]
+    assert _pool(spent, GB)["spend"] is None  # the Bot shows spend only when its allowance is used up
+    assert sp(over, OM)[0] == "over" and sp(over, CM)[0] == "over"
+    assert sp(capped, OM)[0] == "draw" and sp(capped, GB)[0] == "draw"
+    assert _pool(capped, CM)["spend"] is None  # not capped, and zero spend
+    assert all(p["chips_drawn"] == len(p["chips"]) for c in capped["cards"] for p in c["pools"]), capped
+
+def test_phone_spend_chip_colors():
+    """The "$" chip is orderly --warn when its pool is capped and --crit past the limit."""
+    WARN, CRIT = (0xfa, 0xb2, 0x19), (0xe0, 0x4b, 0x4b)
+    # as_of.claude so the Fable row reads "unknown", not a red "read failed"
+    base = {"ts": NOW, "as_of": {"claude": NOW}, "cursor_api_pct": 20, "cursor_reset_ts": NOW + 20 * 86400,
+            "cursor_window_s": 31 * 86400}
+    def has(cache, color):
+        with tempfile.TemporaryDirectory() as t:
+            r, out = render(t, cache, None)
+            assert r.returncode == 0, r.stderr
+            im = Image.open(out).convert("RGB")
+            return color in {im.getpixel((x, y)) for y in range(im.size[1]) for x in range(im.size[0])}
+    assert not has(base, WARN) and not has(base, CRIT)
+    assert has({**base, "cursor_api_pct": 100, "cursor_ondemand": 0}, WARN)
+    assert has({**base, "cursor_ondemand": 30, "cursor_ondemand_limit": 20}, CRIT)
+    # Grok Bot alone and exhausted, under the limit: amber, not Grok blue
+    bot = {"ts": NOW, "as_of": {"claude": NOW}, "bot_pct": 100, "bot_exhausted": True, "bot_reset_ts": NOW + 5 * 86400,
+           "bot_window_s": 7 * 86400, "cursor_ondemand": 30, "cursor_ondemand_limit": 50}
+    assert has(bot, WARN)
 
 def test_phone_errors_wrap_inside_the_frame():
     with tempfile.TemporaryDirectory() as t:
@@ -440,10 +552,36 @@ def test_phone_google_chips_are_data_in_pools_json():
     assert _pool(doc, "Google AI Pro \u00b7 Gemini")["chips"] == [["Argon", "solid"], ["Gemini Flash", "solid"]]
     assert _pool(doc, "Google AI Pro \u00b7 Claude/GPT")["chips"] == [["Opus", "solid"], ["Sonnet", "solid"], ["GPT-OSS", "solid"]]
     assert all(p["chips_drawn"] == len(p["chips"]) for c in doc["cards"] for p in c["pools"]), doc
-    assert _pool(edited, "Google AI Pro \u00b7 Argon")["chips"] == [["Test fam", "dashed"]]  # read, not hard-coded
+    # read, not hard-coded; orderly styles chips by seat only, so pools.json's "style" is not used
+    assert _pool(edited, "Google AI Pro \u00b7 Argon")["chips"] == [["Test fam", "solid"]]
     assert _pool(edited, "Google AI Pro \u00b7 Claude/GPT")["chips"] == []
     assert all(p["chips"] == [] for p in _card(none, "Google AI Pro \u00b7 Argon")["pools"])
-    assert doc["notes"] == []  # no Claude row: no Claude plan footnote
+    assert doc["notes"] == []
+
+def test_phone_google_chips_take_orderlys_family_order():
+    """orderly families(): known families keep FAMILIES' order, so a Google row naming Opus last
+    still draws it first; new families follow in the order rows name them. A Google pool with no
+    weekly reading names none (seat_rows carries families only on a weekly bar)."""
+    with tempfile.TemporaryDirectory() as t:
+        conf = json.load(open(os.path.join(ROOT, "config", "pools.json")))
+        conf["google_ai_pro"]["pools"]["argon"] = {"families": ["Zeta", "Argon"]}
+        conf["google_ai_pro"]["pools"]["gemini"] = {"families": ["Argon", "Zeta"]}
+        conf["google_ai_pro"]["pools"]["claudegpt"] = {"families": ["GPT-OSS", "Opus"]}
+        alt = os.path.join(t, "pools.json"); json.dump(conf, open(alt, "w"))
+        doc = phone_text(t, GOOGLE_CACHE, pools=alt)
+        five_only = {k: v for k, v in GOOGLE_CACHE.items() if not k.startswith("google_gemini_week")}
+        five_only.update({"google_gemini_5h": 5, "google_gemini_5h_reset_ts": NOW + 3600})
+        no_week = phone_text(t, five_only, pools=alt)
+        # a weekly percent with no reset still names its families (seat_rows needs no reset)
+        no_reset = phone_text(t, {**five_only, "google_gemini_week": 5}, pools=alt)
+        # no as_of.google: seat_rows draws a failed bar, which names no families
+        no_stamp = phone_text(t, {**GOOGLE_CACHE, "as_of": {k: v for k, v in FRESH.items() if k != "google"}}, pools=alt)
+    assert _pool(no_reset, "Google AI Pro \u00b7 Gemini")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
+    assert all(p["chips"] == [] for p in _card(no_stamp, "Google AI Pro \u00b7 Argon")["pools"]), no_stamp
+    assert _pool(doc, "Google AI Pro \u00b7 Argon")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
+    assert _pool(doc, "Google AI Pro \u00b7 Gemini")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
+    assert _pool(doc, "Google AI Pro \u00b7 Claude/GPT")["chips"] == [["Opus", "solid"], ["GPT-OSS", "solid"]]
+    assert _pool(no_week, "Google AI Pro \u00b7 Gemini")["chips"] == []
 
 def test_phone_chips_that_do_not_fit_wrap_and_the_card_grows():
     with tempfile.TemporaryDirectory() as t:
