@@ -15,7 +15,7 @@ Snapshot of Ryan's "router core": `seat-usage` (reads per-seat/pool usage for Cl
 | `tests/test_seat_usage.py` | test suite (only the two path constants changed, see Tests) |
 | `renewals.example.json` | placeholder for `~/.config/seat-usage/renewals.json` (same schema, placeholder values) |
 | `install.sh` | links or copies the two commands into the frozen paths |
-| `bin/seat-meters` | optional: draws the cached reading as an orderly-style PNG (needs Pillow; no network). `seat-meters [--phone] [--text] [out.png]` (`--phone`: orderly's meters panel: a `Next host` line from `seat-usage --route host --cached --json`, one card per subscription with its cached renewal, orderly's model-family chips (Google AI Pro's come from `google_ai_pro` in `config/pools.json`; a Fable chip and the Fable slice row only when the cache says Max: `claude_max`, else a plan name with `max`), and a `55% · 5h 1% · resets Wed` stats line per pool, with orderly's red `caps 10d early` after the percent when the cache carries that pool's `<pool>_caps_early_s`; `--phone --text` also prints that layout's words as JSON instead of the path), cache path from `SEAT_USAGE_CACHE`. Google AI Pro is its own group in both layouts |
+| `bin/seat-meters` | optional: draws the cached reading as a PNG laid out like orderly's meters panel (needs Pillow; no network). `seat-meters [--text] [out.png]`: a `Next host` line from `seat-usage --route host --cached --json`, one card per subscription with its cached renewal, orderly's model-family chips (Google AI Pro's come from `google_ai_pro` in `config/pools.json`; a Fable chip and the Fable slice row only when the cache says Max: `claude_max`, else a plan name with `max`), and a `55% · 5h 1% · resets Wed` stats line per pool, with orderly's red `caps 10d early` after the percent when the cache carries that pool's `<pool>_caps_early_s`; `--text` also prints the layout's words as JSON instead of the path. This is the only layout: `--phone`, which used to pick it over a wide one, is still accepted and does nothing. Cache path from `SEAT_USAGE_CACHE`. Google AI Pro is its own card |
 | `bin/seat-usage-push` | optional: copies an allowlist of the cache to a secret gist for the phone widget, plus a numbers-only cache copy that `--pull` lands on a reader |
 | `systemd/` | the `seat-usage-push` timer (every 5 minutes) |
 | `android/` | Seats, the Android home-screen widget that reads that gist |
@@ -87,7 +87,7 @@ The check does not stash, reset, or overwrite local changes. A dirty tree, a bra
 
 A missing `agy`, a session that is not signed in, a non-zero exit, a timeout, or output that does not parse is an error line. No percent is invented. Numbers already in the cache stay until a later reading replaces them. `--cached` does not run `agy`. `SEAT_USAGE_SKIP_GOOGLE=1` skips the live check, as do `COUNCIL_VOTER=1` and `CONCLAVE_VOTER=1`.
 
-`seat-meters` draws those pools as their own Google AI Pro group, in a deep indigo blue (`#5468f0`) kept apart from SuperGrok's sky blue, in the wide layout and in `--phone`. Argon is the weekly row. Gemini and Claude/GPT each have a weekly bar and a 5-hour bar. There is no Antigravity API call.
+`seat-meters` draws those pools as their own Google AI Pro group, in a deep indigo blue (`#5468f0`) kept apart from SuperGrok's sky blue. Argon is the weekly row. Gemini and Claude/GPT each have a weekly bar and a 5-hour bar. There is no Antigravity API call.
 
 ## Phone widget (optional)
 
