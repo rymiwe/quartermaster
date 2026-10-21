@@ -46,7 +46,11 @@ def render(t, cache, muse=None, *flags):
     return r, out
 
 O_INK, O_PANEL2 = (0xe4, 0xe8, 0xee), (0x20, 0x26, 0x2e)  # orderly's dark palette
-PHONE_CX0 = 6 + 14 * 1.3  # frame inset plus the rail's 14px padding, at K = 1.3
+TK = 1.7  # seat-meters' K: orderly CSS px to 1x px
+PHONE_CX0 = 6 + 14 * TK  # frame inset plus the rail's 14px padding
+COL_W = 390 - 2 * PHONE_CX0          # one column's card width, 1x
+COL_DX = COL_W + 10 * TK              # one column to the next
+two_wide = lambda n=2: round(3 * (390 + (n - 1) * COL_DX))  # the picture's width at 3x, n columns
 
 def phone_text(t, cache, muse=None, name="latest.json", pools=None, flags=()):
     """The layout's words, from --text: host line, card headers, pool titles, chips, stats."""
@@ -102,7 +106,7 @@ def test_missing_or_stale_muse_file_says_no_reading():
         assert _pool(doc, "Muse \u00b7 weekly")["stats"] == "no reading", doc
 
 def test_phone_flag_is_a_no_op_alias():
-    """One layout: orderly's meters panel at the narrow rail width. --phone, which used to
+    """One layout: orderly's cards in two columns of the narrow rail. --phone, which used to
     pick it, is still accepted and draws the same thing."""
     cache = {"ts": NOW, "claude_week": 42, "claude_week_reset_ts": NOW + 4 * 86400,
              "bot_pct": 24, "bot_reset_ts": NOW + 5 * 86400, "bot_window_s": 7 * 86400}
@@ -117,8 +121,8 @@ def test_phone_flag_is_a_no_op_alias():
         assert Image.open(out2).size == (w, h), (Image.open(out2).size, (w, h))
         doc = phone_text(t, cache, muse_doc())
         doc2 = phone_text(t, cache, muse_doc(), flags=("--phone",))
-    assert w == 3 * 390, w              # orderly's narrow rail at 3x
-    assert h > w, (w, h)                # tall
+    assert w == two_wide(), w           # two columns of orderly's rail at 3x
+    assert w / h >= 9 / 19.5, (w, h)    # no narrower than a phone screen
     assert doc == doc2
 
 def test_nearly_finished_5h_window_stays_on_the_page():
@@ -305,7 +309,7 @@ def test_phone_long_stats_line_wraps_instead_of_being_cut():
     assert p["stats_drawn"] == [p["stats"]], p  # a line that fits stays one line
     p = _pool(doc, "Claude \u00b7 weekly")
     assert p["stats"] == f"68% \u00b7 caps 2d early \u00b7 5h 38% \u00b7 resets {_wd(now + 4 * 86400)} \u00b7 stale 3h 13m", p
-    assert len(p["stats_drawn"]) == 2, p
+    assert len(p["stats_drawn"]) >= 2, p
     assert " \u00b7 ".join(p["stats_drawn"]) == p["stats"], p  # nothing cut, no ellipsis
     assert not any("\u2026" in l for l in p["stats_drawn"]), p
     assert h_long > h_short, (h_short, h_long)  # the card grows for the second line
@@ -428,7 +432,7 @@ def test_phone_fable_slice_row_follows_orderly():
     assert not any(p["muted"] for c in pro["cards"] for p in c["pools"] if p["title"] != "Claude \u00b7 Fable slice")
     track = over(O_INK, over((0xff, 0x87, 0x00), O_PANEL2, 0.09), 0.08)
     w, h = pro_im.size
-    tx0, tx1 = (PHONE_CX0 + 11 * 1.3) * 3, (390 - 6 - 14 * 1.3 - 10 * 1.3) * 3  # card content edges
+    tx0, tx1 = (PHONE_CX0 + 11 * TK) * 3, (390 - 6 - 14 * TK - 10 * TK) * 3  # card content edges, first column
     lo, hi = int(tx0) + 6, int(tx1) - 6
     full = [y for y in range(h) if all(near(pro_im.getpixel((x, y)), track, 3) for x in range(lo, hi))]
     assert full, "no full-width absent track"
@@ -536,9 +540,12 @@ def test_phone_ended_row_height_counts_wrapped_chips_once():
     assert other["ended"] and other["chips"][-1] == ["$", "solid"] and other["spend"] == "draw", other
     assert other["chips_drawn"] == len(other["chips"])
     # live rows of the same shape (chips wrapped, one 6px bar, one stats line each) are as tall
-    assert [len(_pool(live, x)["stats_drawn"]) for x in ("Cursor \u00b7 Cursor Models", "Cursor \u00b7 Other Models", "Grok Bot \u00b7 weekly")] == [1, 1, 1], live
+    rows_ = ("Cursor \u00b7 Cursor Models", "Cursor \u00b7 Other Models", "Grok Bot \u00b7 weekly")
+    assert [len(_pool(live, x)["stats_drawn"]) for x in rows_] == [len(_pool(doc, x)["stats_drawn"]) for x in rows_], live
+    assert [_pool(live, x)["chips_drawn"] for x in rows_] == [_pool(doc, x)["chips_drawn"] for x in rows_]
     assert _card(live, "Grok Bot \u00b7 weekly")["sub"] == _card(doc, "Grok Bot \u00b7 weekly")["sub"], (live, doc)
-    assert im.size == im2.size, (im.size, im2.size)
+    bl, bd = _card(live, rows_[0])["box"], _card(doc, rows_[0])["box"]
+    assert bl[3] - bl[1] == bd[3] - bd[1], (bl, bd)  # the Cursor card, wherever its column puts it
 
 def test_phone_ended_track_is_full_width_striped_grey():
     """.meter .track.ended (newtab.html:154): repeating-linear-gradient(135deg, ink 22% 0 4px,
@@ -547,15 +554,15 @@ def test_phone_ended_track_is_full_width_striped_grey():
     cache = {"ts": now, "as_of": {"chatgpt": now}, "codex": 90, "codex_reset_ts": now + 2 * 86400,
              "codex_window_s": 7 * 86400, "codex_renews": False, "codex_renews_ts": now - 86400}
     with tempfile.TemporaryDirectory() as t:
-        r, out = render(t, cache, None)
-        assert r.returncode == 0, r.stderr
-        im = Image.open(out).convert("RGB"); w, h = im.size
+        doc = phone_text(t, cache)
+        im = Image.open(os.path.join(t, "p.png")).convert("RGB"); w, h = im.size
+    box = _card(doc, "Codex \u00b7 weekly")["box"]  # whichever column the card landed in
     tint = over((0xaf, 0x87, 0xff), O_PANEL2, 0.09)
     hi_c, lo_c = over(O_INK, tint, 0.22), over(O_INK, tint, 0.10)
-    tx0, tx1 = (PHONE_CX0 + 11 * 1.3) * 3, (390 - 6 - 14 * 1.3 - 10 * 1.3) * 3  # card content edges
+    tx0, tx1 = box[0] + 11 * TK * 3, box[2] - 10 * TK * 3  # card content edges
     lo, hi = int(tx0) + 6, int(tx1) - 6
     striped = []
-    for y in range(h):
+    for y in range(box[1], box[3]):
         px = [im.getpixel((x, y)) for x in range(lo, hi)]
         a, b = runs(px, lambda p: near(p, hi_c, 3), 8), runs(px, lambda p: near(p, lo_c, 3), 8)
         # both stripe tones, alternating across the full width, and nothing else in the band
@@ -590,6 +597,94 @@ def test_phone_ended_row_stays_off_the_shared_scale():
     alone = claude_width(base)
     assert abs(claude_width({**base, **long_codex, "codex_renews": False}) - alone) <= 4
     assert claude_width({**base, **long_codex, "codex_renews": True}) < alone * 0.6  # live: it counts
+
+def _every_seat(now, stale=0):
+    """A cache with every subscription and pool, every reading `stale` seconds old."""
+    at = now - stale
+    return {"ts": now, "as_of": {k: at for k in ("claude", "chatgpt", "cursor", "grokbot", "grok", "google")},
+            "claude_max": False, "claude_week": 79, "claude_week_reset_ts": now + 0.2 * 86400,
+            "claude_5h": 73, "claude_5h_reset_ts": now + 3600,
+            "codex": 24, "codex_reset_ts": now + 5 * 86400, "codex_window_s": 7 * 86400, "codex_caps_early_s": 3 * 86400,
+            "codex_5h": 8, "codex_5h_reset_ts": now + 2 * 3600, "codex_renews": False, "codex_renews_ts": now + 19 * 86400,
+            "cursor_auto_pct": 0, "cursor_api_pct": 3, "cursor_reset_ts": now + 31 * 86400, "cursor_window_s": 31 * 86400,
+            "cursor_renews": True, "bot_pct": 6, "bot_reset_ts": now + 6 * 86400, "bot_window_s": 7 * 86400,
+            "grok_pct": 36, "grok_reset_ts": now + 2 * 86400, "grok_window_s": 7 * 86400,
+            "grok_renews": False, "grok_renews_ts": now + 46 * 86400,
+            "google_argon_week": 3, "google_argon_week_reset_ts": now + 5 * 86400,
+            "google_gemini_week": 0, "google_gemini_week_reset_ts": now + 6 * 86400,
+            "google_gemini_5h": 0, "google_gemini_5h_reset_ts": now + 3 * 3600,
+            "google_claudegpt_week": 1, "google_claudegpt_week_reset_ts": now + 6 * 86400,
+            "google_claudegpt_5h": 0, "google_claudegpt_5h_reset_ts": now + 3 * 3600}
+
+def test_layout_is_no_narrower_than_a_phone_screen():
+    """The picture is at least as wide as a 9:19.5 portrait phone screen, so the phone fits it to
+    its width: a full cache, the same with every reading stale (a longer stats line per row), a
+    single card, and footers of errors that need more columns, even more than there are cards."""
+    now = time.time()
+    errs = {f"seat{i}": "HTTPError 503: the vendor did not answer this read in time" for i in range(30)}
+    with tempfile.TemporaryDirectory() as t:
+        docs = {"full": phone_text(t, _every_seat(now), muse_doc(now)),
+                "stale": phone_text(t, _every_seat(now, 17 * 60), muse_doc(now)),
+                "one": phone_text(t, {"ts": now, "as_of": {"claude": now}, "claude_week": 5,
+                                      "claude_week_reset_ts": now + 86400}),
+                "few_cards": phone_text(t, {"ts": now, "errors": {f"e{i}": "the vendor did not answer " * 8 for i in range(20)}}),
+                "errors": phone_text(t, {**_every_seat(now), "errors": errs}, muse_doc(now))}
+        im_w, im_h = Image.open(os.path.join(t, "p.png")).size
+    for name, doc in docs.items():
+        w, h = doc["size"]
+        assert w / h >= 9 / 19.5, (name, w, h)
+        assert w == two_wide(len(doc["columns"])), (name, w)
+    assert (im_w, im_h) == tuple(docs["errors"]["size"])  # --text says the drawn size
+    assert [len(docs[n]["columns"]) for n in ("full", "stale", "one")] == [2, 2, 2]
+    assert len(docs["errors"]["columns"]) > 2, docs["errors"]["size"]
+    # two cards and a long footer: more columns than cards, the extra ones empty
+    few = docs["few_cards"]
+    assert len(few["cards"]) == 2 and len(few["columns"]) > 2, few["columns"]
+    assert sum(few["columns"], []) == [0, 1], few["columns"]
+    w, h = docs["full"]["size"]
+    assert w / h >= 0.64, (w, h)  # the chat's own image area in Ryan's screenshot, 1080 x ~1680
+
+def test_layout_draws_every_card_once_in_reading_order():
+    """Columns are runs of the cards in orderly's order: every card exactly once, top to bottom
+    and then the next column, boxes inside the picture and apart, each with its vendor stripe."""
+    now = time.time()
+    with tempfile.TemporaryDirectory() as t:
+        doc = phone_text(t, _every_seat(now), muse_doc(now))
+        im = Image.open(os.path.join(t, "p.png")).convert("RGB")
+    cols = doc["columns"]
+    assert sum(cols, []) == list(range(len(doc["cards"]))), cols  # each once, in order
+    assert all(cols), cols                                         # no empty column
+    assert len(doc["cards"]) == 6, [c["pools"][0]["title"] for c in doc["cards"]]
+    w, h = doc["size"]
+    boxes = [c["box"] for c in doc["cards"]]
+    for i, (c, b) in enumerate(zip(doc["cards"], boxes)):
+        assert c["column"] == next(k for k, col in enumerate(cols) if i in col)
+        assert 0 <= b[0] < b[2] <= w and 0 <= b[1] < b[3] <= h, b
+        for j, o in enumerate(boxes[:i]):
+            assert b[2] <= o[0] or o[2] <= b[0] or b[3] <= o[1] or o[3] <= b[1], (i, j, b, o)  # apart
+    hues = {"Claude": (0xff, 0x87, 0x00), "Codex": (0xaf, 0x87, 0xff), "Cursor": (0x00, 0xd7, 0xaf),
+            "SuperGrok": (0x5f, 0xaf, 0xff), "Google": (0x54, 0x68, 0xf0), "Muse": (0xff, 0x87, 0xd7)}
+    for c, b in zip(doc["cards"], boxes):
+        hue = hues[c["pools"][0]["title"].split(" ")[0]]
+        assert near(im.getpixel((b[0] + 2, (b[1] + b[3]) // 2)), hue, 3), c["pools"][0]["title"]
+    # the columns' heights are balanced: the shorter is at least half the taller
+    col_h = [sum(boxes[i][3] - boxes[i][1] for i in col) for col in cols]
+    assert min(col_h) * 2 >= max(col_h), col_h
+
+def test_layout_keeps_ended_cards_last():
+    """Ended plans sink below active ones (newtab.js:1159-1163): the last cards in reading order,
+    at the bottom of the last column, whatever the column split."""
+    now = time.time()
+    ended = {"codex_renews": False, "codex_renews_ts": now - 86400, "grok_renews": False, "grok_renews_ts": now - 60}
+    with tempfile.TemporaryDirectory() as t:
+        doc = phone_text(t, {**_every_seat(now), **ended}, muse_doc(now))
+    flags = [all(p["ended"] for p in c["pools"]) for c in doc["cards"]]
+    assert flags == [False] * 4 + [True] * 2, flags
+    assert [c["pools"][0]["title"] for c in doc["cards"][-2:]] == ["Codex \u00b7 weekly", "SuperGrok \u00b7 weekly"]
+    last = doc["columns"][-1]
+    assert last[-2:] == [4, 5], doc["columns"]
+    boxes = [c["box"] for c in doc["cards"]]
+    assert boxes[5][1] > boxes[4][1] and boxes[5][1] == max(boxes[i][1] for i in last)
 
 def test_phone_spend_chip_follows_orderly():
     """orderly spendChip: "$" after the family chips on the Cursor rows when spend is above zero,
