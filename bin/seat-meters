@@ -4,7 +4,9 @@ meters panel. No network calls. A "Next host" line from
 `seat-usage --route host --cached --json` (cache only), one card per subscription
 with its cached renewal, family chips, and a stats line per pool, every bar on one
 shared time scale with its pace tick on a single "now" line. Google AI Pro is its
-own card: Argon weekly, plus Gemini and Claude/GPT.
+own card: Argon weekly, plus Gemini and Claude/GPT. The cards run in orderly's order down two
+columns (more only if the picture would still be narrower than a 9:19.5 phone screen), so a
+phone shows it at full width; the host line and legend span the columns.
 
 --text prints the layout's words as JSON in place of the output path.
 --phone is accepted and ignored: this is the only layout (it used to pick it)."""
@@ -77,7 +79,10 @@ span = past + fut; nowfrac = past / span
 
 
 S = 3      # device pixels per 1x px
-W = 390    # 1x width, orderly's narrow rail
+W = 390    # 1x width of one column: orderly's narrow rail
+# Columns of cards: two, or more when the picture would still be narrower than a phone screen
+# (9:19.5 portrait), so a phone fits it to its width rather than its height.
+MIN_ASPECT = 9 / 19.5
 P = lambda v: int(v * S)
 
 SS = 4  # supersample factor for bar shapes: Pillow's rounded_rectangle has no antialiasing
@@ -149,7 +154,9 @@ def track(st, y, h, width_frac, right=None, left=None, fill_alpha=1.0):
 # CSS px times K. Every word here comes from the cache, the Muse file, or
 # `seat-usage --route host --cached --json`; nothing is filled in to look complete.
 import glob, math, re, subprocess
-K = 1.3
+# 1.7, not orderly's own 1: each column is orderly's rail at about 229 CSS px, so the type is
+# large enough to read when a phone shows the two-column picture at its width (~1080 px).
+K = 1.7
 O_BG, O_PANEL2, O_LINE = "#14171c", "#20262e", "#2b323c"
 O_INK, O_INK2, O_MUTED, O_CRIT = "#e4e8ee", "#a3acb9", "#6f7987", "#e04b4b"
 O_WARN = "#fab219"  # orderly --warn
@@ -522,7 +529,9 @@ NOTES = []
 # ---- geometry, in 1x px (orderly CSS px * K) ----
 FRAME_X, FRAME_Y = 6, 8
 RPX, RPY = 14 * K, 12 * K                      # .rail padding
-CX0, CX1 = FRAME_X + RPX, W - FRAME_X - RPX     # card box
+CX0, CX1 = FRAME_X + RPX, W - FRAME_X - RPX     # card box, first column
+COL_GAP = 10 * K                                 # between columns, as the rail's side padding
+COL_DX = CX1 - CX0 + COL_GAP                     # one column to the next
 BORDER, PADL, PADR, PADY = 3 * K, 8 * K, 10 * K, 6 * K
 TX0, TX1 = CX0 + BORDER + PADL, CX1 - PADR      # card content
 GAP = 4 * K                                      # .seat row-gap
@@ -554,11 +563,6 @@ def stat_lines(parts, f, width):
     if line: out.append(line)
     return [ellipsize(l, f, width) for l in out] or [[]]
 g = ImageDraw.Draw(Image.new("RGB", (1, 1)))  # measuring only
-host_l = wrap(HOST, F_HOST, CX1 - CX0 - 16 * K)
-why_l = wrap(WHY, F_WHY, CX1 - CX0 - 16 * K) if WHY else []
-legend_l = wrap(LEGEND, F_HDR, CX1 - CX0)
-notes_l = [l for n in NOTES for l in wrap(n, F_HDR, CX1 - CX0)]
-err_l = [l for k, v in errs.items() for l in wrap(f"{k}: {str(v)[:160]}", F_HDR, CX1 - CX0)]
 CHIP_LH = LH(12) + 2 * K
 for c in cards:  # chips beside the title; ones that don't fit go on lines under it
     for p in c["pools"]:
@@ -572,16 +576,6 @@ for c in cards:  # chips beside the title; ones that don't fit go on lines under
             p["fit"].append((name, style, x, line)); x += w_ + 3 * K
         p["chip_lines"] = max([l for *_, l in p["fit"]], default=0)
         p["stat_l"] = stat_lines(p["stats"], F_V, TX1 - TX0)
-if TEXT:
-    print(json.dumps({"host": HOST, "why": WHY, "legend": LEGEND, "notes": NOTES, "errors": {k: str(v) for k, v in errs.items()},
-                      "cards": [{"header": c["header"], "header_warn": c["header_warn"], "sub": c["sub"],
-                                 "pools": [{"title": p["title"], "chips": p["chips"], "chips_drawn": len(p["fit"]), "spend": p["spend"], "state": p["state"],
-                                            "muted": p["ghost"] == "absent" or p["ended"], "ended": p["ended"],
-                                            "stats": " \u00b7 ".join(t for t, _ in p["stats"]),
-                                            "stats_drawn": [" \u00b7 ".join(t for t, _ in l) for l in p["stat_l"]],
-                                            "red": [t for t, r in p["stats"] if r]} for p in c["pools"]]}
-                                for c in cards]}))
-
 pool_h = lambda p: p["chip_lines"] * CHIP_LH + (PADY + LH(12) + GAP + (12 if p["five"] and p["main"] else 6) * K
                                                 + GAP + LH(11) * len(p["stat_l"]) + PADY
     if (p["main"] or p["five"] or p["ghost"]) and not p["ended"] else
@@ -589,16 +583,54 @@ pool_h = lambda p: p["chip_lines"] * CHIP_LH + (PADY + LH(12) + GAP + (12 if p["
 for c in cards:
     c["sub_l"] = wrap(c["sub"], F_HDR, TX1 - TX0) if c["sub"] else []
 hdr_h = lambda c: (3 * K + LH(10.5) * (1 + len(c["sub_l"])) + 2 * K) if c["header"] else 0
-y = FRAME_Y + RPY + LH(13) * len(host_l) + LH(12) * len(why_l) + 8 * K
-for i, c in enumerate(cards):
-    y += 6 * K if i else 0
-    y += hdr_h(c) + sum(pool_h(p) for p in c["pools"])
-y += 8 * K + LH(10.5) * (len(legend_l) + len(notes_l) + len(err_l)) + RPY
-Ht = int(math.ceil(y + FRAME_Y))
-img = Image.new("RGB", (W * S, Ht * S), O_BG); g = ImageDraw.Draw(img)
-g.rounded_rectangle((P(FRAME_X), P(FRAME_Y), P(W - FRAME_X), P(Ht - FRAME_Y)), radius=P(6 * K),
+card_h = lambda c: hdr_h(c) + sum(pool_h(p) for p in c["pools"])
+col_h = lambda cs: sum(card_h(c) for c in cs) + 6 * K * max(0, len(cs) - 1)
+def columns(cs, n):
+    """The cards in reading order, cut into n runs (top to bottom, then the next column) so the
+    tallest column is as short as it can be. Order is kept, so ended plans stay last."""
+    if n <= 1 or len(cs) <= 1: return [list(cs)] + [[] for _ in range(n - 1)]
+    best = None
+    for k_ in range(1, len(cs)):
+        rest = columns(cs[k_:], n - 1)
+        h_ = max(col_h(cs[:k_]), *(col_h(r) for r in rest))
+        if best is None or h_ < best[0]: best = (h_, [list(cs[:k_])] + rest)
+    return best[1]
+NCOL = 2
+while True:
+    WT = W + (NCOL - 1) * COL_DX                   # whole picture, 1x
+    FULL = CX1 - CX0 + (NCOL - 1) * COL_DX         # the host line and legend span every column
+    host_l = wrap(HOST, F_HOST, FULL - 16 * K)
+    why_l = wrap(WHY, F_WHY, FULL - 16 * K) if WHY else []
+    legend_l = wrap(LEGEND, F_HDR, FULL)
+    notes_l = [l for n in NOTES for l in wrap(n, F_HDR, FULL)]
+    err_l = [l for k, v in errs.items() for l in wrap(f"{k}: {str(v)[:160]}", F_HDR, FULL)]
+    COLS = columns(cards, NCOL)
+    TOP = FRAME_Y + RPY + LH(13) * len(host_l) + LH(12) * len(why_l) + 8 * K
+    y = TOP + max(col_h(col) for col in COLS)
+    y += 8 * K + LH(10.5) * (len(legend_l) + len(notes_l) + len(err_l)) + RPY
+    Ht = int(math.ceil(y + FRAME_Y))
+    if P(WT) / (Ht * S) >= MIN_ASPECT or NCOL >= len(cards): break
+    NCOL += 1
+for ci, col in enumerate(COLS):
+    yc = TOP
+    for c in col:  # each card's box, 1x: its column's edges, stacked with orderly's 6px gap
+        c["col"] = ci
+        c["box"] = (CX0 + ci * COL_DX, yc, CX1 + ci * COL_DX, yc + card_h(c)); yc += card_h(c) + 6 * K
+if TEXT:
+    print(json.dumps({"host": HOST, "why": WHY, "legend": LEGEND, "notes": NOTES, "errors": {k: str(v) for k, v in errs.items()},
+                      "size": [P(WT), Ht * S], "columns": [[cards.index(c) for c in col] for col in COLS],
+                      "cards": [{"column": c["col"], "box": [round(v * S) for v in c["box"]], "header": c["header"], "header_warn": c["header_warn"], "sub": c["sub"],
+                                 "pools": [{"title": p["title"], "chips": p["chips"], "chips_drawn": len(p["fit"]), "spend": p["spend"], "state": p["state"],
+                                            "muted": p["ghost"] == "absent" or p["ended"], "ended": p["ended"],
+                                            "stats": " \u00b7 ".join(t for t, _ in p["stats"]),
+                                            "stats_drawn": [" \u00b7 ".join(t for t, _ in l) for l in p["stat_l"]],
+                                            "red": [t for t, r in p["stats"] if r]} for p in c["pools"]]}
+                                for c in cards]}))
+
+img = Image.new("RGB", (P(WT), Ht * S), O_BG); g = ImageDraw.Draw(img)
+g.rounded_rectangle((P(FRAME_X), P(FRAME_Y), P(WT - FRAME_X), P(Ht - FRAME_Y)), radius=P(6 * K),
                     fill=O_PANEL2, outline=O_LINE, width=max(1, P(1)))
-X0, MW = TX0, TX1 - TX0  # the meter spans the card's content width (narrow orderly rail)
+X0, MW = TX0, TX1 - TX0  # the meter spans the card's content width (one column)
 
 def chip(x, yc, name, style, hue, tone=None):
     """orderly .seat .lab .chip: mono 9.5px, padding 0 4px, 1px border in the vendor hue
@@ -637,10 +669,13 @@ for l in host_l:
     g.text((P(CX0 + 8 * K), P(y + LH(13) / 2)), l, font=F_HOST, fill=O_INK, anchor="lm"); y += LH(13)
 for l in why_l:
     g.text((P(CX0 + 8 * K), P(y + LH(12) / 2)), l, font=F_WHY, fill=O_MUTED, anchor="lm"); y += LH(12)
-y += 8 * K
+CX0_, CX1_, TX0_, TX1_ = CX0, CX1, TX0, TX1
 for i, c in enumerate(cards):
-    y += 6 * K if i else 0
-    hue = c["hue"]; top = y; total = hdr_h(c) + sum(pool_h(p) for p in c["pools"])
+    # each card in its column: shift the card and content edges (the meter follows TX0)
+    dx = c["col"] * COL_DX
+    y = c["box"][1]
+    CX0, CX1, TX0, TX1 = CX0_ + dx, CX1_ + dx, TX0_ + dx, TX1_ + dx; X0 = TX0
+    hue = c["hue"]; top = y; total = card_h(c)
     R = P(4 * K)
     # .seat: 9% vendor tint; .band-hdr: 16%; 3px vendor stripe on the left; right corners rounded
     rrect((P(CX0), P(top), P(CX1), P(top + total)), R, mixhex(hue, .09, O_PANEL2), (False, True, True, False))
@@ -666,7 +701,7 @@ for i, c in enumerate(cards):
             sp = p["spend"] if (name == "$" and k_ == len(p["chips"]) - 1) else None
             # orderly: Grok Bot's family chips in Grok blue (.chip.fam); its "$" chip keeps the Cursor hue
             ch = VHUE["grok"] if p["seat"] == "grokbot" and not sp else hue
-            chip(cx, ly + line * CHIP_LH, name, style, ch, sp)
+            chip(cx + dx, ly + line * CHIP_LH, name, style, ch, sp)
         yy += LH(12) + p["chip_lines"] * CHIP_LH + GAP
         m, f = p["main"], p["five"]
         if p["ended"]:
@@ -708,7 +743,8 @@ for i, c in enumerate(cards):
                 g.text((P(x), P(yy + LH(11) / 2)), t, font=F_V, fill=O_CRIT if red else O_MUTED, anchor="lm"); x += tw(t, F_V)
             yy += LH(11)
         y += pool_h(p)
-y += 8 * K
+CX0, CX1, TX0, TX1 = CX0_, CX1_, TX0_, TX1_; X0 = TX0
+y = TOP + max(col_h(col) for col in COLS) + 8 * K
 star_font = vfont(MONO_FB, 10.5 * K) if MONO_FB else F_HDR
 for l in legend_l + notes_l + err_l:
     x = CX0
