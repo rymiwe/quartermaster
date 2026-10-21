@@ -129,7 +129,7 @@ def track(st, y, h, width_frac, right=None, left=None, fill_alpha=1.0):
 # .rail/.band-hdr/.seat/.chip/.meter, newtab.js renderRail). Sizes are orderly's
 # CSS px times K. Every word here comes from the cache, the Muse file, or
 # `seat-usage --route host --cached --json`; nothing is filled in to look complete.
-import glob, math, subprocess
+import glob, math, re, subprocess
 K = 1.3
 O_BG, O_PANEL2, O_LINE = "#14171c", "#20262e", "#2b323c"
 O_INK, O_INK2, O_MUTED, O_CRIT = "#e4e8ee", "#a3acb9", "#6f7987", "#e04b4b"
@@ -256,15 +256,30 @@ POOL = {"Claude": ("claude_weekly", "claude", "Claude \u00b7 weekly", "claude"),
         "Muse": ("muse", "muse", "Muse \u00b7 weekly", None)}
 RESET_KEY = {"Claude": "claude_week_reset_ts", "ChatGPT": "codex_reset_ts", "Cursor models": "cursor_reset_ts",
              "Cursor other": "cursor_reset_ts", "Grok Bot": "bot_reset_ts", "SuperGrok": "grok_reset_ts"}
-# The Fable slice: only a Max plan has one, and only a Max plan's cache can say so.
-if CLAUDE_MAX is True:
-    rows.append(("Fable", seat(d.get("fable"), d.get("fable_reset_ts"), WK), None))
-    POOL["Fable"] = ("claude_fable", "claude", "Claude \u00b7 Fable slice", "claude")
-    RESET_KEY["Fable"] = "fable_reset_ts"
+# The Fable slice row is always drawn, as orderly's quota_claude_fable (server.rb:2031-2047):
+#   live    the cache has a fable percent;
+#   absent  the plan is known not to be Max and the Claude read finished (fable_absent?,
+#           server.rb:2005-2011): "not on <plan title>", or "not on this plan" with no title;
+#   unknown otherwise: "unknown · seat-usage has no value" (unknown_quota_seat, server.rb:1934).
+# orderly reads the plan name (claude_plan); the numbers-only pulled copy has only the
+# claude_max bit, so a false claude_max counts as a known non-Max plan with no title.
+def _isnum(v): return isinstance(v, (int, float)) and not isinstance(v, bool)
+as_of = d.get("as_of") if isinstance(d.get("as_of"), dict) else {}
+_plan = PLAN if PLAN and PLAN != "?" else None
+if isinstance(d.get("claude_max"), bool): _not_max = d["claude_max"] is False
+else: _not_max = _plan is not None and "max" not in _plan.lower()
+# claude_plan_title (server.rb:1989): Max, Pro for claude_ai, else the tier name as read
+_title = None if not _plan else "Max" if "max" in _plan.lower() else {"claude_ai": "Pro"}.get(_plan, _plan)
+FABLE_PCT = d.get("fable") if _isnum(d.get("fable")) else None
+FABLE_STATE = ("live" if FABLE_PCT is not None else
+               "absent" if _not_max and _isnum(as_of.get("claude")) else "unknown")
+FABLE_TEXT = (f"not on {_title}" if _title else "not on this plan") if FABLE_STATE == "absent" else None
+rows.append(("Fable", seat(FABLE_PCT, d.get("fable_reset_ts"), WK) if FABLE_PCT is not None else None, None))
+POOL["Fable"] = ("claude_fable", "claude", "Claude \u00b7 Fable slice", "claude")
+RESET_KEY["Fable"] = "fable_reset_ts"
 ORDER = ["Claude", "Fable", "ChatGPT", "Cursor models", "Cursor other", "Grok Bot", "SuperGrok",
          "Argon", "Gemini", "Claude/GPT", "Muse"]
 rows.sort(key=lambda r: ORDER.index(r[0]) if r[0] in ORDER else 99)
-as_of = d.get("as_of") if isinstance(d.get("as_of"), dict) else {}
 # seat-usage's cap projection for each row's main pool: <pool>_caps_early_s.
 CAPS_KEY = {"Claude": "claude_week", "Fable": "fable", "ChatGPT": "codex", "Cursor models": "cursor_models",
             "Cursor other": "cursor_other", "Grok Bot": "grokbot", "SuperGrok": "grok",
@@ -273,8 +288,23 @@ CAPS_KEY = {"Claude": "claude_week", "Fable": "fable", "ChatGPT": "codex", "Curs
 def roughspan(secs):  # orderly roughSpan
     return fspan(secs if secs < 3600 else math.floor(secs / 3600 + 0.5) * 3600)  # JS Math.round
 
+def fable_stats(m):
+    """The Fable row's .v line when it has no drawable bar (renderRail, newtab.js:1205-1231)."""
+    at = as_of.get("claude")
+    age = now - at if _isnum(at) else None
+    if FABLE_STATE == "absent":  # absent: its text, and "stale" once the read is over 15 minutes old
+        return [(FABLE_TEXT, False)] + ([(f"stale {fspan(age)}", False)] if age is not None and age > 15 * 60 else [])
+    if FABLE_STATE == "live":    # a percent with no reset: no window, so only the percent
+        return [(f"{rnd(FABLE_PCT)}%", False)] + ([(f"stale {fspan(age)}", False)] if age is not None and age > 15 * 60 else [])
+    parts = [("unknown", False), ("seat-usage has no value", False)]
+    if age is None:  # no as_of stamp: quota_read's read_failed, red and first (newtab.js:1222)
+        m_ = re.search(r"\b[A-Z]\w*Error(?: \d{3})?", str((d.get("errors") or {}).get("claude") or ""))
+        return [("read failed" + (": " + m_.group(0) if m_ else ""), True)] + parts
+    return parts + [(f"verified {str(int(max(0, age))) + 's' if age < 60 else fspan(age)}", False)]
+
 def stats(label, m, f):
     """orderly's .v line: percent, 5h, reset, and an old reading. [(text, red)]."""
+    if label == "Fable" and not m: return fable_stats(m)
     if not m and not f: return [("no reading", False)]
     parts = []
     if m: parts.append((f"{rnd(m['pct'])}%", False))
@@ -350,6 +380,8 @@ for label, m, f in rows:
                       "header_warn": bool(hdr and hdr[1]), "sub": None, "pools": []})
     sp = spend(label, m)
     cards[-1]["pools"].append({"label": label, "seat": sid, "title": title,
+                               "state": FABLE_STATE if label == "Fable" else None,
+                               "ghost": FABLE_STATE if label == "Fable" and not m else None,
                                "chips": chips(sid) + ([("$", "solid")] if sp else []), "spend": sp,
                                "main": m, "five": f, "stats": stats(label, m, f)})
 for c in cards:  # orderly poolsResetThen: pools whose reset is the renewal instant
@@ -488,7 +520,8 @@ for c in cards:  # chips beside the title; ones that don't fit go on lines under
 if TEXT:
     print(json.dumps({"host": HOST, "why": WHY, "legend": LEGEND, "notes": NOTES, "errors": {k: str(v) for k, v in errs.items()},
                       "cards": [{"header": c["header"], "header_warn": c["header_warn"], "sub": c["sub"],
-                                 "pools": [{"title": p["title"], "chips": p["chips"], "chips_drawn": len(p["fit"]), "spend": p["spend"],
+                                 "pools": [{"title": p["title"], "chips": p["chips"], "chips_drawn": len(p["fit"]), "spend": p["spend"], "state": p["state"],
+                                            "muted": p["ghost"] == "absent",
                                             "stats": " \u00b7 ".join(t for t, _ in p["stats"]),
                                             "stats_drawn": [" \u00b7 ".join(t for t, _ in l) for l in p["stat_l"]],
                                             "red": [t for t, r in p["stats"] if r]} for p in c["pools"]]}
@@ -496,7 +529,7 @@ if TEXT:
 
 pool_h = lambda p: p["chip_lines"] * CHIP_LH + (PADY + LH(12) + GAP + (12 if p["five"] and p["main"] else 6) * K
                                                 + GAP + LH(11) * len(p["stat_l"]) + PADY
-    if (p["main"] or p["five"]) else PADY + LH(12) + GAP + LH(11) * len(p["stat_l"]) + PADY)
+    if (p["main"] or p["five"] or p["ghost"]) else PADY + LH(12) + GAP + LH(11) * len(p["stat_l"]) + PADY)
 for c in cards:
     c["sub_l"] = wrap(c["sub"], F_HDR, TX1 - TX0) if c["sub"] else []
 hdr_h = lambda c: (3 * K + LH(10.5) * (1 + len(c["sub_l"])) + 2 * K) if c["header"] else 0
@@ -570,7 +603,8 @@ for i, c in enumerate(cards):
     for p in c["pools"]:
         yy = y + PADY
         ly = yy + LH(12) / 2
-        g.text((P(TX0), P(ly)), p["title"], font=F_TITLE, fill=O_INK, anchor="lm")
+        # .seat.absent b{color:var(--muted)} (newtab.html:156)
+        g.text((P(TX0), P(ly)), p["title"], font=F_TITLE, fill=O_MUTED if p["ghost"] == "absent" else O_INK, anchor="lm")
         for k_, (name, style, cx, line) in enumerate(p["fit"]):
             sp = p["spend"] if (name == "$" and k_ == len(p["chips"]) - 1) else None
             # orderly: Grok Bot's family chips in Grok blue (.chip.fam); its "$" chip keeps the Cursor hue
@@ -588,6 +622,21 @@ for i, c in enumerate(cards):
             bh = (12 if (m and f) else 6) * K
             ntick(X0 + MW * nowfrac, yy, yy + bh)
             yy += bh + GAP
+        elif p["ghost"]:
+            # orderly renderRail with no window: no now tick. absent: a full-width track at ink 8%
+            # (.track.absent, newtab.html:155); otherwise the 50% track at left 25% (newtab.js:1240-1243)
+            # with a live percent's fill coloured by meterClass (newtab.js:658, 1255).
+            snap = lambda v: round(v * S) / S
+            yy = snap(yy); bh = snap(6 * K)
+            if p["ghost"] == "absent":
+                pill(X0, yy, X0 + MW, yy + bh, INK, 0.08)
+            else:
+                pill(X0 + MW * .25, yy, X0 + MW * .75, yy + bh, INK, TRACK_A)
+                if p["ghost"] == "live" and FABLE_PCT > 0:
+                    pc = max(0, min(100, FABLE_PCT))
+                    pill(X0 + MW * .25, yy, X0 + MW * (.25 + .5 * pc / 100), yy + bh,
+                         RED if pc >= 80 else "#c99019" if pc >= 50 else BLUE)
+            yy += 6 * K + GAP
         for parts in p["stat_l"]:
             x = TX0
             for j, (t, red) in enumerate(parts):

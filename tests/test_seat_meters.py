@@ -209,8 +209,8 @@ def test_phone_5h_track_has_no_text_beside_it():
         ink = {x for y in five for x in range(lo, hi)
                if dim_text(im.getpixel((x, y))) and not any(abs(x - t) <= 4 for t in tick)}
         assert not ink, sorted(ink)[:5]
-        pools = phone_text(t, cache)["cards"][0]["pools"]
-        assert pools[0]["stats"].startswith("5% \u00b7 5h 20%"), pools[0]["stats"]
+        gem = _pool(phone_text(t, cache), "Google AI Pro \u00b7 Gemini")
+        assert gem["stats"].startswith("5% \u00b7 5h 20%"), gem["stats"]
 
 def test_phone_over_pace_segment_is_red_on_both_tracks():
     """Use past the pace tick draws red on the weekly track and, at full strength, on the 5h one."""
@@ -375,12 +375,53 @@ def test_phone_chips_follow_orderly_whatever_the_claude_plan():
         assert doc["notes"] == [], doc["notes"]  # no "missing Fable chip" footnote any more
         assert all(p["chips_drawn"] == len(p["chips"]) for c in doc["cards"] for p in c["pools"]), doc
         assert _pool(doc, "SuperGrok \u00b7 weekly")["chips"] == [["Grok", "dotted"]]  # a full pool keeps its chip
-    assert not fable_slice(unknown) and not fable_slice(pro)
-    assert _pool(flag_max, "Claude \u00b7 Fable slice")["chips"] == [["Fable", "solid"]]
+    for doc in (unknown, pro, flag_max, capped):  # orderly always draws the Fable slice row, with its chip
+        assert fable_slice(doc) and _pool(doc, "Claude \u00b7 Fable slice")["chips"] == [["Fable", "solid"]]
     assert _pool(unknown, "Cursor \u00b7 Other Models")["chips"] == [["Fable", "dashed"], ["Opus", "dashed"], ["Sol", "dashed"]]
     assert _pool(unknown, "Muse \u00b7 weekly")["chips"] == [["Wonder full", "solid"], ["Wonder", "solid"]]
     assert _pool(unknown, "Google AI Pro \u00b7 Argon")["chips"] == [["Argon", "solid"]]  # config/pools.json
     assert unknown["legend"] == "dashed = metered \u00b7 dotted = builder only \u00b7 \u2605 first usable pool for the family"
+
+def test_phone_fable_slice_row_follows_orderly():
+    """quota_claude_fable (orderly server.rb:2031-2047) and renderRail (newtab.js:1205-1243):
+    live with a percent; absent ("not on <plan>") when the plan is known not to be Max and the
+    Claude read finished; otherwise unknown. Always drawn, always with its Fable chip."""
+    now = time.time()
+    base = {"ts": now, "as_of": {"claude": now - 120}, "claude_week": 10, "claude_week_reset_ts": now + 4 * 86400}
+    fab = lambda doc: _pool(doc, "Claude \u00b7 Fable slice")
+    with tempfile.TemporaryDirectory() as t:
+        pro = phone_text(t, {**base, "claude_max": False})            # the pulled copy: only the bit
+        pro_png = os.path.join(t, "p.png"); pro_im = Image.open(pro_png).convert("RGB"); pro_im.load()
+        named = phone_text(t, {**base, "claude_plan": "claude_ai"})    # orderly's own input: the plan name
+        odd = phone_text(t, {**base, "claude_plan": "enterprise"})
+        old = phone_text(t, {**base, "claude_max": False, "as_of": {"claude": now - 3600 - 5}})
+        no_read = phone_text(t, {**base, "claude_max": False, "as_of": {}})   # no finished read: not absent
+        unknown = phone_text(t, base)
+        mx = phone_text(t, {**base, "claude_max": True})
+        live = phone_text(t, {**base, "claude_max": True, "fable": 12, "fable_reset_ts": now + 3 * 86400})
+        bare = phone_text(t, {**base, "claude_max": True, "fable": 60})  # a percent with no reset
+    assert (fab(pro)["state"], fab(pro)["stats"]) == ("absent", "not on this plan"), fab(pro)
+    assert fab(named)["stats"] == "not on Pro" and fab(odd)["stats"] == "not on enterprise"
+    assert fab(old)["stats"] == "not on this plan \u00b7 stale 1h", fab(old)
+    for doc in (pro, named, odd, old):
+        assert fab(doc)["chips"] == [["Fable", "solid"]] and fab(doc)["state"] == "absent"
+    for doc in (unknown, mx):
+        assert fab(doc)["state"] == "unknown"
+        assert fab(doc)["stats"] == "unknown \u00b7 seat-usage has no value \u00b7 verified 2m", fab(doc)
+    assert fab(no_read)["stats"] == "read failed \u00b7 unknown \u00b7 seat-usage has no value", fab(no_read)
+    assert fab(no_read)["red"] == ["read failed"]
+    assert fab(live)["state"] == "live" and fab(live)["stats"].startswith("12%"), fab(live)
+    assert (fab(bare)["state"], fab(bare)["stats"]) == ("live", "60%"), fab(bare)
+    # absent styling: the title in orderly's --muted, and a track the card's full content width
+    # at ink 8% over the Claude card (.track.absent); no other row is muted
+    assert fab(pro)["muted"] and not fab(unknown)["muted"] and not fab(live)["muted"]
+    assert not any(p["muted"] for c in pro["cards"] for p in c["pools"] if p["title"] != "Claude \u00b7 Fable slice")
+    track = over(O_INK, over((0xff, 0x87, 0x00), O_PANEL2, 0.09), 0.08)
+    w, h = pro_im.size
+    tx0, tx1 = (PHONE_CX0 + 11 * 1.3) * 3, (390 - 6 - 14 * 1.3 - 10 * 1.3) * 3  # card content edges
+    lo, hi = int(tx0) + 6, int(tx1) - 6
+    full = [y for y in range(h) if all(near(pro_im.getpixel((x, y)), track, 3) for x in range(lo, hi))]
+    assert full, "no full-width absent track"
 
 def test_phone_spend_chip_follows_orderly():
     """orderly spendChip: "$" after the family chips on the Cursor rows when spend is above zero,
@@ -408,7 +449,9 @@ def test_phone_spend_chip_follows_orderly():
 def test_phone_spend_chip_colors():
     """The "$" chip is orderly --warn when its pool is capped and --crit past the limit."""
     WARN, CRIT = (0xfa, 0xb2, 0x19), (0xe0, 0x4b, 0x4b)
-    base = {"ts": NOW, "cursor_api_pct": 20, "cursor_reset_ts": NOW + 20 * 86400, "cursor_window_s": 31 * 86400}
+    # as_of.claude so the Fable row reads "unknown", not a red "read failed"
+    base = {"ts": NOW, "as_of": {"claude": NOW}, "cursor_api_pct": 20, "cursor_reset_ts": NOW + 20 * 86400,
+            "cursor_window_s": 31 * 86400}
     def has(cache, color):
         with tempfile.TemporaryDirectory() as t:
             r, out = render(t, cache, None)
@@ -419,7 +462,7 @@ def test_phone_spend_chip_colors():
     assert has({**base, "cursor_api_pct": 100, "cursor_ondemand": 0}, WARN)
     assert has({**base, "cursor_ondemand": 30, "cursor_ondemand_limit": 20}, CRIT)
     # Grok Bot alone and exhausted, under the limit: amber, not Grok blue
-    bot = {"ts": NOW, "bot_pct": 100, "bot_exhausted": True, "bot_reset_ts": NOW + 5 * 86400,
+    bot = {"ts": NOW, "as_of": {"claude": NOW}, "bot_pct": 100, "bot_exhausted": True, "bot_reset_ts": NOW + 5 * 86400,
            "bot_window_s": 7 * 86400, "cursor_ondemand": 30, "cursor_ondemand_limit": 50}
     assert has(bot, WARN)
 
