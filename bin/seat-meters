@@ -219,7 +219,7 @@ def renewal(vendor):
 
 # Model families each pool can serve: orderly's FAMILIES/METERED/BUILDER_ONLY
 # (extension/newtab.js). Google AI Pro's families are data in config/pools.json
-# ("google_ai_pro"), read below; orderly has no Google pools.
+# ("google_ai_pro"), read below; orderly gets the same lists through seat_rows.
 FAMILIES = [("Fable", ["claude_fable", "claude_weekly", "cursor_other"]), ("Opus", ["claude_weekly", "cursor_other"]),
             ("Astra", ["codex"]), ("Sol", ["codex", "cursor_other"]), ("Grok", ["cursor_models", "supergrok"]),
             ("Grok Bot", ["grokbot"]), ("Wonder full", ["muse"]), ("Wonder", ["muse"])]
