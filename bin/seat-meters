@@ -278,6 +278,11 @@ FABLE_TEXT = (f"not on {_title}" if _title else "not on this plan") if FABLE_STA
 rows.append(("Fable", seat(FABLE_PCT, d.get("fable_reset_ts"), WK) if FABLE_PCT is not None else None, None))
 POOL["Fable"] = ("claude_fable", "claude", "Claude \u00b7 Fable slice", "claude")
 RESET_KEY["Fable"] = "fable_reset_ts"
+# The shared time scale again, now with the Fable row: orderly's renderRail takes every live
+# row's window into one span, so Fable's track keeps its full weekly width.
+mains = [m for _, m, _ in rows if m]
+past = max([m["w"] * m["e"] for m in mains] or [1]); fut = max([m["w"] * (1 - m["e"]) for m in mains] or [1])
+span = past + fut; nowfrac = past / span
 ORDER = ["Claude", "Fable", "ChatGPT", "Cursor models", "Cursor other", "Grok Bot", "SuperGrok",
          "Argon", "Gemini", "Claude/GPT", "Muse"]
 rows.sort(key=lambda r: ORDER.index(r[0]) if r[0] in ORDER else 99)

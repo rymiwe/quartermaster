@@ -433,6 +433,30 @@ def test_phone_fable_slice_row_follows_orderly():
     full = [y for y in range(h) if all(near(pro_im.getpixel((x, y)), track, 3) for x in range(lo, hi))]
     assert full, "no full-width absent track"
 
+def test_phone_fable_track_shares_the_weekly_scale():
+    """A Fable window that ends before Claude weekly's still gets a full weekly-width track,
+    not one shrunk to fit a scale computed without it."""
+    now = time.time()
+    cache = {"ts": now, "as_of": {"claude": now}, "claude_max": True,
+             "claude_week": 10, "claude_week_reset_ts": now + 6 * 86400,      # 1 day in
+             "fable": 10, "fable_reset_ts": now + 1 * 86400}                  # 6 days in
+    with tempfile.TemporaryDirectory() as t:
+        r, out = render(t, cache, None)
+        assert r.returncode == 0, r.stderr
+        im = Image.open(out).convert("RGB"); w, h = im.size
+    track = over(O_INK, over((0xff, 0x87, 0x00), O_PANEL2, 0.09), 0.14)
+    is_bar = lambda p: near(p, track, 3) or near(p, BLUE, 3)
+    rows = {}
+    for y in range(h):
+        xs = [x for x in range(w) if is_bar(im.getpixel((x, y)))]
+        if len(xs) > 30: rows[y] = max(xs) - min(xs)
+    bands = []
+    for y in sorted(rows):
+        (bands[-1].append(y) if bands and y - bands[-1][-1] <= 1 else bands.append([y]))
+    assert len(bands) == 2, bands  # Claude weekly and the Fable slice
+    mid = [rows[b[len(b) // 2]] for b in bands]
+    assert abs(mid[0] - mid[1]) <= 4, mid  # same weekly window, same width
+
 def test_phone_spend_chip_follows_orderly():
     """orderly spendChip: "$" after the family chips on the Cursor rows when spend is above zero,
     on any of them (Grok Bot included) when the pool is capped; amber when capped, red past the limit."""
