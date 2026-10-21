@@ -11,7 +11,7 @@ own card: Argon weekly, plus Gemini and Claude/GPT.
 import json, os, sys, time
 from datetime import datetime
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageChops, ImageDraw, ImageFont
 except ImportError:
     sys.exit("seat-meters needs Pillow: python3 -m pip install --user pillow")
 
@@ -101,6 +101,25 @@ def pill(x0, y0, x1, y1, color, alpha=1.0, split=None, color2=None, alpha2=1.0):
             ImageDraw.Draw(m2).rounded_rectangle(box, radius=max(0, r - 0.5), fill=round(255 * alpha2))
             m.paste(m2.crop((sx, 0, w * SS, h * SS)), (sx, 0))
     img.paste(c.resize((w, h), Image.BOX), (ox, oy), m.resize((w, h), Image.LANCZOS))
+
+def striped(x0, y0, x1, y1):
+    """orderly's .meter .track.ended: repeating-linear-gradient(135deg, ink 22% 0 4px, ink 10%
+    4px 8px) on the 3px-radius track (newtab.html:150, 154). At 135deg the stripes run up and
+    to the right, and a point's place along the gradient is (x + y) / sqrt 2 from the top left."""
+    X0_, Y0_, X1_, Y1_ = x0 * S, y0 * S, x1 * S, y1 * S
+    ox, oy = int(X0_), int(Y0_); w, h = int(X1_ + 1) - ox, int(Y1_ + 1) - oy
+    if w <= 0 or h <= 0: return
+    r = min(3 * S, (X1_ - X0_) / 2, (Y1_ - Y0_) / 2) * SS
+    m = Image.new("L", (w * SS, h * SS), 0)
+    ImageDraw.Draw(m).rounded_rectangle(((X0_ - ox) * SS, (Y0_ - oy) * SS, (X1_ - ox) * SS - 1, (Y1_ - oy) * SS - 1),
+                                        radius=max(0, r - 0.5), fill=255)
+    period, a, b = 8 * K * S * SS, round(255 * .22), round(255 * .10)
+    sx, sy = (ox - X0_) * SS, (oy - Y0_) * SS
+    st = Image.new("L", (w * SS, h * SS))
+    st.putdata([a if ((xx + sx + yy + sy) / math.sqrt(2)) % period < period / 2 else b
+                for yy in range(h * SS) for xx in range(w * SS)])
+    m = ImageChops.multiply(m, st)
+    img.paste(Image.new("RGB", (w, h), INK), (ox, oy), m.resize((w, h), Image.LANCZOS))
 
 def track(st, y, h, width_frac, right=None, left=None, fill_alpha=1.0):
     """Draw one track whose own tick lands on the shared now line. Styled after
@@ -278,14 +297,26 @@ FABLE_TEXT = (f"not on {_title}" if _title else "not on this plan") if FABLE_STA
 rows.append(("Fable", seat(FABLE_PCT, d.get("fable_reset_ts"), WK) if FABLE_PCT is not None else None, None))
 POOL["Fable"] = ("claude_fable", "claude", "Claude \u00b7 Fable slice", "claude")
 RESET_KEY["Fable"] = "fable_reset_ts"
+# An ended subscription, as orderly's subEnded (extension/newtab.js:773-775, termPast 744-747):
+# set not to renew (renews false) and its paid-through stamp is now or past. Same keys as
+# renewal() above (server.rb:1749-1754, quota_renewal 1770-1796). orderly's date-only Claude term
+# (claude_renews_on) is not in the pulled cache, so only the timed stamp counts here.
+def sub_ended(vendor):
+    if vendor not in SUBS: return False
+    ts = d.get(SUBS[vendor][0])
+    return d.get(SUBS[vendor][1]) is False and _isnum(ts) and ts <= now
+ENDED = {label for label, _, _ in rows if sub_ended(POOL.get(label, (label, ""))[1])}
 # The shared time scale again, now with the Fable row: orderly's renderRail takes every live
-# row's window into one span, so Fable's track keeps its full weekly width.
-mains = [m for _, m, _ in rows if m]
+# row's window into one span, so Fable's track keeps its full weekly width. An ended row has
+# no window there (newtab.js:1169), so it stays out of the span.
+mains = [m for l, m, _ in rows if m and l not in ENDED]
 past = max([m["w"] * m["e"] for m in mains] or [1]); fut = max([m["w"] * (1 - m["e"]) for m in mains] or [1])
 span = past + fut; nowfrac = past / span
 ORDER = ["Claude", "Fable", "ChatGPT", "Cursor models", "Cursor other", "Grok Bot", "SuperGrok",
          "Argon", "Gemini", "Claude/GPT", "Muse"]
-rows.sort(key=lambda r: ORDER.index(r[0]) if r[0] in ORDER else 99)
+# Ended plans sink to the bottom, the rest in order (newtab.js:1159-1163); a subscription's rows
+# end together, so its card and header move with them.
+rows.sort(key=lambda r: (r[0] in ENDED, ORDER.index(r[0]) if r[0] in ORDER else 99))
 # seat-usage's cap projection for each row's main pool: <pool>_caps_early_s.
 CAPS_KEY = {"Claude": "claude_week", "Fable": "fable", "ChatGPT": "codex", "Cursor models": "cursor_models",
             "Cursor other": "cursor_other", "Grok Bot": "grokbot", "SuperGrok": "grok",
@@ -316,6 +347,9 @@ def fable_stats(m):
 
 def stats(label, m, f):
     """orderly's .v line: percent, 5h, reset, and an old reading. [(text, red)]."""
+    # An ended plan's line is only its renewal words, "sub ended", in the muted .renew class
+    # (newtab.js:1190-1201, renewalPart 757-759): no usage, pace, reset or read state.
+    if label in ENDED: return [("sub ended", False)]
     if label == "Fable" and not m: return fable_stats(m)
     if not m and not f: return [("no reading", False)]
     parts = []
@@ -395,7 +429,8 @@ for label, m, f in rows:
                       "header_warn": bool(hdr and hdr[1]), "sub": None, "pools": []})
     sp = spend(label, m)
     cards[-1]["pools"].append({"label": label, "seat": sid, "title": title,
-                               "state": FABLE_STATE if label == "Fable" else None,
+                               "state": "ended" if label in ENDED else FABLE_STATE if label == "Fable" else None,
+                               "ended": label in ENDED,
                                "ghost": FABLE_STATE if label == "Fable" and not m else None,
                                "chips": chips(sid) + ([("$", "solid")] if sp else []), "spend": sp,
                                "main": m, "five": f, "stats": stats(label, m, f)})
@@ -536,7 +571,7 @@ if TEXT:
     print(json.dumps({"host": HOST, "why": WHY, "legend": LEGEND, "notes": NOTES, "errors": {k: str(v) for k, v in errs.items()},
                       "cards": [{"header": c["header"], "header_warn": c["header_warn"], "sub": c["sub"],
                                  "pools": [{"title": p["title"], "chips": p["chips"], "chips_drawn": len(p["fit"]), "spend": p["spend"], "state": p["state"],
-                                            "muted": p["ghost"] == "absent",
+                                            "muted": p["ghost"] == "absent" or p["ended"], "ended": p["ended"],
                                             "stats": " \u00b7 ".join(t for t, _ in p["stats"]),
                                             "stats_drawn": [" \u00b7 ".join(t for t, _ in l) for l in p["stat_l"]],
                                             "red": [t for t, r in p["stats"] if r]} for p in c["pools"]]}
@@ -544,7 +579,8 @@ if TEXT:
 
 pool_h = lambda p: p["chip_lines"] * CHIP_LH + (PADY + LH(12) + GAP + (12 if p["five"] and p["main"] else 6) * K
                                                 + GAP + LH(11) * len(p["stat_l"]) + PADY
-    if (p["main"] or p["five"] or p["ghost"]) else PADY + LH(12) + GAP + LH(11) * len(p["stat_l"]) + PADY)
+    if (p["main"] or p["five"] or p["ghost"]) and not p["ended"] else
+    PADY + LH(12) + p["chip_lines"] * CHIP_LH + GAP + 6 * K + GAP + LH(11) * len(p["stat_l"]) + PADY if p["ended"] else PADY + LH(12) + GAP + LH(11) * len(p["stat_l"]) + PADY)
 for c in cards:
     c["sub_l"] = wrap(c["sub"], F_HDR, TX1 - TX0) if c["sub"] else []
 hdr_h = lambda c: (3 * K + LH(10.5) * (1 + len(c["sub_l"])) + 2 * K) if c["header"] else 0
@@ -618,8 +654,9 @@ for i, c in enumerate(cards):
     for p in c["pools"]:
         yy = y + PADY
         ly = yy + LH(12) / 2
-        # .seat.absent b{color:var(--muted)} (newtab.html:156)
-        g.text((P(TX0), P(ly)), p["title"], font=F_TITLE, fill=O_MUTED if p["ghost"] == "absent" else O_INK, anchor="lm")
+        # .seat.ended b,.seat.absent b{color:var(--muted)} (newtab.html:156)
+        g.text((P(TX0), P(ly)), p["title"], font=F_TITLE,
+               fill=O_MUTED if p["ghost"] == "absent" or p["ended"] else O_INK, anchor="lm")
         for k_, (name, style, cx, line) in enumerate(p["fit"]):
             sp = p["spend"] if (name == "$" and k_ == len(p["chips"]) - 1) else None
             # orderly: Grok Bot's family chips in Grok blue (.chip.fam); its "$" chip keeps the Cursor hue
@@ -627,7 +664,14 @@ for i, c in enumerate(cards):
             chip(cx, ly + line * CHIP_LH, name, style, ch, sp)
         yy += LH(12) + p["chip_lines"] * CHIP_LH + GAP
         m, f = p["main"], p["five"]
-        if m or f:
+        if p["ended"]:
+            # An ended plan: a full-width striped grey track, no fill and no now tick
+            # (newtab.js:1191-1194; .meter .track.ended, newtab.html:154; .meter height 6px).
+            snap = lambda v: round(v * S) / S
+            yy = snap(yy); bh = snap(6 * K)
+            striped(X0, yy, X0 + MW, yy + bh)
+            yy += 6 * K + GAP
+        elif m or f:
             snap = lambda v: round(v * S) / S  # whole device pixels: no half-lit rows in a bar
             yy = snap(yy)
             if m:
