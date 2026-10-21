@@ -81,7 +81,8 @@ span = past + fut; nowfrac = past / span
 S = 3      # device pixels per 1x px
 W = 390    # 1x width of one column: orderly's narrow rail
 # Columns of cards: two, or more when the picture would still be narrower than a phone screen
-# (9:19.5 portrait), so a phone fits it to its width rather than its height.
+# (9:19.5 portrait), so a phone fits it to its width rather than its height. With fewer cards
+# than columns the rest stay empty, which happens only when a long footer needs the width.
 MIN_ASPECT = 9 / 19.5
 P = lambda v: int(v * S)
 
@@ -609,7 +610,9 @@ while True:
     y = TOP + max(col_h(col) for col in COLS)
     y += 8 * K + LH(10.5) * (len(legend_l) + len(notes_l) + len(err_l)) + RPY
     Ht = int(math.ceil(y + FRAME_Y))
-    if P(WT) / (Ht * S) >= MIN_ASPECT or NCOL >= len(cards): break
+    # Width grows with each column and the footer's lines only get fewer, so this ends; past the
+    # card count the extra columns are empty and only widen the footer (a long error list).
+    if P(WT) / (Ht * S) >= MIN_ASPECT: break
     NCOL += 1
 for ci, col in enumerate(COLS):
     yc = TOP

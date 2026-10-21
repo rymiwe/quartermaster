@@ -619,7 +619,7 @@ def _every_seat(now, stale=0):
 def test_layout_is_no_narrower_than_a_phone_screen():
     """The picture is at least as wide as a 9:19.5 portrait phone screen, so the phone fits it to
     its width: a full cache, the same with every reading stale (a longer stats line per row), a
-    single card, and a footer of errors that needs a third column."""
+    single card, and footers of errors that need more columns, even more than there are cards."""
     now = time.time()
     errs = {f"seat{i}": "HTTPError 503: the vendor did not answer this read in time" for i in range(30)}
     with tempfile.TemporaryDirectory() as t:
@@ -627,15 +627,20 @@ def test_layout_is_no_narrower_than_a_phone_screen():
                 "stale": phone_text(t, _every_seat(now, 17 * 60), muse_doc(now)),
                 "one": phone_text(t, {"ts": now, "as_of": {"claude": now}, "claude_week": 5,
                                       "claude_week_reset_ts": now + 86400}),
+                "few_cards": phone_text(t, {"ts": now, "errors": {f"e{i}": "the vendor did not answer " * 8 for i in range(20)}}),
                 "errors": phone_text(t, {**_every_seat(now), "errors": errs}, muse_doc(now))}
         im_w, im_h = Image.open(os.path.join(t, "p.png")).size
     for name, doc in docs.items():
         w, h = doc["size"]
-        assert w / h >= 9 / 19.5 or len(doc["columns"]) == len(doc["cards"]), (name, w, h)
+        assert w / h >= 9 / 19.5, (name, w, h)
         assert w == two_wide(len(doc["columns"])), (name, w)
     assert (im_w, im_h) == tuple(docs["errors"]["size"])  # --text says the drawn size
     assert [len(docs[n]["columns"]) for n in ("full", "stale", "one")] == [2, 2, 2]
     assert len(docs["errors"]["columns"]) > 2, docs["errors"]["size"]
+    # two cards and a long footer: more columns than cards, the extra ones empty
+    few = docs["few_cards"]
+    assert len(few["cards"]) == 2 and len(few["columns"]) > 2, few["columns"]
+    assert sum(few["columns"], []) == [0, 1], few["columns"]
     w, h = docs["full"]["size"]
     assert w / h >= 0.64, (w, h)  # the chat's own image area in Ryan's screenshot, 1080 x ~1680
 
