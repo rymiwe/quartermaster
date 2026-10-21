@@ -1099,6 +1099,7 @@ LINE_SEATS = ("claude", "chatgpt", "cursor", "grokbot", "grok")
 # Model ids live in that file. ROUTE_RULES is empty: score_route replaced the table.
 # A pool with enabled false is left out of POOLS.
 POOLS = {}
+GOOGLE_FAMILIES = {}
 ROLES = {}
 POOL_ORDER = ()
 SCORING = {}
@@ -1319,7 +1320,8 @@ def _copy_maps(raw, meta, *names):
             meta[name] = dict(raw[name])
 
 def _empty_pool_tables():
-    global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, FAMILY_VENDOR, _FAMILY_NAME
+    global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, FAMILY_VENDOR, _FAMILY_NAME, GOOGLE_FAMILIES
+    GOOGLE_FAMILIES = {}
     POOLS = {}
     ROLES = {}
     POOL_ORDER = ()
@@ -1337,7 +1339,7 @@ def load_config(pools_path=None, priors_path=None):
     install still sees it.
     """
     global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, BURN_HOURS, BURN_GAP, NEAR_CAP
-    global FAMILY_VENDOR, _FAMILY_NAME, ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S
+    global FAMILY_VENDOR, _FAMILY_NAME, ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S, GOOGLE_FAMILIES
     ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S = (ROUTE_FRESHNESS_DEFAULT_S["live"], ROUTE_FRESHNESS_DEFAULT_S["pulled"])
     path = pools_path or pools_file()
     try:
@@ -1360,6 +1362,11 @@ def load_config(pools_path=None, priors_path=None):
         fh.close()
     if not isinstance(data, dict) or not isinstance(data.get("pools"), dict):
         raise RuntimeError(f"pool config {path} needs a pools object")
+    # Display only: the model families each Google AI Pro pool serves (seat_rows' chips).
+    gpools = (data.get("google_ai_pro") or {}).get("pools") if isinstance(data.get("google_ai_pro"), dict) else None
+    GOOGLE_FAMILIES = {k: [f for f in v["families"] if isinstance(f, str) and f]
+                       for k, v in (gpools or {}).items()
+                       if isinstance(v, dict) and isinstance(v.get("families"), list)}
     fresh = data.get("route_freshness_s") if isinstance(data.get("route_freshness_s"), dict) else {}
     ok = lambda v: _is_number(v) and v > 0
     if ok(fresh.get("live")):
@@ -3992,7 +3999,8 @@ def seat_rows(s, now=None):
     A list of {"id", "hue", "label", "tag"?, "ondemand_over"?, "bars"}. A bar is
     {"kind": "seat"|"failed"|"empty"|"off", "name", "seat", ...}; a "seat" bar adds
     pool, hue, pct, reset_ts, window_s, notify (may name its reset), "label"? (a
-    longer name than the status line's), and on Claude term_ts/term_verb/term_day. "stdin" names the Claude Code rate_limits key that
+    longer name than the status line's), "families"? (the model families the pool
+    serves, for chips), and on Claude term_ts/term_verb/term_day. "stdin" names the Claude Code rate_limits key that
     overrides it live. "stale_name" sits on the first bar of each seat, for the
     renderer's old-reading note. Staleness and wording stay with the renderer.
     """
@@ -4087,6 +4095,7 @@ def seat_rows(s, now=None):
                 if num(f"google_{pool}_week") is not None:
                     gg["bars"].append(bar(name, "google", f"google_{pool}_week", hue, num(f"google_{pool}_week"),
                                           num(f"google_{pool}_week_reset_ts"), 7 * 86400, label=label,
+                                          **({"families": GOOGLE_FAMILIES[pool]} if GOOGLE_FAMILIES.get(pool) else {}),
                                           **({} if gg["bars"] else {"stale_name": "gg"})))
     return [g for g in groups.values() if g["bars"] or g.get("tag")]
 

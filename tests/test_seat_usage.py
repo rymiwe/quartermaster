@@ -3869,6 +3869,8 @@ def seat_rows_mirror_the_status_line_groups():
     assert [(b["name"], b["pct"]) for b in rows["gg"]["bars"]] == [("argon", 4), ("c/g", 10)], rows["gg"]
     assert [g["label"] for g in rows.values()] == ["Claude", "Codex", "Cursor", "SuperGrok", "Muse", "Google"]
     assert [b["label"] for b in rows["gg"]["bars"]] == ["Argon weekly", "Claude/GPT weekly"]
+    assert rows["gg"]["bars"][0]["families"] == ["Argon"], "chips come from pools.json's google_ai_pro block"
+    assert "Opus" in rows["gg"]["bars"][1]["families"]
     # A failed read, an ended ChatGPT term, and no Google keys at all.
     s2 = {k: v for k, v in snap(codex_renews=False, codex_renews_ts=NOW - 60).items() if not k.startswith("google_")}
     s2["as_of"] = {k: v for k, v in s2["as_of"].items() if k != "grok"}
