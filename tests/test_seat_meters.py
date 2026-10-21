@@ -509,6 +509,36 @@ def test_phone_ended_subscription_follows_orderly():
         assert _pool(claude, x)["state"] == "ended" and _pool(claude, x)["stats"] == "sub ended", _pool(claude, x)
     assert titles(claude)[-2:] == ["Claude \u00b7 weekly", "Claude \u00b7 Fable slice"], titles(claude)
     assert not any(p["ended"] for c in active["cards"] for p in c["pools"])
+    # an ended plan whose usage numbers are gone still gets its rows (orderly lists every seat)
+    bare = {"ts": now, "as_of": {}, "codex_renews": False, "codex_renews_ts": now - 86400,
+            "cursor_renews": False, "cursor_reset_ts": now - 3600, "grok_renews": True, "grok_renews_ts": now - 60}
+    with tempfile.TemporaryDirectory() as t:
+        gone = phone_text(t, bare)
+    assert titles(gone)[-4:] == ["Codex \u00b7 weekly"] + cur, titles(gone)
+    assert all(_pool(gone, x)["stats"] == "sub ended" for x in ["Codex \u00b7 weekly"] + cur)
+    assert _card(gone, "Codex \u00b7 weekly")["header"] == "Codex \u00b7 sub ended"
+    assert "SuperGrok \u00b7 weekly" not in titles(gone)  # set to renew: no reading, no row, as before
+
+def test_phone_ended_row_height_counts_wrapped_chips_once():
+    """An ended row with chips on a second line is as tall as its content: the striped track, then
+    "sub ended", then the card's padding, with no extra space below."""
+    now = time.time()
+    cache = {"ts": now, "as_of": {"cursor": now}, "cursor_api_pct": 100, "cursor_reset_ts": now - 3600,
+             "cursor_window_s": 31 * 86400, "cursor_renews": False, "cursor_ondemand": 5, "cursor_auto_pct": 3,
+             "bot_pct": 30, "bot_reset_ts": now + 2 * 86400, "bot_window_s": 7 * 86400}
+    with tempfile.TemporaryDirectory() as t:
+        # not latest.json: no host line, which follows seat-usage's route and would differ
+        doc = phone_text(t, cache, name="c.json")
+        im = Image.open(os.path.join(t, "p.png")).convert("RGB"); w, h = im.size
+        live = phone_text(t, {**cache, "cursor_renews": True, "cursor_reset_ts": now + 86400}, name="c.json")
+        im2 = Image.open(os.path.join(t, "p.png")).convert("RGB")
+    other = _pool(doc, "Cursor \u00b7 Other Models")
+    assert other["ended"] and other["chips"][-1] == ["$", "solid"] and other["spend"] == "draw", other
+    assert other["chips_drawn"] == len(other["chips"])
+    # live rows of the same shape (chips wrapped, one 6px bar, one stats line each) are as tall
+    assert [len(_pool(live, x)["stats_drawn"]) for x in ("Cursor \u00b7 Cursor Models", "Cursor \u00b7 Other Models", "Grok Bot \u00b7 weekly")] == [1, 1, 1], live
+    assert _card(live, "Grok Bot \u00b7 weekly")["sub"] == _card(doc, "Grok Bot \u00b7 weekly")["sub"], (live, doc)
+    assert im.size == im2.size, (im.size, im2.size)
 
 def test_phone_ended_track_is_full_width_striped_grey():
     """.meter .track.ended (newtab.html:154): repeating-linear-gradient(135deg, ink 22% 0 4px,

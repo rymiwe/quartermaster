@@ -305,6 +305,11 @@ def sub_ended(vendor):
     if vendor not in SUBS: return False
     ts = d.get(SUBS[vendor][0])
     return d.get(SUBS[vendor][1]) is False and _isnum(ts) and ts <= now
+# orderly lists every seat, read or not, so an ended plan's rows are drawn even with no
+# usage numbers left in the cache: add the ones add() dropped.
+_have = {label for label, _, _ in rows}
+rows += [(label, None, None) for label, (_s, vendor, _t, _a) in POOL.items()
+         if label not in _have and sub_ended(vendor)]
 ENDED = {label for label, _, _ in rows if sub_ended(POOL.get(label, (label, ""))[1])}
 # The shared time scale again, now with the Fable row: orderly's renderRail takes every live
 # row's window into one span, so Fable's track keeps its full weekly width. An ended row has
@@ -580,7 +585,7 @@ if TEXT:
 pool_h = lambda p: p["chip_lines"] * CHIP_LH + (PADY + LH(12) + GAP + (12 if p["five"] and p["main"] else 6) * K
                                                 + GAP + LH(11) * len(p["stat_l"]) + PADY
     if (p["main"] or p["five"] or p["ghost"]) and not p["ended"] else
-    PADY + LH(12) + p["chip_lines"] * CHIP_LH + GAP + 6 * K + GAP + LH(11) * len(p["stat_l"]) + PADY if p["ended"] else PADY + LH(12) + GAP + LH(11) * len(p["stat_l"]) + PADY)
+    PADY + LH(12) + GAP + 6 * K + GAP + LH(11) * len(p["stat_l"]) + PADY if p["ended"] else PADY + LH(12) + GAP + LH(11) * len(p["stat_l"]) + PADY)
 for c in cards:
     c["sub_l"] = wrap(c["sub"], F_HDR, TX1 - TX0) if c["sub"] else []
 hdr_h = lambda c: (3 * K + LH(10.5) * (1 + len(c["sub_l"])) + 2 * K) if c["header"] else 0
