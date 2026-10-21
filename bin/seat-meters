@@ -303,14 +303,16 @@ def stats(label, m, f):
     return parts
 
 def families():
-    """orderly families(): FAMILIES, then the families each Google row names (seat_rows
-    carries them only on a Google pool with a weekly reading). A row joins the end of a
-    family's sources; a family orderly doesn't know joins the end of the list."""
+    """orderly families(): FAMILIES, then the families each Google row names. seat_rows
+    (bin/seat-usage) puts them on a Google weekly bar when as_of.google is a number and the
+    pool's weekly percent is a number, in the order argon, gemini, claudegpt. A row joins the
+    end of a family's sources; a family orderly doesn't know joins the end of the list."""
     out = [(n, list(src)) for n, src in FAMILIES]
-    for label, m, _f in rows:
-        sid = POOL.get(label, (label,))[0]
-        pool = sid[len("google_"):-len("_week")] if sid.startswith("google_") and sid.endswith("_week") else None
-        if pool is None or not m: continue
+    isnum = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    google_ok = isnum((d.get("as_of") if isinstance(d.get("as_of"), dict) else {}).get("google"))
+    for pool in ("argon", "gemini", "claudegpt"):
+        sid = f"google_{pool}_week"
+        if not (google_ok and isnum(d.get(sid))): continue
         for name in GFAM.get(pool, []):
             fam = next((x for x in out if x[0] == name), None)
             if fam is None: out.append(fam := (name, []))

@@ -495,6 +495,12 @@ def test_phone_google_chips_take_orderlys_family_order():
         five_only = {k: v for k, v in GOOGLE_CACHE.items() if not k.startswith("google_gemini_week")}
         five_only.update({"google_gemini_5h": 5, "google_gemini_5h_reset_ts": NOW + 3600})
         no_week = phone_text(t, five_only, pools=alt)
+        # a weekly percent with no reset still names its families (seat_rows needs no reset)
+        no_reset = phone_text(t, {**five_only, "google_gemini_week": 5}, pools=alt)
+        # no as_of.google: seat_rows draws a failed bar, which names no families
+        no_stamp = phone_text(t, {**GOOGLE_CACHE, "as_of": {k: v for k, v in FRESH.items() if k != "google"}}, pools=alt)
+    assert _pool(no_reset, "Google AI Pro \u00b7 Gemini")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
+    assert all(p["chips"] == [] for p in _card(no_stamp, "Google AI Pro \u00b7 Argon")["pools"]), no_stamp
     assert _pool(doc, "Google AI Pro \u00b7 Argon")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
     assert _pool(doc, "Google AI Pro \u00b7 Gemini")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
     assert _pool(doc, "Google AI Pro \u00b7 Claude/GPT")["chips"] == [["Opus", "solid"], ["GPT-OSS", "solid"]]
