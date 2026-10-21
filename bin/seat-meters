@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """Draw seat-usage meters as a PNG from the cached summary, laid out like orderly:
 one shared time scale, every row's pace tick on a single "now" line. No network calls.
-Google AI Pro is its own group: Argon weekly, plus Gemini and Claude/GPT."""
+Google AI Pro is its own group: Argon weekly, plus Gemini and Claude/GPT.
+
+--phone draws orderly's meters panel: a "Next host" line from
+`seat-usage --route host --cached --json` (cache only), one card per subscription
+with its cached renewal, family chips, and a stats line per pool. --text also
+prints that layout's words as JSON in place of the output path."""
 import json, os, sys, time
 from datetime import datetime
 try:
@@ -10,7 +15,10 @@ except ImportError:
     sys.exit("seat-meters needs Pillow: python3 -m pip install --user pillow")
 
 CACHE = os.environ.get("SEAT_USAGE_CACHE", os.path.expanduser("~/.cache/seat-usage/latest.json"))
-ARGS = [a for a in sys.argv[1:] if a != "--phone"]; PHONE = "--phone" in sys.argv[1:]
+FLAGS = {"--phone", "--text"}
+ARGS = [a for a in sys.argv[1:] if a not in FLAGS]; PHONE = "--phone" in sys.argv[1:]
+TEXT = "--text" in sys.argv[1:]  # print the phone layout's words as JSON instead of the path
+if TEXT and not PHONE: sys.exit("seat-meters: --text needs --phone")
 OUT = ARGS[0] if ARGS else os.path.join(os.environ.get("TMPDIR") or "/tmp", "seat-meters.png")
 BG, INK, DIM = "#141a22", "#e6ebf2", "#8a96a8"
 TRACK_A = 0.14  # orderly: color-mix(in srgb, var(--ink) 14%, transparent)
@@ -55,8 +63,10 @@ def muse():
     except Exception:
         return None
     if None in (wr, kr) or mins <= 0 or wr <= now or kr <= now: return None
-    return seat(kp, kr, WK), seat(wp, wr, mins * 60)
+    return seat(kp, kr, WK), seat(wp, wr, mins * 60), epoch(m.get("captured_at"))
 mu = muse()
+MUSE_AT = mu[2] if mu else None
+mu = mu[:2] if mu else None
 rows.append(("Muse",) + mu if mu else ("Muse", None, None))
 # A 5h window whose reset time has passed has rolled over since the reading: drop its bar.
 rows = [(l, m, f if f and f["left"] > 0 else None) for l, m, f in rows]
@@ -75,18 +85,15 @@ if PHONE:  # tall, narrow, big type: label and numbers above full-width bars
     F, FB, FS = font(17 * S), font(17 * S, True), font(14 * S)
     W, PAD, LBL = 390, 18, 0
     MW = W - 2 * PAD
-    row_h = lambda r: 70 if r[2] else 56
+    row_h = lambda r: 0  # the phone layout measures itself below
 else:
     S = 2
     F, FB, FS = font(13 * S), font(13 * S, True), font(11 * S)
     W, PAD, LBL, MW, VAL = 600, 14, 112, 330, 120
     row_h = lambda r: 40 if r[2] else 26
 X0 = PAD + LBL
-_PHONE_GROUP = {"Cursor models": "Cursor", "Cursor other": "Cursor", "Grok Bot": "Cursor",
-                "Argon": "Google", "Gemini": "Google", "Claude/GPT": "Google"}
-NGROUPS = len({_PHONE_GROUP.get(r[0], r[0]) for r in rows}) if PHONE else 0
 ghead = 16 if (not PHONE and any(r[0] in GOOGLE_LABELS for r in rows)) else 0
-Ht = PAD * 2 + 26 + 32 * NGROUPS + ghead + sum(row_h(r) for r in rows) + (16 * len(errs) + 8 if errs else 0)
+Ht = PAD * 2 + 26 + ghead + sum(row_h(r) for r in rows) + (16 * len(errs) + 8 if errs else 0)
 img = Image.new("RGB", (W * S, Ht * S), BG); g = ImageDraw.Draw(img)
 P = lambda v: int(v * S)
 
@@ -142,8 +149,9 @@ def tick(x, y0, y1):
     """orderly's now marker: 2px ink, rounded, 3px past the bars above and below."""
     pill(x - 1, y0 - 3, x + 1, y1 + 3, INK)
 
-g.text((P(PAD), P(PAD)), "Seat usage", font=FB, fill=INK)
-g.text((P(W - PAD), P(PAD)), f"as of {int((now - d.get('ts', now)) / 60)} min ago", font=FS, fill=DIM, anchor="ra")
+if not PHONE:
+    g.text((P(PAD), P(PAD)), "Seat usage", font=FB, fill=INK)
+    g.text((P(W - PAD), P(PAD)), f"as of {int((now - d.get('ts', now)) / 60)} min ago", font=FS, fill=DIM, anchor="ra")
 y = PAD + 30; top = y
 g0 = g1 = None
 for label, m, f in (rows if not PHONE else []):
@@ -171,65 +179,460 @@ for label, m, f in (rows if not PHONE else []):
         g1 = y
 if g0 is not None and g1 is not None:
     g.rectangle((P(4), P(g0), P(7), P(g1 - 4)), fill=GOOGLE)
-# Phone layout groups pools by subscription, like orderly (Grok Bot bills the Cursor seat).
-CPLAN = {"plus": "Plus", "pro": "Pro"}.get(str(d.get("codex_plan") or ""), str(d.get("codex_plan") or "").title())
-GROUP = {"Claude": ("Claude", "Weekly"), "ChatGPT": (("ChatGPT " + CPLAN).strip(), "Weekly"),
-         "Cursor models": ("Cursor Pro+", "Cursor Models"), "Cursor other": ("Cursor Pro+", "Other Models"),
-         "Grok Bot": ("Cursor Pro+", "Grok Bot"), "SuperGrok": ("SuperGrok", "Weekly"),
-         "Argon": ("Google AI Pro", "Argon"), "Gemini": ("Google AI Pro", "Gemini"),
-         "Claude/GPT": ("Google AI Pro", "Claude/GPT"), "Muse": ("Muse", "Weekly")}
-ORDER = ["Claude", "ChatGPT", "Cursor models", "Cursor other", "Grok Bot", "SuperGrok",
-         "Argon", "Gemini", "Claude/GPT", "Muse"]
 if PHONE:
-    rows.sort(key=lambda r: ORDER.index(r[0]) if r[0] in ORDER else 99)
-    # orderly's dark-theme vendor hues: 3px left rule, 16% tint on the header, 9% on the rows
-    HUE = {"Claude": "#ff8700", "ChatGPT": "#af87ff", "Cursor": "#00d7af", "SuperGrok": "#5fafff",
-           "Google": GOOGLE, "Muse": "#ff87d7"}
-    def hue(grp): return next((v for k, v in HUE.items() if grp.startswith(k)), DIM)
-    def mix(c, a):
-        c, b = [int(c[i:i + 2], 16) for i in (1, 3, 5)], [int(BG[i:i + 2], 16) for i in (1, 3, 5)]
+    # Phone layout: orderly's meters rail at its narrow width (extension/newtab.html
+    # .rail/.band-hdr/.seat/.chip/.meter, newtab.js renderRail). Sizes are orderly's
+    # CSS px times K. Every word here comes from the cache, the Muse file, or
+    # `seat-usage --route host --cached --json`; nothing is filled in to look complete.
+    import glob, math, subprocess
+    K = 1.3
+    O_BG, O_PANEL2, O_LINE = "#14171c", "#20262e", "#2b323c"
+    O_INK, O_INK2, O_MUTED, O_CRIT = "#e4e8ee", "#a3acb9", "#6f7987", "#e04b4b"
+    VHUE = {"claude": "#ff8700", "codex": "#af87ff", "cursor": "#00d7af", "grok": "#5fafff",
+            "google": GOOGLE, "muse": "#ff87d7"}
+    BG, INK = O_BG, O_INK  # tracks are ink at 14% over the card, as in orderly
+
+    def _find_font(names):
+        roots = ["/usr/share/fonts", "/usr/local/share/fonts", os.path.expanduser("~/.local/share/fonts"),
+                 os.path.expanduser("~/.fonts"), "/Library/Fonts", os.path.expanduser("~/Library/Fonts"),
+                 "/System/Library/Fonts"]
+        for n in names:
+            for r in roots:
+                hit = sorted(glob.glob(os.path.join(r, "**", n), recursive=True))
+                if hit: return hit[0]
+        return None
+    # orderly: --sans "IBM Plex Sans", --mono "JetBrains Mono"; DejaVu when they are not installed
+    SANS = _find_font(["IBMPlexSans-VariableFont*.ttf", "IBMPlexSans-SemiBold.ttf", "DejaVuSans.ttf", "Helvetica.ttc"])
+    SANS_REG = _find_font(["IBMPlexSans-VariableFont*.ttf", "IBMPlexSans-Regular.ttf", "DejaVuSans.ttf", "Helvetica.ttc"])
+    MONO = _find_font(["JetBrainsMono-VariableFont_wght.ttf", "JetBrainsMono-Regular.ttf", "DejaVuSansMono.ttf", "Menlo.ttc"])
+    MONO_FB = _find_font(["DejaVuSansMono.ttf", "Menlo.ttc"])  # for glyphs JetBrains Mono lacks (the star)
+    if not (SANS and SANS_REG and MONO):
+        sys.exit("seat-meters --phone needs a TrueType sans and mono face (IBM Plex Sans and JetBrains Mono, or DejaVu)")
+    def vfont(path, px, weight=None):
+        f = ImageFont.truetype(path, max(1, round(px * S)))
+        if weight is not None:
+            try:
+                axes = f.get_variation_axes()
+                f.set_variation_by_axes([weight if a.get("name") in (b"Weight", "Weight") else a["default"] for a in axes])
+            except Exception:
+                pass  # a static face: its own weight
+        return f
+    F_TITLE = vfont(SANS, 12 * K, 600)      # .seat b
+    F_HOST = vfont(SANS_REG, 13 * K, 400)   # .host-line
+    F_WHY = vfont(SANS_REG, 12 * K, 400)    # .host-line .why
+    F_HDR = vfont(MONO, 10.5 * K, 400)      # .band-hdr, .rail-key
+    F_CHIP = vfont(MONO, 9.5 * K, 400)      # .seat .lab .chip
+    F_V = vfont(MONO, 11 * K, 400)          # .seat .v
+
+    def rrect(box, radius, fill, corners):
+        try:
+            g.rounded_rectangle(box, radius=radius, fill=fill, corners=corners)
+        except TypeError:  # Pillow before 9.3 has no per-corner radius: square corners
+            g.rectangle(box, fill=fill)
+    def mixhex(c, a, under):
+        c, b = [int(c[i:i + 2], 16) for i in (1, 3, 5)], [int(under[i:i + 2], 16) for i in (1, 3, 5)]
         return tuple(round(b[i] + (c[i] - b[i]) * a) for i in range(3))
-    y += 4; top = y
-    spans, yy, last = [], y, None  # first pass: where each group's panel starts and ends
-    for r in rows:
-        grp = GROUP.get(r[0], (r[0], ""))[0]
-        if grp != last:
-            yy += 10; spans.append([grp, yy, yy]); last = grp; yy += 22
-        yy += row_h(r); spans[-1][2] = yy
-    for grp, a, b in spans:
-        X1, X2 = PAD - 8, W - PAD + 8
-        g.rounded_rectangle((P(X1), P(a - 2), P(X2), P(b - 4)), radius=P(5), fill=mix(hue(grp), .09))
-        g.rounded_rectangle((P(X1), P(a - 2), P(X2), P(a + 20)), radius=P(5), fill=mix(hue(grp), .16))
-        g.rectangle((P(X1), P(a + 12), P(X2), P(a + 20)), fill=mix(hue(grp), .16))
-        g.rectangle((P(X1), P(a - 2), P(X1 + 3), P(b - 4)), fill=hue(grp))
-    last = None
-    for label, m, f in rows:
-        grp, sub = GROUP.get(label, (label, ""))
-        if grp != last:
-            y += 10
-            g.text((P(PAD), P(y + 9)), grp.upper(), font=FS, fill=hue(grp), anchor="lm"); y += 22; last = grp
-        h = row_h((label, m, f)); ty = y + 10
-        g.text((P(PAD), P(ty)), sub, font=F, fill=INK, anchor="lm")
-        if m:
-            g.text((P(W - PAD), P(ty)), f"{m['pct']:.0f}%  \u00b7  {left_txt(m['left'])}", font=FB, fill=INK, anchor="rm")
-            track(m, ty + (20.5 if f else 20), 5 if f else 6, m["w"] / span)
-        else:
-            g.text((P(W - PAD), P(ty)), "no reading", font=FS, fill=DIM, anchor="rm")
+    hexof = lambda t: "#%02x%02x%02x" % t
+    rnd = lambda v: int(math.floor(float(v) + 0.5))  # Ruby's round, as orderly's pct_text
+    def fspan(secs):  # orderly formatSpan
+        s = max(0, int(secs)); dd, hh, mm = s // 86400, (s % 86400) // 3600, (s % 3600) // 60
+        if dd >= 2: return f"{dd}d"
+        if dd >= 1: return f"{dd}d {hh}h" if hh else f"{dd}d"
+        if hh >= 1: return f"{hh}h {mm}m" if mm else f"{hh}h"
+        return f"{mm}m"
+    def reset_label(t):  # orderly resetLabel: a time within 24h, a weekday within 7 days, else M/D
+        if not isinstance(t, (int, float)) or t <= now: return ""
+        dt = datetime.fromtimestamp(t)
+        if t - now < 86400:
+            h = dt.hour % 12 or 12
+            return f"{h}" + (f":{dt.minute:02d}" if dt.minute else "") + ("am" if dt.hour < 12 else "pm")
+        if t - now < 7 * 86400: return dt.strftime("%a")
+        return f"{dt.month}/{dt.day}"
+
+    CPLAN = {"plus": "Plus", "pro": "Pro"}.get(str(d.get("codex_plan") or ""), str(d.get("codex_plan") or "").title())
+    # Is the Claude plan Max? seat-usage's claude_max (bool) first, the plan name second;
+    # None when the cache can't say. Same rule as seat-usage's claude_max().
+    PLAN = d.get("claude_plan") if isinstance(d.get("claude_plan"), str) else ""
+    if "claude_max" in d:
+        CLAUDE_MAX = d["claude_max"] if isinstance(d["claude_max"], bool) else None
+    else:
+        tier = PLAN.strip().lower().replace("default_", "")
+        CLAUDE_MAX = True if "max" in tier else False if tier in ("claude_ai", "claude_pro") else None
+    # Subscription each card belongs to: (paid-through key, will-renew key), as orderly's quota_renewal.
+    SUBS = {"claude": ("claude_renews_ts", "claude_renews"), "codex": ("codex_renews_ts", "codex_renews"),
+            "cursor": ("cursor_reset_ts", "cursor_renews"), "grok": ("grok_renews_ts", "grok_renews")}
+    def renewal(vendor):
+        """(text, warn) for the band header, or None when the cache has no date."""
+        if vendor not in SUBS: return None
+        ts, rn = d.get(SUBS[vendor][0]), d.get(SUBS[vendor][1])
+        if not isinstance(ts, (int, float)) or isinstance(ts, bool): return None
+        rn = rn if isinstance(rn, bool) else None
+        if ts <= now:
+            return ("sub ended" if rn is False else "sub renewal due"), False
+        verb = "renews" if rn is True else "sub ends" if rn is False else "term ends"
+        return f"{verb} {reset_label(ts)}", rn is False and ts - now < 7 * 86400
+
+    # Model families each pool can serve: orderly's FAMILIES/METERED/BUILDER_ONLY
+    # (extension/newtab.js). Google AI Pro's families are data in config/pools.json
+    # ("google_ai_pro"), read below; orderly has no Google pools.
+    FAMILIES = [("Fable", ["claude_fable", "claude_weekly", "cursor_other"]), ("Opus", ["claude_weekly", "cursor_other"]),
+                ("Astra", ["codex"]), ("Sol", ["codex", "cursor_other"]), ("Grok", ["cursor_models", "supergrok"]),
+                ("Grok Bot", ["grokbot"]), ("Wonder full", ["muse"]), ("Wonder", ["muse"])]
+    METERED, BUILDER_ONLY = {"cursor_other"}, {"supergrok"}
+    def pools_conf():
+        """pools.json as seat-usage finds it (SEAT_USAGE_POOLS, then the repo's config), or {}."""
+        path = os.environ.get("SEAT_USAGE_POOLS") or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config", "pools.json")
+        try:
+            with open(path) as fh: conf = json.load(fh)
+        except (OSError, ValueError): return {}
+        return conf if isinstance(conf, dict) else {}
+    def google_families():
+        """{orderly-style seat id: [(family, style)]} from pools.json's google_ai_pro block."""
+        block = pools_conf().get("google_ai_pro")
+        pools = block.get("pools") if isinstance(block, dict) else None
+        if not isinstance(pools, dict): return {}
+        out = {}
+        for pool, rec in pools.items():
+            if not isinstance(rec, dict) or not isinstance(rec.get("families"), list): continue
+            style = rec.get("style") if rec.get("style") in ("solid", "dashed", "dotted") else "solid"
+            out["google_" + pool] = [(f, style) for f in rec["families"] if isinstance(f, str) and f]
+        return out
+    GFAM = google_families()
+    def chips(sid):
+        if sid in GFAM: return list(GFAM[sid])
+        out = []
+        for name, src in FAMILIES:
+            if sid not in src: continue
+            # Claude Pro runs Fable only on usage credits; only Max includes it.
+            if name == "Fable" and sid == "claude_weekly" and CLAUDE_MAX is not True: continue
+            out.append((name, "dashed" if sid in METERED else "dotted" if sid in BUILDER_ONLY else "solid"))
+        return out
+
+    # label -> (orderly seat id, vendor card, title, as_of key)
+    POOL = {"Claude": ("claude_weekly", "claude", "Claude \u00b7 weekly", "claude"),
+            "ChatGPT": ("codex", "codex", "Codex \u00b7 weekly", "chatgpt"),
+            "Cursor models": ("cursor_models", "cursor", "Cursor \u00b7 Cursor Models", "cursor"),
+            "Cursor other": ("cursor_other", "cursor", "Cursor \u00b7 Other Models", "cursor"),
+            "Grok Bot": ("grokbot", "cursor", "Grok Bot \u00b7 weekly", "grokbot"),
+            "SuperGrok": ("supergrok", "grok", "SuperGrok \u00b7 weekly", "grok"),
+            "Argon": ("google_argon", "google", "Google AI Pro \u00b7 Argon", "google"),
+            "Gemini": ("google_gemini", "google", "Google AI Pro \u00b7 Gemini", "google"),
+            "Claude/GPT": ("google_claudegpt", "google", "Google AI Pro \u00b7 Claude/GPT", "google"),
+            "Muse": ("muse", "muse", "Muse \u00b7 weekly", None)}
+    RESET_KEY = {"Claude": "claude_week_reset_ts", "ChatGPT": "codex_reset_ts", "Cursor models": "cursor_reset_ts",
+                 "Cursor other": "cursor_reset_ts", "Grok Bot": "bot_reset_ts", "SuperGrok": "grok_reset_ts"}
+    # The Fable slice: only a Max plan has one, and only a Max plan's cache can say so.
+    if CLAUDE_MAX is True:
+        rows.append(("Fable", seat(d.get("fable"), d.get("fable_reset_ts"), WK), None))
+        POOL["Fable"] = ("claude_fable", "claude", "Claude \u00b7 Fable slice", "claude")
+        RESET_KEY["Fable"] = "fable_reset_ts"
+    ORDER = ["Claude", "Fable", "ChatGPT", "Cursor models", "Cursor other", "Grok Bot", "SuperGrok",
+             "Argon", "Gemini", "Claude/GPT", "Muse"]
+    rows.sort(key=lambda r: ORDER.index(r[0]) if r[0] in ORDER else 99)
+    as_of = d.get("as_of") if isinstance(d.get("as_of"), dict) else {}
+    # seat-usage's cap projection for each row's main pool: <pool>_caps_early_s.
+    CAPS_KEY = {"Claude": "claude_week", "Fable": "fable", "ChatGPT": "codex", "Cursor models": "cursor_models",
+                "Cursor other": "cursor_other", "Grok Bot": "grokbot", "SuperGrok": "grok",
+                "Argon": "google_argon_week", "Gemini": "google_gemini_week",
+                "Claude/GPT": "google_claudegpt_week", "Muse": "muse_week"}
+    def roughspan(secs):  # orderly roughSpan
+        return fspan(secs if secs < 3600 else math.floor(secs / 3600 + 0.5) * 3600)  # JS Math.round
+
+    def stats(label, m, f):
+        """orderly's .v line: percent, 5h, reset, and an old reading. [(text, red)]."""
+        if not m and not f: return [("no reading", False)]
+        parts = []
+        if m: parts.append((f"{rnd(m['pct'])}%", False))
+        early = d.get(CAPS_KEY[label] + "_caps_early_s") if label in CAPS_KEY else None
+        # Right after the percentage, as orderly, so a narrow row cuts the reset, not this.
+        if m and m["left"] > 0 and isinstance(early, (int, float)) and not isinstance(early, bool) \
+                and math.isfinite(early) and early > 0:
+            parts.append((f"caps {roughspan(early)} early", True))
         if f:
-            wf = m["w"] / span if m else 0.5
-            ftxt = f"5h {f['pct']:.0f}%  \u00b7  {left_txt(f['left'])}"
-            # keep the 5h track and its label apart: label on the right unless
-            # the now line is too close to it, then label on the left
-            lw = g.textlength(ftxt, font=FS) / S + 10
-            if W - PAD - lw - (X0 + MW * nowfrac) >= 12:
-                track(f, ty + 35.5, 3, wf, right=W - PAD - lw, fill_alpha=.55)
-                g.text((P(W - PAD), P(ty + 37)), ftxt, font=FS, fill=DIM, anchor="rm")
-            else:
-                track(f, ty + 35.5, 3, wf, left=PAD + lw, fill_alpha=.55)
-                g.text((P(PAD), P(ty + 37)), ftxt, font=FS, fill=DIM, anchor="lm")
-        nxr = X0 + MW * nowfrac  # tick only through this row's bars, never over text
-        tick(nxr, ty + 35.5 if f and not m else ty + (20.5 if f else 20), ty + (38.5 if f else 26))
-        y += h
+            hot = f["pct"] >= 100 or f["pct"] > f["e"] * 100
+            parts.append((f"5h {rnd(f['pct'])}%", hot))
+        sid, vendor, _t, at_key = POOL.get(label, (label, "", label, None))
+        rk = RESET_KEY.get(label)
+        reset = d.get(rk) if rk else None
+        if not isinstance(reset, (int, float)) and m: reset = now + m["left"]
+        sub = SUBS.get(vendor)
+        term = d.get(sub[0]) if sub else None
+        same = isinstance(term, (int, float)) and isinstance(reset, (int, float)) and abs(term - reset) < 1
+        lbl = reset_label(reset) if m else ""
+        if lbl and not same:
+            after = sub and d.get(sub[1]) is False and isinstance(term, (int, float)) and reset > term
+            parts.append(((f"pool reset {lbl} (after term)" if after else f"resets {lbl}"), False))
+        at = as_of.get(at_key) if at_key else (MUSE_AT if label == "Muse" else None)
+        if isinstance(at, (int, float)) and now - at > 15 * 60:
+            parts.append((f"stale {fspan(now - at)}", False))
+        return parts
+
+    # Cards: one per subscription run, Grok Bot on the Cursor bill.
+    cards = []
+    for label, m, f in rows:
+        sid, vendor, title, _ = POOL.get(label, (label, "", label, None))
+        if not cards or cards[-1]["vendor"] != vendor:
+            hdr = renewal(vendor)
+            names = {"claude": "Claude", "codex": ("Codex " + CPLAN).strip(), "cursor": "Cursor", "grok": "SuperGrok"}
+            cards.append({"vendor": vendor, "hue": VHUE.get(vendor, O_MUTED),
+                          "header": f"{names[vendor]} \u00b7 {hdr[0]}" if hdr else None,
+                          "header_warn": bool(hdr and hdr[1]), "sub": None, "pools": []})
+        cards[-1]["pools"].append({"label": label, "seat": sid, "title": title, "chips": chips(sid),
+                                   "main": m, "five": f, "stats": stats(label, m, f)})
+    for c in cards:  # orderly poolsResetThen: pools whose reset is the renewal instant
+        sub = SUBS.get(c["vendor"])
+        term = d.get(sub[0]) if sub and c["header"] else None
+        names = [p["title"].split(" \u00b7 ", 1)[-1] for p in c["pools"] if p["main"]
+                 and isinstance(term, (int, float)) and isinstance(d.get(RESET_KEY.get(p["label"], "")), (int, float))
+                 and abs(d[RESET_KEY[p["label"]]] - term) < 1]
+        if names:
+            c["sub"] = (names[0] + " resets then" if len(names) == 1 else
+                        " and ".join(names) + " reset then" if len(names) == 2 else
+                        ", ".join(names[:-1]) + ", and " + names[-1] + " reset then")
+
+    # Next host: seat-usage's own pick from the cache, as orderly's host line.
+    def route_host():
+        exe = os.path.join(os.path.dirname(os.path.realpath(__file__)), "seat-usage")
+        if not os.path.exists(exe): return None
+        # seat-usage reads <SEAT_USAGE_CACHE_DIR>/latest.json: point it at the file these meters read
+        if os.path.basename(CACHE) != "latest.json": return None
+        env = {**os.environ, "SEAT_USAGE_CACHE_DIR": os.path.dirname(os.path.abspath(CACHE))}
+        try:
+            r = subprocess.run([sys.executable, exe, "--route", "host", "--cached", "--json"], env=env,
+                               capture_output=True, text=True, timeout=15)
+            rows_ = json.loads(r.stdout) if r.returncode == 0 else None
+        except Exception:
+            return None
+        if not isinstance(rows_, list): return None
+        return next((x for x in rows_ if isinstance(x, dict) and x.get("role") == "host"), None)
+    def host_lines(s):
+        if not isinstance(s, dict): return "Next host: no cached route", ""
+        sid, label = s.get("suggestion"), ""
+        if sid == "grokbot": label = "Grok Bot"
+        elif sid == "opus":
+            eff = s.get("effort") if s.get("effort") not in (None, "", "-") else ""
+            # orderly says "on Max"; only a Max plan in the cache says so here
+            label = "Opus" + (f" {eff}" if eff else "") + (" on Max" if CLAUDE_MAX is True else "")
+        elif sid: label = str(s.get("family") or sid)
+        reason = str(s.get("reason") or "")
+        lean_names = [{"cursor_models": "Cursor Models", "grok": "SuperGrok"}.get(i, str(i)) for i in (s.get("lean") or [])]
+        lean = ("lean " + lean_names[0] + "".join(", then " + n for n in lean_names[1:])) if lean_names else ""
+        if not label and s.get("mode") == "ask":
+            text = "Next host: ask" + (f" ({reason})" if reason else "") + (f" \u00b7 {lean}" if lean else "")
+        elif label: text = f"Next host: {label}" + (f" ({reason})" if reason else "")
+        else: text = "Next host:" + (f" {reason}" if reason else "")
+        names = {"grokbot": "Grok Bot", "opus": "Opus on Max" if CLAUDE_MAX is True else "Opus"}
+        wins = {"grokbot": "its weekly allowance",
+                "claude_week": "the Max weekly pool" if CLAUDE_MAX is True else "the Claude weekly pool",
+                "claude_5h": "the Max 5h window" if CLAUDE_MAX is True else "the Claude 5h window"}
+        why = []
+        hosts = s.get("hosts") if isinstance(s.get("hosts"), list) else []
+        for h in hosts:
+            if not isinstance(h, dict): continue
+            n, w = names.get(h.get("id"), h.get("id")), wins.get(h.get("binding"), h.get("binding") or "its pool")
+            u = h.get("used_pct")
+            used = f" at {rnd(u)}%" if isinstance(u, (int, float)) and not isinstance(u, bool) else ""
+            st = h.get("state")
+            if st == "capped": why.append(f"{n}: {w} is used up{used}.")
+            elif st == "ahead": why.append(f"{n}: {w} is{used}" + ("," if used else "") + " ahead of the time elapsed, so it may run out before it resets.")
+            elif st == "unknown":
+                # unknown because the reading is past the route's freshness limit: an old
+                # reading, not a missing one, so say how old it is
+                age = h.get("reading_age_s")
+                if isinstance(age, (int, float)) and not isinstance(age, bool) and math.isfinite(age) and age > FRESH_S:
+                    why.append(f"{n}: reading stale, {fspan(age)} old.")
+                else: why.append(f"{n}: no reading.")
+        if why and s.get("mode") == "ask" and not label:
+            why.append("No host is clear, so the router leaves the choice to you.")
+            if lean: why.append("If you start one anyway, draw Grok from " + lean[5:] + " first.")
+        return text, " ".join(why)
+    def route_fresh_s():
+        """seat-usage's route_fresh_s: how old a reading may be before a route calls it unknown.
+        pools.json route_freshness_s, 600 s live / 1200 s on a pulled copy when unset."""
+        fresh = pools_conf().get("route_freshness_s")
+        fresh = fresh if isinstance(fresh, dict) else {}
+        key = "pulled" if isinstance(d.get("pulled_ts"), (int, float)) and not isinstance(d.get("pulled_ts"), bool) else "live"
+        v = fresh.get(key)
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else {"live": 600, "pulled": 1200}[key]
+    FRESH_S = route_fresh_s()
+    HOST, WHY = host_lines(route_host())
+    LEGEND = "dashed = metered \u00b7 dotted = builder only \u00b7 \u2605 first usable pool for the family"
+    NOTES = []
+    if CLAUDE_MAX is None and any(r[0] == "Claude" for r in rows):  # Pro: no chip, no note
+        NOTES.append("No Fable chip on Claude: the cache doesn't say whether the Claude plan is Max, "
+                     "and only Max includes Fable.")
+
+    # ---- geometry, in 1x px (orderly CSS px * K) ----
+    FRAME_X, FRAME_Y = 6, 8
+    RPX, RPY = 14 * K, 12 * K                      # .rail padding
+    CX0, CX1 = FRAME_X + RPX, W - FRAME_X - RPX     # card box
+    BORDER, PADL, PADR, PADY = 3 * K, 8 * K, 10 * K, 6 * K
+    TX0, TX1 = CX0 + BORDER + PADL, CX1 - PADR      # card content
+    GAP = 4 * K                                      # .seat row-gap
+    LH = lambda px: px * 1.5 * K                     # line-height 1.5
+    tw = lambda s, f: g.textlength(s, font=f) / S
+    def wrap(text, f, width):
+        out, line = [], ""
+        for w_ in text.split(" "):
+            t = (line + " " + w_).strip()
+            if line and tw(t, f) > width: out.append(line); line = w_
+            else: line = t
+        return out + ([line] if line else [])
+    def ellipsize(parts, f, width):
+        """Trim from the end until the parts fit on one line."""
+        parts = list(parts)
+        while parts and tw(" \u00b7 ".join(t for t, _ in parts), f) > width:
+            t, r = parts[-1]
+            if len(t) <= 2: parts.pop(); continue
+            parts[-1] = (t[:-2].rstrip() + "\u2026" if not t.endswith("\u2026") else t[:-3].rstrip() + "\u2026", r)
+        return parts
+    def stat_lines(parts, f, width):
+        """The .v line, wrapped between parts so nothing is cut off; only a single part
+        wider than the card on its own is ellipsized."""
+        out, line = [], []
+        for part in parts:
+            if line and tw(" \u00b7 ".join(t for t, _ in line + [part]), f) > width:
+                out.append(line); line = []
+            line.append(part)
+        if line: out.append(line)
+        return [ellipsize(l, f, width) for l in out] or [[]]
+    g = ImageDraw.Draw(Image.new("RGB", (1, 1)))  # measuring only
+    host_l = wrap(HOST, F_HOST, CX1 - CX0 - 16 * K)
+    why_l = wrap(WHY, F_WHY, CX1 - CX0 - 16 * K) if WHY else []
+    legend_l = wrap(LEGEND, F_HDR, CX1 - CX0)
+    notes_l = [l for n in NOTES for l in wrap(n, F_HDR, CX1 - CX0)]
+    err_l = [l for k, v in errs.items() for l in wrap(f"{k}: {str(v)[:160]}", F_HDR, CX1 - CX0)]
+    CHIP_LH = LH(12) + 2 * K
+    for c in cards:  # chips beside the title; ones that don't fit go on lines under it
+        for p in c["pools"]:
+            x, line, p["fit"] = TX0 + tw(p["title"], F_TITLE) + 6 * K, 0, []
+            for name, style in p["chips"]:
+                w_ = tw(name, F_CHIP) + 8 * K
+                if x + w_ > TX1 and (line or x > TX0):
+                    if x == TX0: break  # wider than the card: left out, and chips_drawn says so
+                    x, line = TX0, line + 1
+                if x + w_ > TX1: break
+                p["fit"].append((name, style, x, line)); x += w_ + 3 * K
+            p["chip_lines"] = max([l for *_, l in p["fit"]], default=0)
+            p["stat_l"] = stat_lines(p["stats"], F_V, TX1 - TX0)
+    if TEXT:
+        print(json.dumps({"host": HOST, "why": WHY, "legend": LEGEND, "notes": NOTES, "errors": {k: str(v) for k, v in errs.items()},
+                          "cards": [{"header": c["header"], "header_warn": c["header_warn"], "sub": c["sub"],
+                                     "pools": [{"title": p["title"], "chips": p["chips"], "chips_drawn": len(p["fit"]),
+                                                "stats": " \u00b7 ".join(t for t, _ in p["stats"]),
+                                                "stats_drawn": [" \u00b7 ".join(t for t, _ in l) for l in p["stat_l"]],
+                                                "red": [t for t, r in p["stats"] if r]} for p in c["pools"]]}
+                                    for c in cards]}))
+
+    pool_h = lambda p: p["chip_lines"] * CHIP_LH + (PADY + LH(12) + GAP + (12 if p["five"] and p["main"] else 6) * K
+                                                    + GAP + LH(11) * len(p["stat_l"]) + PADY
+        if (p["main"] or p["five"]) else PADY + LH(12) + GAP + LH(11) * len(p["stat_l"]) + PADY)
+    for c in cards:
+        c["sub_l"] = wrap(c["sub"], F_HDR, TX1 - TX0) if c["sub"] else []
+    hdr_h = lambda c: (3 * K + LH(10.5) * (1 + len(c["sub_l"])) + 2 * K) if c["header"] else 0
+    y = FRAME_Y + RPY + LH(13) * len(host_l) + LH(12) * len(why_l) + 8 * K
+    for i, c in enumerate(cards):
+        y += 6 * K if i else 0
+        y += hdr_h(c) + sum(pool_h(p) for p in c["pools"])
+    y += 8 * K + LH(10.5) * (len(legend_l) + len(notes_l) + len(err_l)) + RPY
+    Ht = int(math.ceil(y + FRAME_Y))
+    img = Image.new("RGB", (W * S, Ht * S), O_BG); g = ImageDraw.Draw(img)
+    g.rounded_rectangle((P(FRAME_X), P(FRAME_Y), P(W - FRAME_X), P(Ht - FRAME_Y)), radius=P(6 * K),
+                        fill=O_PANEL2, outline=O_LINE, width=max(1, P(1)))
+    X0, MW = TX0, TX1 - TX0  # the meter spans the card's content width (narrow orderly rail)
+
+    def chip(x, yc, name, style, hue):
+        """orderly .seat .lab .chip: mono 9.5px, padding 0 4px, 1px border in the vendor hue
+        mixed 55% with --line, radius 3px. dashed = metered, dotted = builder only."""
+        w_ = tw(name, F_CHIP) + 8 * K; h_ = 9.5 * 1.35 * K + 2 * K
+        y0 = yc - h_ / 2
+        bc = mixhex(hue, .55, O_LINE)
+        if style == "solid":
+            g.rounded_rectangle((P(x), P(y0), P(x + w_), P(y0 + h_)), radius=P(3 * K), outline=bc, width=max(1, P(1)))
+        else:
+            dash, gapl = ((4 * K, 2.5 * K) if style == "dashed" else (1 * K, 1.5 * K))
+            lw = max(1, P(1))
+            def seg(ax, ay, bx, by):
+                L = math.hypot(bx - ax, by - ay); t = 0.0
+                while t < L:
+                    e = min(L, t + dash)
+                    x0_, y0_ = ax + (bx - ax) * t / L, ay + (by - ay) * t / L
+                    x1_, y1_ = ax + (bx - ax) * e / L, ay + (by - ay) * e / L
+                    g.rectangle((P(min(x0_, x1_)), P(min(y0_, y1_)), max(P(min(x0_, x1_)) + lw - 1, P(max(x0_, x1_))),
+                                 max(P(min(y0_, y1_)) + lw - 1, P(max(y0_, y1_)))), fill=bc)
+                    t = e + gapl
+            seg(x + 1, y0, x + w_ - 1, y0); seg(x + 1, y0 + h_ - 1 / S, x + w_ - 1, y0 + h_ - 1 / S)
+            seg(x, y0 + 1, x, y0 + h_ - 1); seg(x + w_ - 1 / S, y0 + 1, x + w_ - 1 / S, y0 + h_ - 1)
+        g.text((P(x + w_ / 2), P(yc)), name, font=F_CHIP, fill=hue, anchor="mm")
+        return w_
+
+    def ntick(x, y0, y1):
+        """orderly .meter s: 2px ink, 3px past the meter above and below."""
+        pill(x - K, y0 - 3 * K, x + K, y1 + 3 * K, O_INK)
+
+    y = FRAME_Y + RPY
+    for l in host_l:
+        g.text((P(CX0 + 8 * K), P(y + LH(13) / 2)), l, font=F_HOST, fill=O_INK, anchor="lm"); y += LH(13)
+    for l in why_l:
+        g.text((P(CX0 + 8 * K), P(y + LH(12) / 2)), l, font=F_WHY, fill=O_MUTED, anchor="lm"); y += LH(12)
+    y += 8 * K
+    for i, c in enumerate(cards):
+        y += 6 * K if i else 0
+        hue = c["hue"]; top = y; total = hdr_h(c) + sum(pool_h(p) for p in c["pools"])
+        R = P(4 * K)
+        # .seat: 9% vendor tint; .band-hdr: 16%; 3px vendor stripe on the left; right corners rounded
+        rrect((P(CX0), P(top), P(CX1), P(top + total)), R, mixhex(hue, .09, O_PANEL2), (False, True, True, False))
+        if c["header"]:
+            rrect((P(CX0), P(top), P(CX1), P(top + hdr_h(c))), R, mixhex(hue, .16, O_PANEL2), (False, True, False, False))
+        g.rectangle((P(CX0), P(top), P(CX0 + BORDER) - 1, P(top + total) - 1), fill=hue)
+        if c["header"]:
+            yy = top + 3 * K
+            head, rest = c["header"].split(" \u00b7 ", 1)
+            g.text((P(TX0), P(yy + LH(10.5) / 2)), head + " \u00b7 ", font=F_HDR, fill=O_INK2, anchor="lm")
+            g.text((P(TX0 + tw(head + " \u00b7 ", F_HDR)), P(yy + LH(10.5) / 2)), rest, font=F_HDR,
+                   fill=O_CRIT if c["header_warn"] else O_INK2, anchor="lm")
+            for k_, l in enumerate(c["sub_l"]):
+                g.text((P(TX0), P(yy + LH(10.5) * (1.5 + k_))), l, font=F_HDR, fill=O_MUTED, anchor="lm")
+            y += hdr_h(c)
+        for p in c["pools"]:
+            yy = y + PADY
+            ly = yy + LH(12) / 2
+            g.text((P(TX0), P(ly)), p["title"], font=F_TITLE, fill=O_INK, anchor="lm")
+            for name, style, cx, line in p["fit"]:
+                ch = VHUE["grok"] if p["seat"] == "grokbot" else hue  # orderly: Grok Bot chips in Grok blue
+                chip(cx, ly + line * CHIP_LH, name, style, ch)
+            yy += LH(12) + p["chip_lines"] * CHIP_LH + GAP
+            m, f = p["main"], p["five"]
+            if m or f:
+                snap = lambda v: round(v * S) / S  # whole device pixels: no half-lit rows in a bar
+                yy = snap(yy)
+                if m:
+                    track(m, yy, snap(5 * K if f else 6 * K), m["w"] / span)
+                if f:
+                    track(f, yy + (snap(8 * K) if m else 0), snap(3 * K), m["w"] / span if m else 0.5, fill_alpha=.55)
+                bh = (12 if (m and f) else 6) * K
+                ntick(X0 + MW * nowfrac, yy, yy + bh)
+                yy += bh + GAP
+            for parts in p["stat_l"]:
+                x = TX0
+                for j, (t, red) in enumerate(parts):
+                    if j: g.text((P(x), P(yy + LH(11) / 2)), " \u00b7 ", font=F_V, fill=O_MUTED, anchor="lm"); x += tw(" \u00b7 ", F_V)
+                    g.text((P(x), P(yy + LH(11) / 2)), t, font=F_V, fill=O_CRIT if red else O_MUTED, anchor="lm"); x += tw(t, F_V)
+                yy += LH(11)
+            y += pool_h(p)
+    y += 8 * K
+    star_font = vfont(MONO_FB, 10.5 * K) if MONO_FB else F_HDR
+    for l in legend_l + notes_l + err_l:
+        x = CX0
+        for k_, piece in enumerate(l.split("\u2605")):  # the star from a face that has it
+            if k_:
+                g.text((P(x), P(y + LH(10.5) / 2)), "\u2605", font=star_font, fill=O_MUTED, anchor="lm"); x += tw("\u2605", star_font)
+            g.text((P(x), P(y + LH(10.5) / 2)), piece, font=F_HDR, fill=O_MUTED, anchor="lm"); x += tw(piece, F_HDR)
+        y += LH(10.5)
+    img.save(OUT)
+    if not TEXT: print(OUT)
+    sys.exit(0)
 nx = X0 + MW * nowfrac
 if not PHONE: pill(nx - 1, top - 4, nx + 1, y - 6, INK)
 if not PHONE: g.text((P(nx), P(top - 6)), "now", font=FS, fill=DIM, anchor="mb")
