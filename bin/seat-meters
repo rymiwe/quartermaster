@@ -261,13 +261,14 @@ RESET_KEY = {"Claude": "claude_week_reset_ts", "ChatGPT": "codex_reset_ts", "Cur
 #   absent  the plan is known not to be Max and the Claude read finished (fable_absent?,
 #           server.rb:2005-2011): "not on <plan title>", or "not on this plan" with no title;
 #   unknown otherwise: "unknown · seat-usage has no value" (unknown_quota_seat, server.rb:1934).
-# orderly reads the plan name (claude_plan); the numbers-only pulled copy has only the
-# claude_max bit, so a false claude_max counts as a known non-Max plan with no title.
+# orderly reads the plan name (claude_plan), and so does this when the cache has one. The
+# numbers-only pulled copy has only the claude_max bit: with no plan name, a false claude_max
+# counts as a known non-Max plan with no title.
 def _isnum(v): return isinstance(v, (int, float)) and not isinstance(v, bool)
 as_of = d.get("as_of") if isinstance(d.get("as_of"), dict) else {}
 _plan = PLAN if PLAN and PLAN != "?" else None
-if isinstance(d.get("claude_max"), bool): _not_max = d["claude_max"] is False
-else: _not_max = _plan is not None and "max" not in _plan.lower()
+if _plan is not None: _not_max = "max" not in _plan.lower()
+else: _not_max = d.get("claude_max") is False
 # claude_plan_title (server.rb:1989): Max, Pro for claude_ai, else the tier name as read
 _title = None if not _plan else "Max" if "max" in _plan.lower() else {"claude_ai": "Pro"}.get(_plan, _plan)
 FABLE_PCT = d.get("fable") if _isnum(d.get("fable")) else None
@@ -288,18 +289,24 @@ CAPS_KEY = {"Claude": "claude_week", "Fable": "fable", "ChatGPT": "codex", "Curs
 def roughspan(secs):  # orderly roughSpan
     return fspan(secs if secs < 3600 else math.floor(secs / 3600 + 0.5) * 3600)  # JS Math.round
 
+def read_failed():
+    """quota_read (server.rb): no as_of.claude stamp is a failed read; renderRail's red
+    "read failed" plus readCode of the error (newtab.js:792, 1222)."""
+    if _isnum(as_of.get("claude")): return None
+    m_ = re.search(r"\b[A-Z]\w*Error(?: \d{3})?", str((d.get("errors") or {}).get("claude") or ""))
+    return ("read failed" + (": " + m_.group(0) if m_ else ""), True)
 def fable_stats(m):
     """The Fable row's .v line when it has no drawable bar (renderRail, newtab.js:1205-1231)."""
     at = as_of.get("claude")
     age = now - at if _isnum(at) else None
+    rf = read_failed()
     if FABLE_STATE == "absent":  # absent: its text, and "stale" once the read is over 15 minutes old
         return [(FABLE_TEXT, False)] + ([(f"stale {fspan(age)}", False)] if age is not None and age > 15 * 60 else [])
     if FABLE_STATE == "live":    # a percent with no reset: no window, so only the percent
-        return [(f"{rnd(FABLE_PCT)}%", False)] + ([(f"stale {fspan(age)}", False)] if age is not None and age > 15 * 60 else [])
+        return ([(f"{rnd(FABLE_PCT)}%", False)] + ([rf] if rf else []) +
+                ([(f"stale {fspan(age)}", False)] if age is not None and age > 15 * 60 else []))
     parts = [("unknown", False), ("seat-usage has no value", False)]
-    if age is None:  # no as_of stamp: quota_read's read_failed, red and first (newtab.js:1222)
-        m_ = re.search(r"\b[A-Z]\w*Error(?: \d{3})?", str((d.get("errors") or {}).get("claude") or ""))
-        return [("read failed" + (": " + m_.group(0) if m_ else ""), True)] + parts
+    if rf: return [rf] + parts  # not live: first
     return parts + [(f"verified {str(int(max(0, age))) + 's' if age < 60 else fspan(age)}", False)]
 
 def stats(label, m, f):
@@ -330,6 +337,9 @@ def stats(label, m, f):
     at = as_of.get(at_key) if at_key else (MUSE_AT if label == "Muse" else None)
     if isinstance(at, (int, float)) and now - at > 15 * 60:
         parts.append((f"stale {fspan(now - at)}", False))
+    if label == "Fable" and read_failed():
+        # orderly splices "read failed" in after the percent, then the caps warning before it
+        parts.insert(2 if len(parts) > 1 and parts[1][0].startswith("caps ") else 1, read_failed())
     return parts
 
 def families():

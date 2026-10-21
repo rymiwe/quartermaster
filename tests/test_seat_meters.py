@@ -400,6 +400,12 @@ def test_phone_fable_slice_row_follows_orderly():
         mx = phone_text(t, {**base, "claude_max": True})
         live = phone_text(t, {**base, "claude_max": True, "fable": 12, "fable_reset_ts": now + 3 * 86400})
         bare = phone_text(t, {**base, "claude_max": True, "fable": 60})  # a percent with no reset
+        # a plan name wins over the bit, as orderly reads only the name: Max named, not absent
+        named_max = phone_text(t, {**base, "claude_plan": "default_claude_max_5x", "claude_max": False})
+        # a kept percent with no as_of.claude: orderly's red "read failed" after the percent
+        kept = phone_text(t, {**base, "as_of": {}, "fable": 12, "fable_reset_ts": now + 3 * 86400,
+                              "fable_caps_early_s": 86400, "errors": {"claude": "HTTPError 401: bad"}})
+        kept_bare = phone_text(t, {**base, "as_of": {}, "fable": 60})
     assert (fab(pro)["state"], fab(pro)["stats"]) == ("absent", "not on this plan"), fab(pro)
     assert fab(named)["stats"] == "not on Pro" and fab(odd)["stats"] == "not on enterprise"
     assert fab(old)["stats"] == "not on this plan \u00b7 stale 1h", fab(old)
@@ -412,6 +418,10 @@ def test_phone_fable_slice_row_follows_orderly():
     assert fab(no_read)["red"] == ["read failed"]
     assert fab(live)["state"] == "live" and fab(live)["stats"].startswith("12%"), fab(live)
     assert (fab(bare)["state"], fab(bare)["stats"]) == ("live", "60%"), fab(bare)
+    assert fab(named_max)["state"] == "unknown", fab(named_max)
+    assert fab(kept)["stats"].startswith("12% \u00b7 caps 1d early \u00b7 read failed: HTTPError 401 \u00b7 resets"), fab(kept)
+    assert fab(kept)["red"] == ["caps 1d early", "read failed: HTTPError 401"], fab(kept)
+    assert fab(kept_bare)["stats"] == "60% \u00b7 read failed", fab(kept_bare)
     # absent styling: the title in orderly's --muted, and a track the card's full content width
     # at ink 8% over the Claude card (.track.absent); no other row is muted
     assert fab(pro)["muted"] and not fab(unknown)["muted"] and not fab(live)["muted"]
