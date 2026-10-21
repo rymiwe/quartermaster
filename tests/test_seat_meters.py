@@ -457,6 +457,140 @@ def test_phone_fable_track_shares_the_weekly_scale():
     mid = [rows[b[len(b) // 2]] for b in bands]
     assert abs(mid[0] - mid[1]) <= 4, mid  # same weekly window, same width
 
+def test_phone_ended_subscription_follows_orderly():
+    """orderly subEnded (newtab.js:773-775): renews false and the paid-through stamp past. The
+    row gets a muted title, its chips, "sub ended" in place of usage and reset (newtab.js:1190-1201),
+    the header says "sub ended" without a warning, and ended plans sink below active ones,
+    a subscription's rows together (newtab.js:1159-1163)."""
+    now = time.time()
+    base = {"ts": now, "as_of": {"claude": now, "chatgpt": now, "cursor": now, "grokbot": now, "grok": now, "google": now},
+            "claude_max": False, "claude_week": 10, "claude_week_reset_ts": now + 4 * 86400,
+            "codex": 40, "codex_reset_ts": now + 5 * 86400, "codex_window_s": 7 * 86400, "codex_caps_early_s": 86400,
+            "cursor_auto_pct": 2, "cursor_api_pct": 20, "cursor_reset_ts": now + 20 * 86400, "cursor_window_s": 31 * 86400,
+            "cursor_renews": True, "bot_pct": 30, "bot_reset_ts": now + 2 * 86400, "bot_window_s": 7 * 86400,
+            "grok_pct": 19, "grok_reset_ts": now + 3 * 86400, "grok_window_s": 7 * 86400,
+            "grok_renews_ts": now + 40 * 86400, "grok_renews": True,
+            "google_argon_week": 0, "google_argon_week_reset_ts": now + 6 * 86400}
+    codex_end = {"codex_renews": False, "codex_renews_ts": now - 86400}
+    titles = lambda doc: [p["title"] for c in doc["cards"] for p in c["pools"]]
+    with tempfile.TemporaryDirectory() as t:
+        active = phone_text(t, {**base, "codex_renews": True, "codex_renews_ts": now + 9 * 86400}, muse_doc())
+        ended = phone_text(t, {**base, **codex_end}, muse_doc())
+        ending = phone_text(t, {**base, "codex_renews": False, "codex_renews_ts": now + 3 * 86400})  # not yet
+        due = phone_text(t, {**base, "codex_renews_ts": now - 86400})                     # renews unknown
+        lapsed_but_renews = phone_text(t, {**base, "codex_renews": True, "codex_renews_ts": now - 86400})
+        both = phone_text(t, {**base, **codex_end, "cursor_renews": False, "cursor_reset_ts": now - 3600})
+        claude = phone_text(t, {**base, "claude_renews": False, "claude_renews_ts": now - 60})
+    cx = lambda doc: _pool(doc, "Codex \u00b7 weekly")
+    # ended: muted, "sub ended" only (no percent, caps, reset or stale), no red, chips kept
+    assert (cx(ended)["state"], cx(ended)["muted"], cx(ended)["ended"]) == ("ended", True, True), cx(ended)
+    assert cx(ended)["stats"] == "sub ended" and cx(ended)["red"] == [], cx(ended)
+    assert cx(ended)["chips"] == [["Astra", "solid"], ["Sol", "solid"]] == cx(active)["chips"]
+    hdr = _card(ended, "Codex \u00b7 weekly")
+    assert hdr["header"] == "Codex \u00b7 sub ended" and not hdr["header_warn"], hdr
+    # it sinks below every active row, Muse and Google included; the rest keep their order
+    assert titles(ended)[-1] == "Codex \u00b7 weekly", titles(ended)
+    assert titles(ended)[:-1] == [x for x in titles(active) if x != "Codex \u00b7 weekly"]
+    assert titles(active).index("Codex \u00b7 weekly") == 2, titles(active)
+    # not ended: a term still ahead, an unknown renewal, or one set to renew
+    for doc in (active, ending, due, lapsed_but_renews):
+        assert not cx(doc)["ended"] and not cx(doc)["muted"] and cx(doc)["stats"].startswith("40%"), cx(doc)
+        assert titles(doc).index("Codex \u00b7 weekly") == 2, titles(doc)
+    assert _card(ending, "Codex \u00b7 weekly")["header_warn"]
+    assert _card(due, "Codex \u00b7 weekly")["header"] == "Codex \u00b7 sub renewal due"
+    # Grok Bot is on the Cursor bill: the Cursor subscription's three rows end and sink together
+    cur = ["Cursor \u00b7 Cursor Models", "Cursor \u00b7 Other Models", "Grok Bot \u00b7 weekly"]
+    assert titles(both)[-4:] == ["Codex \u00b7 weekly"] + cur, titles(both)
+    assert all(_pool(both, x)["stats"] == "sub ended" and _pool(both, x)["muted"] for x in cur)
+    assert _card(both, cur[0])["header"] == "Cursor \u00b7 sub ended"
+    assert len([c for c in both["cards"] if any(p["title"] in cur for p in c["pools"])]) == 1
+    # Claude's subscription carries the Fable slice: both rows end, absent or not
+    for x in ("Claude \u00b7 weekly", "Claude \u00b7 Fable slice"):
+        assert _pool(claude, x)["state"] == "ended" and _pool(claude, x)["stats"] == "sub ended", _pool(claude, x)
+    assert titles(claude)[-2:] == ["Claude \u00b7 weekly", "Claude \u00b7 Fable slice"], titles(claude)
+    assert not any(p["ended"] for c in active["cards"] for p in c["pools"])
+    # an ended plan whose usage numbers are gone still gets its rows (orderly lists every seat)
+    bare = {"ts": now, "as_of": {}, "codex_renews": False, "codex_renews_ts": now - 86400,
+            "cursor_renews": False, "cursor_reset_ts": now - 3600, "grok_renews": True, "grok_renews_ts": now - 60}
+    with tempfile.TemporaryDirectory() as t:
+        gone = phone_text(t, bare)
+    assert titles(gone)[-4:] == ["Codex \u00b7 weekly"] + cur, titles(gone)
+    assert all(_pool(gone, x)["stats"] == "sub ended" for x in ["Codex \u00b7 weekly"] + cur)
+    assert _card(gone, "Codex \u00b7 weekly")["header"] == "Codex \u00b7 sub ended"
+    assert "SuperGrok \u00b7 weekly" not in titles(gone)  # set to renew: no reading, no row, as before
+
+def test_phone_ended_row_height_counts_wrapped_chips_once():
+    """An ended row with chips on a second line is as tall as its content: the striped track, then
+    "sub ended", then the card's padding, with no extra space below."""
+    now = time.time()
+    cache = {"ts": now, "as_of": {"cursor": now}, "cursor_api_pct": 100, "cursor_reset_ts": now - 3600,
+             "cursor_window_s": 31 * 86400, "cursor_renews": False, "cursor_ondemand": 5, "cursor_auto_pct": 3,
+             "bot_pct": 30, "bot_reset_ts": now + 2 * 86400, "bot_window_s": 7 * 86400}
+    with tempfile.TemporaryDirectory() as t:
+        # not latest.json: no host line, which follows seat-usage's route and would differ
+        doc = phone_text(t, cache, name="c.json")
+        im = Image.open(os.path.join(t, "p.png")).convert("RGB"); w, h = im.size
+        live = phone_text(t, {**cache, "cursor_renews": True, "cursor_reset_ts": now + 86400}, name="c.json")
+        im2 = Image.open(os.path.join(t, "p.png")).convert("RGB")
+    other = _pool(doc, "Cursor \u00b7 Other Models")
+    assert other["ended"] and other["chips"][-1] == ["$", "solid"] and other["spend"] == "draw", other
+    assert other["chips_drawn"] == len(other["chips"])
+    # live rows of the same shape (chips wrapped, one 6px bar, one stats line each) are as tall
+    assert [len(_pool(live, x)["stats_drawn"]) for x in ("Cursor \u00b7 Cursor Models", "Cursor \u00b7 Other Models", "Grok Bot \u00b7 weekly")] == [1, 1, 1], live
+    assert _card(live, "Grok Bot \u00b7 weekly")["sub"] == _card(doc, "Grok Bot \u00b7 weekly")["sub"], (live, doc)
+    assert im.size == im2.size, (im.size, im2.size)
+
+def test_phone_ended_track_is_full_width_striped_grey():
+    """.meter .track.ended (newtab.html:154): repeating-linear-gradient(135deg, ink 22% 0 4px,
+    ink 10% 4px 8px) across the whole meter, with no fill and no now tick."""
+    now = time.time()
+    cache = {"ts": now, "as_of": {"chatgpt": now}, "codex": 90, "codex_reset_ts": now + 2 * 86400,
+             "codex_window_s": 7 * 86400, "codex_renews": False, "codex_renews_ts": now - 86400}
+    with tempfile.TemporaryDirectory() as t:
+        r, out = render(t, cache, None)
+        assert r.returncode == 0, r.stderr
+        im = Image.open(out).convert("RGB"); w, h = im.size
+    tint = over((0xaf, 0x87, 0xff), O_PANEL2, 0.09)
+    hi_c, lo_c = over(O_INK, tint, 0.22), over(O_INK, tint, 0.10)
+    tx0, tx1 = (PHONE_CX0 + 11 * 1.3) * 3, (390 - 6 - 14 * 1.3 - 10 * 1.3) * 3  # card content edges
+    lo, hi = int(tx0) + 6, int(tx1) - 6
+    striped = []
+    for y in range(h):
+        px = [im.getpixel((x, y)) for x in range(lo, hi)]
+        a, b = runs(px, lambda p: near(p, hi_c, 3), 8), runs(px, lambda p: near(p, lo_c, 3), 8)
+        # both stripe tones, alternating across the full width, and nothing else in the band
+        if len(a) > 0.3 * len(px) and len(b) > 0.3 * len(px) and min(a | b) < 50 and max(a | b) > len(px) - 50:
+            striped.append(y)
+    assert len(striped) >= 6, striped
+    band = [im.getpixel((x, y)) for y in striped for x in range(lo, hi)]
+    assert not any(near(p, BLUE, 20) or near(p, RED, 20) or near(p, O_INK, 20) for p in band)  # no fill, no tick
+    # the stripes run up to the right: one row down, the pattern sits one pixel left
+    y = striped[len(striped) // 2]
+    row = lambda yy: [near(im.getpixel((x, yy)), hi_c, 3) for x in range(lo, hi)]
+    assert sum(p == q for p, q in zip(row(y)[1:], row(y + 1))) > 0.9 * (hi - lo - 1)
+
+def test_phone_ended_row_stays_off_the_shared_scale():
+    """renderRail leaves an ended row out of the time scale (newtab.js:1169): a long window on an
+    ended plan must not squeeze the active tracks."""
+    now = time.time()
+    base = {"ts": now, "as_of": {"claude": now}, "claude_week": 10, "claude_week_reset_ts": now + 6 * 86400}
+    long_codex = {"codex": 5, "codex_reset_ts": now + 29 * 86400, "codex_window_s": 30 * 86400,
+                  "codex_renews_ts": now - 86400}
+    def claude_width(cache):
+        with tempfile.TemporaryDirectory() as t:
+            r, out = render(t, cache, None)
+            assert r.returncode == 0, r.stderr
+            im = Image.open(out).convert("RGB"); w, h = im.size
+        track = over(O_INK, over((0xff, 0x87, 0x00), O_PANEL2, 0.09), 0.14)
+        widths = []
+        for y in range(h):
+            xs = [x for x in range(w) if near(im.getpixel((x, y)), track, 3) or near(im.getpixel((x, y)), BLUE, 3)]
+            if len(xs) > 30: widths.append(max(xs) - min(xs))
+        return max(widths)
+    alone = claude_width(base)
+    assert abs(claude_width({**base, **long_codex, "codex_renews": False}) - alone) <= 4
+    assert claude_width({**base, **long_codex, "codex_renews": True}) < alone * 0.6  # live: it counts
+
 def test_phone_spend_chip_follows_orderly():
     """orderly spendChip: "$" after the family chips on the Cursor rows when spend is above zero,
     on any of them (Grok Bot included) when the pool is capped; amber when capped, red past the limit."""
