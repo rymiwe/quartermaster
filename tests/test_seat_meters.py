@@ -357,36 +357,71 @@ def test_phone_card_headers_use_cached_renewals_only():
     assert _card(doc, "Google AI Pro \u00b7 Argon")["header"] is None          # no renewal in the cache
     assert _card(doc, "Muse \u00b7 weekly")["header"] is None
 
-def test_phone_chips_follow_orderly_and_the_claude_plan():
+def test_phone_chips_follow_orderly_whatever_the_claude_plan():
+    """orderly seatLabel: every family whose sources include the seat. The plan hides no chip;
+    only the Fable slice row itself still needs a Max cache."""
     base = {"ts": NOW, "as_of": FRESH, "claude_week": 10, "claude_week_reset_ts": NOW + 4 * 86400,
             "cursor_api_pct": 20, "cursor_reset_ts": NOW + 20 * 86400, "cursor_window_s": 31 * 86400,
             "grok_pct": 19, "grok_reset_ts": NOW + 3 * 86400, "grok_window_s": 7 * 86400,
             "google_argon_week": 0, "google_argon_week_reset_ts": NOW + 6 * 86400}
     with tempfile.TemporaryDirectory() as t:
         unknown = phone_text(t, base, muse_doc())
-        pro = phone_text(t, {**base, "claude_plan": "claude_ai"})
-        mx = phone_text(t, {**base, "claude_plan": "max_5x", "fable": 12, "fable_reset_ts": NOW + 4 * 86400})
-        flag_pro = phone_text(t, {**base, "claude_max": False, "claude_plan": "max_5x"})  # the flag wins
+        pro = phone_text(t, {**base, "claude_max": False})
         flag_max = phone_text(t, {**base, "claude_max": True, "fable": 12, "fable_reset_ts": NOW + 4 * 86400})
-        bad_flag = phone_text(t, {**base, "claude_max": "yes", "claude_plan": "max_5x"})  # not a bool: unknown
-        odd_tier = phone_text(t, {**base, "claude_plan": "enterprise"})
+        capped = phone_text(t, {**base, "claude_week": 100, "grok_pct": 100, "grok_exhausted": True})
     fable_slice = lambda doc: any(p["title"] == "Claude \u00b7 Fable slice" for c in doc["cards"] for p in c["pools"])
-    for doc in (unknown, bad_flag, odd_tier):
-        assert _pool(doc, "Claude \u00b7 weekly")["chips"] == [["Opus", "solid"]] and not fable_slice(doc)
-        assert any("whether the Claude plan is Max" in n for n in doc["notes"]), doc["notes"]
-    for doc in (pro, flag_pro):  # Pro: no Fable, and nothing to explain
-        assert _pool(doc, "Claude \u00b7 weekly")["chips"] == [["Opus", "solid"]] and doc["notes"] == []
-        assert not fable_slice(doc)
-    for doc in (mx, flag_max):
-        assert _pool(doc, "Claude \u00b7 weekly")["chips"] == [["Fable", "solid"], ["Opus", "solid"]]
-        assert _pool(doc, "Claude \u00b7 Fable slice")["chips"] == [["Fable", "solid"]] and doc["notes"] == []
-    for doc in (unknown, pro, mx, flag_max):  # every chip the text lists is drawn in the PNG too
+    for doc in (unknown, pro, flag_max, capped):
+        assert _pool(doc, "Claude \u00b7 weekly")["chips"] == [["Fable", "solid"], ["Opus", "solid"]], doc
+        assert doc["notes"] == [], doc["notes"]  # no "missing Fable chip" footnote any more
         assert all(p["chips_drawn"] == len(p["chips"]) for c in doc["cards"] for p in c["pools"]), doc
+        assert _pool(doc, "SuperGrok \u00b7 weekly")["chips"] == [["Grok", "dotted"]]  # a full pool keeps its chip
+    assert not fable_slice(unknown) and not fable_slice(pro)
+    assert _pool(flag_max, "Claude \u00b7 Fable slice")["chips"] == [["Fable", "solid"]]
     assert _pool(unknown, "Cursor \u00b7 Other Models")["chips"] == [["Fable", "dashed"], ["Opus", "dashed"], ["Sol", "dashed"]]
-    assert _pool(unknown, "SuperGrok \u00b7 weekly")["chips"] == [["Grok", "dotted"]]
     assert _pool(unknown, "Muse \u00b7 weekly")["chips"] == [["Wonder full", "solid"], ["Wonder", "solid"]]
     assert _pool(unknown, "Google AI Pro \u00b7 Argon")["chips"] == [["Argon", "solid"]]  # config/pools.json
     assert unknown["legend"] == "dashed = metered \u00b7 dotted = builder only \u00b7 \u2605 first usable pool for the family"
+
+def test_phone_spend_chip_follows_orderly():
+    """orderly spendChip: "$" after the family chips on the Cursor rows when spend is above zero,
+    on any of them (Grok Bot included) when the pool is capped; amber when capped, red past the limit."""
+    base = {"ts": NOW, "as_of": FRESH, "cursor_api_pct": 20, "cursor_auto_pct": 5, "cursor_reset_ts": NOW + 20 * 86400,
+            "cursor_window_s": 31 * 86400, "bot_pct": 30, "bot_reset_ts": NOW + 5 * 86400, "bot_window_s": 7 * 86400}
+    sp = lambda doc, title: (_pool(doc, title)["spend"], _pool(doc, title)["chips"][-1])
+    OM, CM, GB = "Cursor \u00b7 Other Models", "Cursor \u00b7 Cursor Models", "Grok Bot \u00b7 weekly"
+    with tempfile.TemporaryDirectory() as t:
+        none = phone_text(t, base)                                       # no spend number: no chip
+        zero = phone_text(t, {**base, "cursor_ondemand": 0})            # zero, nothing capped: no chip
+        spent = phone_text(t, {**base, "cursor_ondemand": 4.5})
+        over = phone_text(t, {**base, "cursor_ondemand": 30, "cursor_ondemand_limit": 20})
+        capped = phone_text(t, {**base, "cursor_ondemand": 0, "cursor_api_pct": 100, "bot_exhausted": True})
+    for doc in (none, zero):
+        assert all(p["spend"] is None and ["$", "solid"] not in p["chips"] for c in doc["cards"] for p in c["pools"]), doc
+    assert sp(spent, OM) == ("plain", ["$", "solid"]) and sp(spent, CM) == ("plain", ["$", "solid"])
+    assert _pool(spent, OM)["chips"][:3] == [["Fable", "dashed"], ["Opus", "dashed"], ["Sol", "dashed"]]
+    assert _pool(spent, GB)["spend"] is None  # the Bot shows spend only when its allowance is used up
+    assert sp(over, OM)[0] == "over" and sp(over, CM)[0] == "over"
+    assert sp(capped, OM)[0] == "draw" and sp(capped, GB)[0] == "draw"
+    assert _pool(capped, CM)["spend"] is None  # not capped, and zero spend
+    assert all(p["chips_drawn"] == len(p["chips"]) for c in capped["cards"] for p in c["pools"]), capped
+
+def test_phone_spend_chip_colors():
+    """The "$" chip is orderly --warn when its pool is capped and --crit past the limit."""
+    WARN, CRIT = (0xfa, 0xb2, 0x19), (0xe0, 0x4b, 0x4b)
+    base = {"ts": NOW, "cursor_api_pct": 20, "cursor_reset_ts": NOW + 20 * 86400, "cursor_window_s": 31 * 86400}
+    def has(cache, color):
+        with tempfile.TemporaryDirectory() as t:
+            r, out = render(t, cache, None)
+            assert r.returncode == 0, r.stderr
+            im = Image.open(out).convert("RGB")
+            return color in {im.getpixel((x, y)) for y in range(im.size[1]) for x in range(im.size[0])}
+    assert not has(base, WARN) and not has(base, CRIT)
+    assert has({**base, "cursor_api_pct": 100, "cursor_ondemand": 0}, WARN)
+    assert has({**base, "cursor_ondemand": 30, "cursor_ondemand_limit": 20}, CRIT)
+    # Grok Bot alone and exhausted, under the limit: amber, not Grok blue
+    bot = {"ts": NOW, "bot_pct": 100, "bot_exhausted": True, "bot_reset_ts": NOW + 5 * 86400,
+           "bot_window_s": 7 * 86400, "cursor_ondemand": 30, "cursor_ondemand_limit": 50}
+    assert has(bot, WARN)
 
 def test_phone_errors_wrap_inside_the_frame():
     with tempfile.TemporaryDirectory() as t:
@@ -440,10 +475,30 @@ def test_phone_google_chips_are_data_in_pools_json():
     assert _pool(doc, "Google AI Pro \u00b7 Gemini")["chips"] == [["Argon", "solid"], ["Gemini Flash", "solid"]]
     assert _pool(doc, "Google AI Pro \u00b7 Claude/GPT")["chips"] == [["Opus", "solid"], ["Sonnet", "solid"], ["GPT-OSS", "solid"]]
     assert all(p["chips_drawn"] == len(p["chips"]) for c in doc["cards"] for p in c["pools"]), doc
-    assert _pool(edited, "Google AI Pro \u00b7 Argon")["chips"] == [["Test fam", "dashed"]]  # read, not hard-coded
+    # read, not hard-coded; orderly styles chips by seat only, so pools.json's "style" is not used
+    assert _pool(edited, "Google AI Pro \u00b7 Argon")["chips"] == [["Test fam", "solid"]]
     assert _pool(edited, "Google AI Pro \u00b7 Claude/GPT")["chips"] == []
     assert all(p["chips"] == [] for p in _card(none, "Google AI Pro \u00b7 Argon")["pools"])
-    assert doc["notes"] == []  # no Claude row: no Claude plan footnote
+    assert doc["notes"] == []
+
+def test_phone_google_chips_take_orderlys_family_order():
+    """orderly families(): known families keep FAMILIES' order, so a Google row naming Opus last
+    still draws it first; new families follow in the order rows name them. A Google pool with no
+    weekly reading names none (seat_rows carries families only on a weekly bar)."""
+    with tempfile.TemporaryDirectory() as t:
+        conf = json.load(open(os.path.join(ROOT, "config", "pools.json")))
+        conf["google_ai_pro"]["pools"]["argon"] = {"families": ["Zeta", "Argon"]}
+        conf["google_ai_pro"]["pools"]["gemini"] = {"families": ["Argon", "Zeta"]}
+        conf["google_ai_pro"]["pools"]["claudegpt"] = {"families": ["GPT-OSS", "Opus"]}
+        alt = os.path.join(t, "pools.json"); json.dump(conf, open(alt, "w"))
+        doc = phone_text(t, GOOGLE_CACHE, pools=alt)
+        five_only = {k: v for k, v in GOOGLE_CACHE.items() if not k.startswith("google_gemini_week")}
+        five_only.update({"google_gemini_5h": 5, "google_gemini_5h_reset_ts": NOW + 3600})
+        no_week = phone_text(t, five_only, pools=alt)
+    assert _pool(doc, "Google AI Pro \u00b7 Argon")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
+    assert _pool(doc, "Google AI Pro \u00b7 Gemini")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
+    assert _pool(doc, "Google AI Pro \u00b7 Claude/GPT")["chips"] == [["Opus", "solid"], ["GPT-OSS", "solid"]]
+    assert _pool(no_week, "Google AI Pro \u00b7 Gemini")["chips"] == []
 
 def test_phone_chips_that_do_not_fit_wrap_and_the_card_grows():
     with tempfile.TemporaryDirectory() as t:

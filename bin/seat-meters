@@ -133,6 +133,7 @@ import glob, math, subprocess
 K = 1.3
 O_BG, O_PANEL2, O_LINE = "#14171c", "#20262e", "#2b323c"
 O_INK, O_INK2, O_MUTED, O_CRIT = "#e4e8ee", "#a3acb9", "#6f7987", "#e04b4b"
+O_WARN = "#fab219"  # orderly --warn
 VHUE = {"claude": "#ff8700", "codex": "#af87ff", "cursor": "#00d7af", "grok": "#5fafff",
         "google": GOOGLE, "muse": "#ff87d7"}
 INK = O_INK  # tracks are ink at 14% over the card, as in orderly
@@ -219,7 +220,8 @@ def renewal(vendor):
 
 # Model families each pool can serve: orderly's FAMILIES/METERED/BUILDER_ONLY
 # (extension/newtab.js). Google AI Pro's families are data in config/pools.json
-# ("google_ai_pro"), read below; orderly gets the same lists through seat_rows.
+# ("google_ai_pro"); orderly gets the same lists through seat_rows and merges
+# them into FAMILIES (families(), below).
 FAMILIES = [("Fable", ["claude_fable", "claude_weekly", "cursor_other"]), ("Opus", ["claude_weekly", "cursor_other"]),
             ("Astra", ["codex"]), ("Sol", ["codex", "cursor_other"]), ("Grok", ["cursor_models", "supergrok"]),
             ("Grok Bot", ["grokbot"]), ("Wonder full", ["muse"]), ("Wonder", ["muse"])]
@@ -233,26 +235,13 @@ def pools_conf():
     except (OSError, ValueError): return {}
     return conf if isinstance(conf, dict) else {}
 def google_families():
-    """{orderly-style seat id: [(family, style)]} from pools.json's google_ai_pro block."""
+    """{pool: [family]} from pools.json's google_ai_pro block, as seat-usage's GOOGLE_FAMILIES."""
     block = pools_conf().get("google_ai_pro")
     pools = block.get("pools") if isinstance(block, dict) else None
     if not isinstance(pools, dict): return {}
-    out = {}
-    for pool, rec in pools.items():
-        if not isinstance(rec, dict) or not isinstance(rec.get("families"), list): continue
-        style = rec.get("style") if rec.get("style") in ("solid", "dashed", "dotted") else "solid"
-        out["google_" + pool] = [(f, style) for f in rec["families"] if isinstance(f, str) and f]
-    return out
+    return {pool: [f for f in rec["families"] if isinstance(f, str) and f] for pool, rec in pools.items()
+            if isinstance(rec, dict) and isinstance(rec.get("families"), list)}
 GFAM = google_families()
-def chips(sid):
-    if sid in GFAM: return list(GFAM[sid])
-    out = []
-    for name, src in FAMILIES:
-        if sid not in src: continue
-        # Claude Pro runs Fable only on usage credits; only Max includes it.
-        if name == "Fable" and sid == "claude_weekly" and CLAUDE_MAX is not True: continue
-        out.append((name, "dashed" if sid in METERED else "dotted" if sid in BUILDER_ONLY else "solid"))
-    return out
 
 # label -> (orderly seat id, vendor card, title, as_of key)
 POOL = {"Claude": ("claude_weekly", "claude", "Claude \u00b7 weekly", "claude"),
@@ -261,9 +250,9 @@ POOL = {"Claude": ("claude_weekly", "claude", "Claude \u00b7 weekly", "claude"),
         "Cursor other": ("cursor_other", "cursor", "Cursor \u00b7 Other Models", "cursor"),
         "Grok Bot": ("grokbot", "cursor", "Grok Bot \u00b7 weekly", "grokbot"),
         "SuperGrok": ("supergrok", "grok", "SuperGrok \u00b7 weekly", "grok"),
-        "Argon": ("google_argon", "google", "Google AI Pro \u00b7 Argon", "google"),
-        "Gemini": ("google_gemini", "google", "Google AI Pro \u00b7 Gemini", "google"),
-        "Claude/GPT": ("google_claudegpt", "google", "Google AI Pro \u00b7 Claude/GPT", "google"),
+        "Argon": ("google_argon_week", "google", "Google AI Pro \u00b7 Argon", "google"),
+        "Gemini": ("google_gemini_week", "google", "Google AI Pro \u00b7 Gemini", "google"),
+        "Claude/GPT": ("google_claudegpt_week", "google", "Google AI Pro \u00b7 Claude/GPT", "google"),
         "Muse": ("muse", "muse", "Muse \u00b7 weekly", None)}
 RESET_KEY = {"Claude": "claude_week_reset_ts", "ChatGPT": "codex_reset_ts", "Cursor models": "cursor_reset_ts",
              "Cursor other": "cursor_reset_ts", "Grok Bot": "bot_reset_ts", "SuperGrok": "grok_reset_ts"}
@@ -313,6 +302,40 @@ def stats(label, m, f):
         parts.append((f"stale {fspan(now - at)}", False))
     return parts
 
+def families():
+    """orderly families(): FAMILIES, then the families each Google row names (seat_rows
+    carries them only on a Google pool with a weekly reading). A row joins the end of a
+    family's sources; a family orderly doesn't know joins the end of the list."""
+    out = [(n, list(src)) for n, src in FAMILIES]
+    for label, m, _f in rows:
+        sid = POOL.get(label, (label,))[0]
+        pool = sid[len("google_"):-len("_week")] if sid.startswith("google_") and sid.endswith("_week") else None
+        if pool is None or not m: continue
+        for name in GFAM.get(pool, []):
+            fam = next((x for x in out if x[0] == name), None)
+            if fam is None: out.append(fam := (name, []))
+            if sid not in fam[1]: fam[1].append(sid)
+    return out
+FAMS = families()
+def chips(sid):
+    """orderly seatLabel: every family whose sources include this seat, in families() order.
+    No plan, availability or cap hides one. dashed = metered, dotted = builder only."""
+    style = "dashed" if sid in METERED else "dotted" if sid in BUILDER_ONLY else "solid"
+    return [(name, style) for name, src in FAMS if sid in src]
+def num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) else None
+def spend(label, m):
+    """orderly spendChip: Cursor's on-demand spend as a "$" chip on the Cursor and Grok Bot rows
+    (the rows orderly gives on_demand). Shown on a capped pool, or on a Cursor row with spend
+    above zero; "over" past the cached limit, "draw" on a capped pool, else plain."""
+    sid = POOL.get(label, (label,))[0]
+    spent = num(d.get("cursor_ondemand"))
+    if sid not in ("cursor_models", "cursor_other", "grokbot") or spent is None or not m: return None
+    capped = (sid == "grokbot" and d.get("bot_exhausted") is True) or m["pct"] >= 100
+    if not (capped or (sid != "grokbot" and spent > 0)): return None
+    limit = num(d.get("cursor_ondemand_limit"))
+    return "over" if limit is not None and spent > limit else "draw" if capped else "plain"
+
 # Cards: one per subscription run, Grok Bot on the Cursor bill.
 cards = []
 for label, m, f in rows:
@@ -323,7 +346,9 @@ for label, m, f in rows:
         cards.append({"vendor": vendor, "hue": VHUE.get(vendor, O_MUTED),
                       "header": f"{names[vendor]} \u00b7 {hdr[0]}" if hdr else None,
                       "header_warn": bool(hdr and hdr[1]), "sub": None, "pools": []})
-    cards[-1]["pools"].append({"label": label, "seat": sid, "title": title, "chips": chips(sid),
+    sp = spend(label, m)
+    cards[-1]["pools"].append({"label": label, "seat": sid, "title": title,
+                               "chips": chips(sid) + ([("$", "solid")] if sp else []), "spend": sp,
                                "main": m, "five": f, "stats": stats(label, m, f)})
 for c in cards:  # orderly poolsResetThen: pools whose reset is the renewal instant
     sub = SUBS.get(c["vendor"])
@@ -404,9 +429,6 @@ FRESH_S = route_fresh_s()
 HOST, WHY = host_lines(route_host())
 LEGEND = "dashed = metered \u00b7 dotted = builder only \u00b7 \u2605 first usable pool for the family"
 NOTES = []
-if CLAUDE_MAX is None and any(r[0] == "Claude" for r in rows):  # Pro: no chip, no note
-    NOTES.append("No Fable chip on Claude: the cache doesn't say whether the Claude plan is Max, "
-                 "and only Max includes Fable.")
 
 # ---- geometry, in 1x px (orderly CSS px * K) ----
 FRAME_X, FRAME_Y = 6, 8
@@ -464,7 +486,7 @@ for c in cards:  # chips beside the title; ones that don't fit go on lines under
 if TEXT:
     print(json.dumps({"host": HOST, "why": WHY, "legend": LEGEND, "notes": NOTES, "errors": {k: str(v) for k, v in errs.items()},
                       "cards": [{"header": c["header"], "header_warn": c["header_warn"], "sub": c["sub"],
-                                 "pools": [{"title": p["title"], "chips": p["chips"], "chips_drawn": len(p["fit"]),
+                                 "pools": [{"title": p["title"], "chips": p["chips"], "chips_drawn": len(p["fit"]), "spend": p["spend"],
                                             "stats": " \u00b7 ".join(t for t, _ in p["stats"]),
                                             "stats_drawn": [" \u00b7 ".join(t for t, _ in l) for l in p["stat_l"]],
                                             "red": [t for t, r in p["stats"] if r]} for p in c["pools"]]}
@@ -487,12 +509,15 @@ g.rounded_rectangle((P(FRAME_X), P(FRAME_Y), P(W - FRAME_X), P(Ht - FRAME_Y)), r
                     fill=O_PANEL2, outline=O_LINE, width=max(1, P(1)))
 X0, MW = TX0, TX1 - TX0  # the meter spans the card's content width (narrow orderly rail)
 
-def chip(x, yc, name, style, hue):
+def chip(x, yc, name, style, hue, tone=None):
     """orderly .seat .lab .chip: mono 9.5px, padding 0 4px, 1px border in the vendor hue
-    mixed 55% with --line, radius 3px. dashed = metered, dotted = builder only."""
+    mixed 55% with --line, radius 3px. dashed = metered, dotted = builder only.
+    tone: the "$" spend chip's .spend.draw (--warn) or .spend.over (--crit), text and border."""
     w_ = tw(name, F_CHIP) + 8 * K; h_ = 9.5 * 1.35 * K + 2 * K
     y0 = yc - h_ / 2
-    bc = mixhex(hue, .55, O_LINE)
+    toned = {"draw": O_WARN, "over": O_CRIT}.get(tone)
+    if toned: hue = toned
+    bc = toned or mixhex(hue, .55, O_LINE)
     if style == "solid":
         g.rounded_rectangle((P(x), P(y0), P(x + w_), P(y0 + h_)), radius=P(3 * K), outline=bc, width=max(1, P(1)))
     else:
@@ -544,9 +569,11 @@ for i, c in enumerate(cards):
         yy = y + PADY
         ly = yy + LH(12) / 2
         g.text((P(TX0), P(ly)), p["title"], font=F_TITLE, fill=O_INK, anchor="lm")
-        for name, style, cx, line in p["fit"]:
-            ch = VHUE["grok"] if p["seat"] == "grokbot" else hue  # orderly: Grok Bot chips in Grok blue
-            chip(cx, ly + line * CHIP_LH, name, style, ch)
+        for k_, (name, style, cx, line) in enumerate(p["fit"]):
+            sp = p["spend"] if (name == "$" and k_ == len(p["chips"]) - 1) else None
+            # orderly: Grok Bot's family chips in Grok blue (.chip.fam); its "$" chip keeps the Cursor hue
+            ch = VHUE["grok"] if p["seat"] == "grokbot" and not sp else hue
+            chip(cx, ly + line * CHIP_LH, name, style, ch, sp)
         yy += LH(12) + p["chip_lines"] * CHIP_LH + GAP
         m, f = p["main"], p["five"]
         if m or f:
