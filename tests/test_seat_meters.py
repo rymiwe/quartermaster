@@ -14,9 +14,8 @@ except ImportError:
         import pytest
         pytest.skip("Pillow not installed", allow_module_level=True)
 NOW = time.time()
-BLUE, RED, INK, BG = (0x5b, 0x8f, 0xd6), (0xc4, 0x3c, 0x3c), (0xe6, 0xeb, 0xf2), (0x14, 0x1a, 0x22)
+BLUE, RED = (0x5b, 0x8f, 0xd6), (0xc4, 0x3c, 0x3c)
 over = lambda c, under, a: tuple(round(u + (x - u) * a) for x, u in zip(c, under))
-TRACK = over(INK, BG, 0.14)  # the track is ink at 14% over the page, like orderly's
 near = lambda p, q, tol=2: all(abs(a - b) <= tol for a, b in zip(p, q))
 
 def runs(px, ok, run=12):
@@ -46,11 +45,11 @@ def render(t, cache, muse=None, *flags):
     r = subprocess.run([sys.executable, BIN, *flags, out], env=env, capture_output=True, text=True)
     return r, out
 
-O_INK, O_PANEL2 = (0xe4, 0xe8, 0xee), (0x20, 0x26, 0x2e)  # orderly's dark palette, used by --phone
-PHONE_CX0 = 6 + 14 * 1.3  # phone: frame inset plus the rail's 14px padding, at K = 1.3
+O_INK, O_PANEL2 = (0xe4, 0xe8, 0xee), (0x20, 0x26, 0x2e)  # orderly's dark palette
+PHONE_CX0 = 6 + 14 * 1.3  # frame inset plus the rail's 14px padding, at K = 1.3
 
-def phone_text(t, cache, muse=None, name="latest.json", pools=None):
-    """The phone layout's words, from --text: host line, card headers, pool titles, chips, stats."""
+def phone_text(t, cache, muse=None, name="latest.json", pools=None, flags=()):
+    """The layout's words, from --text: host line, card headers, pool titles, chips, stats."""
     cp, mp, out = os.path.join(t, name), os.path.join(t, "muse-usage.json"), os.path.join(t, "p.png")
     json.dump(cache, open(cp, "w"))
     if muse is not None:
@@ -61,15 +60,10 @@ def phone_text(t, cache, muse=None, name="latest.json", pools=None):
            "SEAT_USAGE_CACHE": cp, "SEAT_USAGE_MUSE_FILE": mp}
     if pools is not None:
         env["SEAT_USAGE_POOLS"] = pools
-    r = subprocess.run([sys.executable, BIN, "--phone", "--text", out], env=env, capture_output=True, text=True)
+    r = subprocess.run([sys.executable, BIN, *flags, "--text", out], env=env, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     assert open(out, "rb").read(8) == b"\x89PNG\r\n\x1a\n"
     return json.loads(r.stdout)
-
-def muse_band(out):
-    """Pixels of the Muse row, the only row when the cache is empty (y 44.. in 1x units)."""
-    im = Image.open(out).convert("RGB"); w, h = im.size
-    return im, [[im.getpixel((x, y)) for x in range(w)] for y in range(88, h - 28)]
 
 def test_renders_full_cache():
     with tempfile.TemporaryDirectory() as t:
@@ -91,9 +85,10 @@ def test_muse_file_draws_a_muse_track():
     with tempfile.TemporaryDirectory() as t:
         r, out = render(t, {"ts": NOW}, muse_doc())
         assert r.returncode == 0, r.stderr
-        im, band = muse_band(out)
-        assert im.size[1] == 2 * (14 * 2 + 26 + 40)   # one Muse row with its 5h track
-        assert any(BLUE in row for row in band) and any(has_run(row, lambda p: near(p, TRACK)) for row in band)
+        im = Image.open(out).convert("RGB")
+        assert BLUE in {im.getpixel((x, y)) for y in range(im.size[1]) for x in range(im.size[0])}
+        doc = phone_text(t, {"ts": NOW}, muse_doc())
+    assert _pool(doc, "Muse \u00b7 weekly")["stats"].startswith("50% \u00b7 5h 35%"), doc
 
 def test_missing_or_stale_muse_file_says_no_reading():
     stale = muse_doc(); stale["window"]["resets_at"] = iso(NOW - 60)
@@ -101,38 +96,38 @@ def test_missing_or_stale_muse_file_says_no_reading():
         with tempfile.TemporaryDirectory() as t:
             r, out = render(t, {"ts": NOW}, muse)
             assert r.returncode == 0, r.stderr
-            im, band = muse_band(out)
-            assert im.size[1] == 2 * (14 * 2 + 26 + 26)   # a Muse row, text only
-            assert not any(BLUE in row for row in band)
-            assert not any(has_run(row, lambda p: near(p, TRACK)) for row in band)
+            im = Image.open(out).convert("RGB")
+            assert BLUE not in {im.getpixel((x, y)) for y in range(im.size[1]) for x in range(im.size[0])}
+            doc = phone_text(t, {"ts": NOW}, muse)
+        assert _pool(doc, "Muse \u00b7 weekly")["stats"] == "no reading", doc
 
-def test_phone_layout_is_tall_and_narrow():
+def test_phone_flag_is_a_no_op_alias():
+    """One layout: orderly's meters panel at the narrow rail width. --phone, which used to
+    pick it, is still accepted and draws the same thing."""
     cache = {"ts": NOW, "claude_week": 42, "claude_week_reset_ts": NOW + 4 * 86400,
              "bot_pct": 24, "bot_reset_ts": NOW + 5 * 86400, "bot_window_s": 7 * 86400}
     with tempfile.TemporaryDirectory() as t:
-        r, out = render(t, cache, muse_doc(), "--phone")
+        r, out = render(t, cache, muse_doc())
         assert r.returncode == 0, r.stderr
         assert r.stdout.strip() == out
         w, h = Image.open(out).size
-        r2, wide = render(t, cache, muse_doc())
-        ww, wh = Image.open(wide).size
-        assert w == 3 * 390, w              # phone width at 3x
-        assert w < ww and h > wh, (w, h, ww, wh)   # narrower and taller than the wide layout
+        r2, out2 = render(t, cache, muse_doc(), "--phone")
+        assert r2.returncode == 0, r2.stderr
+        assert r2.stdout.strip() == out2
+        assert Image.open(out2).size == (w, h), (Image.open(out2).size, (w, h))
+        doc = phone_text(t, cache, muse_doc())
+        doc2 = phone_text(t, cache, muse_doc(), flags=("--phone",))
+    assert w == 3 * 390, w              # orderly's narrow rail at 3x
+    assert h > w, (w, h)                # tall
+    assert doc == doc2
 
 def test_nearly_finished_5h_window_stays_on_the_page():
-    BG = (0x14, 0x1a, 0x22)
     cache = {"ts": NOW, "claude_week": 42, "claude_week_reset_ts": NOW + 4 * 86400,
              "claude_5h": 90, "claude_5h_reset_ts": NOW + 60,
              "cursor_api_pct": 20, "cursor_reset_ts": NOW + 29 * 86400, "cursor_window_s": 31 * 86400}
+    # left of the cards is only the page, the frame and its border (orderly's palette)
     with tempfile.TemporaryDirectory() as t:
         r, out = render(t, cache, muse_doc())
-        assert r.returncode == 0, r.stderr
-        im = Image.open(out).convert("RGB")
-        spill = [(x, y) for x in range(14 * 2) for y in range(im.size[1]) if im.getpixel((x, y)) != BG]
-        assert not spill, spill[:3]
-    # phone: left of the cards is only the page, the frame and its border (orderly's palette)
-    with tempfile.TemporaryDirectory() as t:
-        r, out = render(t, cache, muse_doc(), "--phone")
         assert r.returncode == 0, r.stderr
         im = Image.open(out).convert("RGB")
         page = [(0x14, 0x17, 0x1c), (0x20, 0x26, 0x2e), (0x2b, 0x32, 0x3c)]
@@ -155,7 +150,7 @@ def _epoch(text):
     return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
 
 
-def test_google_group_is_its_own_color_in_both_layouts():
+def test_google_group_is_its_own_color():
     """Numbers match tests/fixtures/agy-usage.tsv: remaining 100/100/99 -> used 0/0/1."""
     # The fixture's resets, moved to now: absolute stamps expired at 2026-10-20T06:39:26Z and dropped the 5h rows.
     week, five, argon = NOW + 7 * 86400 - 60, NOW + 5 * 3600 - 60, NOW + 7 * 86400 - 106
@@ -167,32 +162,25 @@ def test_google_group_is_its_own_color_in_both_layouts():
         "google_claudegpt_5h": 0, "google_claudegpt_5h_reset_ts": five,
     }
     GOOGLE = (0x54, 0x68, 0xf0)
+    def colors(path):
+        im = Image.open(path).convert("RGB")
+        w, h = im.size
+        return im, {im.getpixel((x, y)) for y in range(h) for x in range(w)}
     with tempfile.TemporaryDirectory() as t:
         base = {"ts": NOW}
         plain, plain_out = render(t, base)
         assert plain.returncode == 0, plain.stderr
-        def colors(path):
-            im = Image.open(path).convert("RGB")
-            w, h = im.size
-            return im, {im.getpixel((x, y)) for y in range(h) for x in range(w)}
         plain_im, plain_px = colors(plain_out)
-        plain_h = plain_im.size[1]
-        wide, wide_out = render(t, {**base, **google})
-        assert wide.returncode == 0, wide.stderr
-        wide_im, wide_px = colors(wide_out)
-        wide_h = wide_im.size[1]
-        phone, phone_out = render(t, {**base, **google}, None, "--phone")
-        assert phone.returncode == 0, phone.stderr
-        phone_im, phone_px = colors(phone_out)
-        assert GOOGLE in wide_px
-        assert GOOGLE in phone_px
+        full, full_out = render(t, {**base, **google})
+        assert full.returncode == 0, full.stderr
+        full_im, full_px = colors(full_out)
+        assert GOOGLE in full_px
         assert GOOGLE not in plain_px
-        assert wide_h > plain_h
-        assert phone_im.size[0] == 3 * 390
+        assert full_im.size[1] > plain_im.size[1]
         weekly_only = {k: v for k, v in google.items() if not k.endswith("_5h") and "5h_reset" not in k}
         short, short_out = render(t, {**base, **weekly_only})
         assert short.returncode == 0, short.stderr
-        assert Image.open(short_out).size[1] < wide_h
+        assert Image.open(short_out).size[1] < full_im.size[1]
 
 
 def test_phone_5h_track_has_no_text_beside_it():
@@ -200,7 +188,7 @@ def test_phone_5h_track_has_no_text_beside_it():
     cache = {"ts": NOW, "google_gemini_week": 5, "google_gemini_week_reset_ts": NOW + 86400,
              "google_gemini_5h": 20, "google_gemini_5h_reset_ts": NOW + 3 * 3600}
     with tempfile.TemporaryDirectory() as t:
-        r, out = render(t, cache, None, "--phone")
+        r, out = render(t, cache, None)
         assert r.returncode == 0, r.stderr
         im = Image.open(out).convert("RGB"); w, h = im.size
         # the track is orderly's ink at 14% over the Google card's 9% tint over the rail
@@ -230,7 +218,7 @@ def test_phone_over_pace_segment_is_red_on_both_tracks():
         cache = {"ts": NOW, "claude_week": week, "claude_week_reset_ts": NOW + 4 * 86400,
                  "claude_5h": five, "claude_5h_reset_ts": NOW + 2.5 * 3600}
         with tempfile.TemporaryDirectory() as t:
-            r, out = render(t, cache, None, "--phone")
+            r, out = render(t, cache, None)
             assert r.returncode == 0, r.stderr
             im = Image.open(out).convert("RGB"); w, h = im.size
             rows = [y for y in range(h) if any(im.getpixel((x, y)) == RED for x in range(0, w, 2))]
@@ -254,7 +242,7 @@ def test_phone_over_pace_5h_blue_stays_dim():
     cache = {"ts": NOW, "claude_week": 10, "claude_week_reset_ts": NOW + 4 * 86400,
              "claude_5h": 90, "claude_5h_reset_ts": NOW + 2.5 * 3600}
     with tempfile.TemporaryDirectory() as t:
-        r, out = render(t, cache, None, "--phone")
+        r, out = render(t, cache, None)
         assert r.returncode == 0, r.stderr
         im = Image.open(out).convert("RGB"); w, h = im.size
         red_rows = [y for y in range(h) if any(im.getpixel((x, y)) == RED for x in range(w))]
@@ -403,7 +391,7 @@ def test_phone_chips_follow_orderly_and_the_claude_plan():
 def test_phone_errors_wrap_inside_the_frame():
     with tempfile.TemporaryDirectory() as t:
         doc = phone_text(t, {"ts": NOW, "errors": {"claude": "HTTPError 401 " + "x " * 60}})
-        r, out = render(t, {"ts": NOW, "errors": {"claude": "HTTPError 401 " + "x " * 60}}, None, "--phone")
+        r, out = render(t, {"ts": NOW, "errors": {"claude": "HTTPError 401 " + "x " * 60}}, None)
         assert r.returncode == 0, r.stderr
     assert doc["errors"]["claude"].startswith("HTTPError 401")
 
@@ -427,9 +415,7 @@ def test_phone_header_is_seat_usages_host_pick():
 
 def test_text_flag_prints_json_not_the_path():
     with tempfile.TemporaryDirectory() as t:
-        r, _ = render(t, {"ts": NOW}, None, "--text")
-        assert r.returncode != 0 and "--text needs --phone" in r.stderr
-        r, out = render(t, {"ts": NOW}, None, "--phone")
+        r, out = render(t, {"ts": NOW}, None)
         assert r.stdout.strip() == out
         doc = phone_text(t, {"ts": NOW})
         assert doc["host"].startswith("Next host:")
