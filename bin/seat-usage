@@ -2165,9 +2165,13 @@ def _party(row):
             "vendor": row.get("vendor"), "effort": row.get("effort"), "variant": row.get("variant", "-")}
 
 
+_REVIEW_DISPLAY = {"argon": "Argon", "wonder": "Wonder"}
+
+
 def _name_list(voters):
     """'A', 'A and B', or 'A, B, and C'."""
-    names = [_FAMILY_NAME.get(v["family"], v["family"]) for v in voters]
+    names = [_FAMILY_NAME.get(v["family"]) or _REVIEW_DISPLAY.get(v["family"]) or v["family"]
+             for v in voters]
     if len(names) <= 1:
         return names[0] if names else ""
     if len(names) == 2:
@@ -2759,10 +2763,14 @@ def _argon_reading(s, now):
     if not _is_number(used):
         return "unknown", "no used %", None
     reset = s.get("google_argon_week_reset_ts")
-    if used >= 100:
-        return "capped", None, used
+    # Same order as pool_status: a clock that already passed is unknown,
+    # including a window that reads 100. Near cap is the scoring band at 95.
     if not _is_number(reset) or reset <= now:
         return "unknown", "reset passed", used
+    if used >= 100:
+        return "capped", None, used
+    if used >= NEAR_CAP:
+        return "near_cap", None, used
     code = pace_code(used, reset, 7 * 86400, now)
     if not code:
         return "unknown", "no used %", used
@@ -2972,7 +2980,13 @@ def route_review(s, now, builder_vendor):
     states = {pid: pool_status(pid, s, now) for pid in POOLS}
     vendor = _normalize_vendor(builder_vendor)
     if vendor is None:
-        return _lineup_ask(s, now, states, f"builder vendor {builder_vendor} is unknown: {_ASK}", [])
+        asked = _lineup_ask(s, now, states, f"builder vendor {builder_vendor} is unknown: {_ASK}", [])
+        asked["role"] = "review"
+        asked["why"] = asked["reason"]
+        asked["builder_vendor"] = None
+        asked["reviewers"] = []
+        asked["skipped"] = []
+        return asked
     status, why, chosen, skipped = _pick_review_seats(states, s, now, vendor, 1)
     ages = [row.get("reading_age_s") for row in chosen]
     ages.extend(row.get("reading_age_s") for row in skipped if isinstance(row.get("reading_age_s"), (int, float)))
@@ -3051,23 +3065,40 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
         excluded_vendor = chair_row["vendor"]
         excl = None
     else:
-        excl = _lineup_exclusion(kind, author, builder_row)
-        if excl.get("ask"):
-            return _lineup_ask(s, now, states, excl["ask"], [])
-        excluded_vendor = excl["vendor"]
+        if kind == "review" and builder_vendor is not None and str(builder_vendor).strip():
+            forced = _normalize_vendor(builder_vendor)
+            if forced is None:
+                asked = _lineup_ask(s, now, states,
+                                    f"builder vendor {builder_vendor} is unknown: {_ASK}", [])
+                asked["kind"] = "review"
+                asked["builder_vendor"] = None
+                asked["skipped"] = []
+                asked["why"] = asked["reason"]
+                return asked
+            # --builder-vendor wins. An author family that is not in the config
+            # does not ask when this flag names a real vendor.
+            if isinstance(author, str) and author not in FAMILY_VENDOR:
+                excl = {"vendor": forced, "name": _VENDOR_NAME.get(forced, forced),
+                        "family": None, "why": f"builder vendor {forced}", "author": author}
+            else:
+                excl = _lineup_exclusion(kind, author, builder_row)
+                if excl.get("ask"):
+                    return _lineup_ask(s, now, states, excl["ask"], [])
+                if excl.get("vendor") != forced:
+                    excl["why"] = f"builder vendor {forced}"
+                    excl["name"] = _VENDOR_NAME.get(forced, forced)
+                    if FAMILY_VENDOR.get(excl.get("family")) != forced:
+                        excl["family"] = None
+                excl["vendor"] = forced
+            excluded_vendor = forced
+        else:
+            excl = _lineup_exclusion(kind, author, builder_row)
+            if excl.get("ask"):
+                return _lineup_ask(s, now, states, excl["ask"], [])
+            excluded_vendor = excl["vendor"]
 
     review_why = None
     review_skipped = None
-    if kind == "review" and builder_vendor is not None and str(builder_vendor).strip():
-        forced = _normalize_vendor(builder_vendor)
-        if forced is None:
-            return _lineup_ask(s, now, states, f"builder vendor {builder_vendor} is unknown: {_ASK}", [])
-        if excl.get("vendor") != forced:
-            excl["why"] = f"builder vendor {forced}"
-        excl["vendor"] = forced
-        excl["name"] = _VENDOR_NAME.get(forced, forced)
-        excluded_vendor = forced
-
     if kind == "review":
         status, payload = _collect_review_voters(states, s, now, excluded_vendor)
         if status == "ask":
@@ -4889,15 +4920,20 @@ def _parse_findings(text, reviewer):
         raw = line.strip()
         if not raw or raw.upper().startswith("VERDICT:"):
             continue
+        if raw.lower() in ("no findings.", "no findings"):
+            continue
         numbered = re.match(r"^(?:\d+[\.\)])\s*(?:P[0-3]\b[:\s-]*)?(.*)$", raw, re.I)
         level = re.match(r"^(P[0-3])\b[:\s-]*(.*)$", raw, re.I)
         if numbered and numbered.group(1).strip():
             found.append(numbered.group(1).strip())
         elif level and (level.group(2).strip() or level.group(1)):
             found.append((level.group(2) or level.group(1)).strip())
+        elif found:
+            found[-1] = found[-1] + "\n" + raw
     if not found:
         body = "\n".join(line for line in (text or "").splitlines()
-                         if line.strip() and not line.strip().upper().startswith("VERDICT:")).strip()
+                         if line.strip() and not line.strip().upper().startswith("VERDICT:")
+                         and line.strip().lower() not in ("no findings.", "no findings")).strip()
         if body:
             found.append(body)
     return [{"id": f"f{i}", "reviewer": reviewer, "text": body, "grade": ""}

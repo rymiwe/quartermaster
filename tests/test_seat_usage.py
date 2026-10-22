@@ -3973,6 +3973,32 @@ def review_gate_picks_one_other_vendor():
     assert asked["mode"] == "ask" and asked["reviewers"] == [], asked
 
 
+@test
+def review_argon_matches_pool_pace_and_vendor_flag_wins():
+    hot = _argon(snap(), 96)
+    pace, why, _used = su._argon_reading(hot, NOW)
+    assert pace == "near_cap" and why is None, (pace, why)
+    row = su.route_lineup(hot, NOW, kind="review", builder_vendor="xai")
+    assert [v["family"] for v in row["lineup"]["voters"]] == ["fable", "astra"], row["why"]
+    expired = _argon(snap(), 100, reset=NOW - 60)
+    pace, why, _used = su._argon_reading(expired, NOW)
+    assert pace == "unknown" and why == "reset passed", (pace, why)
+    named = su.route_lineup(snap(), NOW, kind="review", author="argon", builder_vendor="openai")
+    assert named["mode"] != "ask", named
+    assert named["excluded"]["vendor"] == "openai" and named["excluded"]["family"] is None, named["excluded"]
+    stale = _argon(snap(codex=80), 6)
+    stale["as_of"] = dict(stale["as_of"])
+    stale["as_of"]["claude"] = NOW - 222 * 60
+    shown = su.route_lineup(stale, NOW, kind="review", builder_vendor="xai")
+    assert [v["family"] for v in shown["lineup"]["voters"]] == ["argon", "wonder"], shown["why"]
+    assert "Argon" in shown["rule"] and "Wonder" in shown["rule"], shown["rule"]
+    asked = su.route_review(snap(), NOW, "not-a-vendor")
+    assert asked["role"] == "review" and asked["mode"] == "ask" and asked["reviewers"] == [], asked
+    assert su._parse_findings("VERDICT: approve\nNo findings.\n", "A") == []
+    kept = su._parse_findings("VERDICT: request changes\n1. P1: first line\nstill the finding\n", "A")
+    assert kept[0]["text"] == "first line\nstill the finding", kept
+
+
 def _pick_without_ages(text):
     def scrub(obj):
         if isinstance(obj, dict):
