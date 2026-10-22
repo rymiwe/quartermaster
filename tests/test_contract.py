@@ -477,7 +477,7 @@ def unknown_role_exits_2_with_the_role_list():
         })
     assert proc.returncode == 2, proc.returncode
     assert proc.stdout == "", proc.stdout
-    assert proc.stderr == "unknown role nope; roles: bounded-question, hard-bug, builder, chair, lineup, host, ask\n", proc.stderr
+    assert proc.stderr == "unknown role nope; roles: bounded-question, hard-bug, builder, chair, lineup, host, ask, review\n", proc.stderr
 
 
 @test

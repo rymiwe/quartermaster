@@ -1971,7 +1971,7 @@ def lineup_kind_excludes_the_author_not_the_chair():
     assert review["lineup"]["chair"]["family"] == "opus", review["lineup"]["chair"]
     assert review["lineup"]["builder"]["family"] == "grok", review["lineup"]["builder"]
     assert review["lineup"]["builder"]["effort"] == "low", review["lineup"]["builder"]
-    assert _voter_families(review) == ["fable", "astra", "wonder-full"], review
+    assert _voter_families(review) == ["fable", "astra"], review
     assert review["author"] == "grok", review
     assert review["excluded"]["vendor"] == "xai", review["excluded"]
     assert review["excluded"]["why"] == "Grok built the diff", review["excluded"]
@@ -1989,7 +1989,7 @@ def lineup_kind_excludes_the_author_not_the_chair():
     named = su.route_lineup(ahead, NOW, builder=grok_builder(), kind="review", author="fable")
     assert named["lineup"]["builder"]["family"] == "grok", named
     assert named["author"] == "fable" and named["excluded"]["vendor"] == "anthropic", named
-    assert _voter_families(named) == ["astra", "grok", "wonder-full"], named
+    assert _voter_families(named) == ["astra", "wonder"], named
     assert named["excluded"]["why"] == "Fable built the diff", named["excluded"]
 
     # Design seats the chair's vendor. Audit seats everybody until an author is named.
@@ -2024,8 +2024,9 @@ def lineup_kind_excludes_the_author_not_the_chair():
     assert review_ask["mode"] != "ask" and review_ask["lineup"] is not None, review_ask
     assert "fable" not in _voter_families(review_ask), review_ask
     assert "astra" in _voter_families(review_ask), review_ask
-    assert "claude 5h full" in review_ask["downgrade"]["reason"], review_ask
-    assert "fix the failed reading" not in review_ask["downgrade"]["reason"], review_ask
+    assert "wonder" in _voter_families(review_ask), review_ask
+    assert "downgrade" not in review_ask, review_ask
+    assert any(item["family"] == "fable" for item in review_ask["skipped"]), review_ask
 
     missing = su.route_lineup(snap(), NOW, kind="review", author="composer")
     assert missing["mode"] == "ask" and "no vendor" in missing["reason"], missing
@@ -2190,7 +2191,7 @@ def lineup_kind_flags_reject_a_bad_kind_before_a_refresh():
         row = json.loads(ok.stdout)[0]
         assert row["lineup"]["chair"]["family"] == "opus", row
         assert row["lineup"]["builder"]["family"] == "grok", row
-        assert [v["family"] for v in row["lineup"]["voters"]] == ["fable", "astra", "wonder-full"], row
+        assert [v["family"] for v in row["lineup"]["voters"]] == ["fable", "astra"], row
         assert row["excluded"]["vendor"] == "xai", row
 
 
@@ -3878,6 +3879,234 @@ def seat_rows_mirror_the_status_line_groups():
     assert rows["cx"]["bars"] == [{"kind": "off", "name": "cx", "seat": "chatgpt"}], rows["cx"]
     assert rows["gk"]["bars"] == [{"kind": "failed", "name": "gk", "seat": "grok"}], rows["gk"]
     assert "gg" not in rows
+
+
+def _argon(s, used=10, **kw):
+    s = dict(s)
+    s["google_argon_week"] = used
+    s["google_argon_week_reset_ts"] = kw.get("reset", NOW + 3 * 86400)
+    return s
+
+
+@test
+def review_roster_excludes_spark_and_muse_contributor():
+    for spec in su.REVIEW_ROSTER:
+        model = spec["model"].lower()
+        assert "spark" not in model and "contributor" not in model, spec
+    assert su._review_model_barred("muse-spark-1")
+    assert su._review_model_barred("wonder-contributor")
+    assert su._review_model_barred("Muse Spark")
+    assert not su._review_model_barred("wonder")
+    assert not su._review_model_barred("gpt-6-astra")
+    families = [spec["family"] for spec in su.REVIEW_ROSTER]
+    assert families == ["fable", "astra", "grok", "argon", "wonder"], families
+    assert "wonder-full" not in families
+    muse = next(spec for spec in su.REVIEW_ROSTER if spec["family"] == "wonder")
+    assert muse["contributor_mode"] == "off" and muse["model"] == "wonder", muse
+    # Design's roster is unchanged and still has no Argon.
+    assert [spec["family"] for spec in su.VOTER_ROSTER] == ["fable", "astra", "grok", "wonder-full"]
+
+
+@test
+def review_lineup_picks_two_by_pace_and_skips_unknown():
+    fresh = _argon(snap(codex=50), 40)
+    row = su.route_lineup(fresh, NOW, builder=grok_builder(), kind="review")
+    assert row["mode"] != "ask" and len(row["lineup"]["voters"]) == 2, row
+    assert _voter_families(row) == ["fable", "wonder"], row
+    vendors = [v["vendor"] for v in row["lineup"]["voters"]]
+    assert len(set(vendors)) == 2 and "xai" not in vendors, row
+    assert all(v["pace"] == "under" and v["headroom"] == 1.0 for v in row["lineup"]["voters"]), row
+    assert "ranked by pace then headroom" in row["why"], row
+    skipped = {item["family"]: item["reason"] for item in row["skipped"]}
+    assert "grok" in skipped and "builder vendor" in skipped["grok"], skipped
+    assert "argon" in skipped and "astra" in skipped, skipped
+    # A stale Fable reading is skipped. The other seats still fill the council.
+    stale = _argon(snap(), 80)
+    stale["as_of"] = dict(stale["as_of"])
+    stale["as_of"]["claude"] = NOW - 222 * 60
+    held = su.route_lineup(stale, NOW, builder_vendor="xai", kind="review")
+    assert held["mode"] != "ask", held
+    assert "fable" not in _voter_families(held), held
+    assert _voter_families(held) == ["astra", "wonder"], held
+    fable_skip = next(item for item in held["skipped"] if item["family"] == "fable")
+    assert "222m old" in fable_skip["reason"], fable_skip
+    # Ask only when fewer than two eligible seats remain.
+    dead = snap(codex=100, muse_week=100, muse_5h=100, google_argon_week=100,
+                google_argon_week_reset_ts=NOW + 3 * 86400)
+    dead["as_of"] = dict(dead["as_of"])
+    dead["as_of"]["claude"] = NOW - 222 * 60
+    asked = su.route_lineup(dead, NOW, kind="review", builder_vendor="grok")
+    assert asked["mode"] == "ask" and asked["lineup"] is None, asked
+    assert asked["builder_vendor"] == "xai", asked
+    assert "need 2" in asked["reason"], asked
+    # grok is an alias for xai. Design output does not grow an Argon voter.
+    design = su.route_lineup(fresh, NOW, kind="design")
+    assert _voter_families(design) == ["fable", "astra", "grok", "wonder-full"], design
+    assert "skipped" not in design and "why" not in design, design
+    text = su.format_lineup(design)
+    assert "pace " not in text and "skipped:" not in text, text
+
+
+@test
+def review_gate_picks_one_other_vendor():
+    fresh = _argon(snap(cursor_api_pct=80, fable=80), 5)
+    row = su.route_review(fresh, NOW, "xai")
+    assert row["role"] == "review" and row["mode"] != "ask", row
+    assert len(row["reviewers"]) == 1, row
+    chosen = row["reviewers"][0]
+    assert chosen["vendor"] != "xai" and chosen["family"] == "argon", chosen
+    assert chosen["model"] == "gemini-4-argon-high", chosen
+    assert chosen["pace"] == "under" and chosen["headroom"] == 1.0, chosen
+    assert "spark" not in json.dumps(row).lower()
+    assert "contributor" not in json.dumps(chosen).lower()
+    text = su.format_review(row)
+    assert text.startswith("route: review |"), text
+    assert "pace under" in text and "headroom 1.00" in text, text
+    assert any(item["family"] == "grok" for item in row["skipped"]), row
+    none = su.route_review(snap(codex=100, muse_week=100, muse_5h=100, fable=100,
+                                cursor_api_pct=100, claude_5h=100), NOW, "anthropic")
+    # grok may still be eligible; this only checks the ask shape when forced empty below.
+    capped = snap(codex=100, muse_week=100, muse_5h=100, fable=100, cursor_api_pct=100,
+                  claude_5h=100, grok_pct=100, google_argon_week=100,
+                  google_argon_week_reset_ts=NOW + 86400)
+    asked = su.route_review(capped, NOW, "xai")
+    assert asked["mode"] == "ask" and asked["reviewers"] == [], asked
+
+
+def _pick_without_ages(text):
+    def scrub(obj):
+        if isinstance(obj, dict):
+            return {k: scrub(v) for k, v in obj.items() if k not in ("reading_age_s", "usage_age_s")}
+        if isinstance(obj, list):
+            return [scrub(v) for v in obj]
+        return obj
+    return scrub(json.loads(text))
+
+
+@test
+def review_routing_ignores_a_log_full_of_grades():
+    now = time.time()
+    with tempfile.TemporaryDirectory() as d:
+        cache = os.path.join(d, "latest.json")
+        with open(cache, "w") as handle:
+            body = _shift_snap(now)
+            body["google_argon_week"] = 12
+            body["google_argon_week_reset_ts"] = now + 3 * 86400
+            json.dump(body, handle)
+        empty = os.path.join(d, "empty.jsonl")
+        graded = os.path.join(d, "graded.jsonl")
+        open(empty, "w").close()
+        graded_row = {
+            "ts": 1, "id": "1.000000", "repo": "rymiwe/example", "pr": "9", "ballot": None,
+            "builder_vendor": "xai", "route": "review",
+            "reviewers": [{"seat": "claude", "family": "fable", "model": "fable", "vendor": "anthropic",
+                           "pace": "under", "headroom": 1.0, "used_pct": 1, "effort": "high"}],
+            "why": "ranked by pace then headroom: fable pace under headroom 1.00 used 1",
+            "findings": [{"id": "f1", "reviewer": "claude", "text": "fable on the claude seat", "grade": "false"},
+                         {"id": "f2", "reviewer": "chatgpt", "text": "astra from openai", "grade": "real"}],
+        }
+        with open(graded, "w") as handle:
+            handle.write(json.dumps(graded_row) + "\n")
+        home = os.path.join(d, "home")
+        os.makedirs(home)
+
+        def run(log_path, args):
+            env = os.environ.copy()
+            env["HOME"] = home
+            env["SEAT_USAGE_CACHE_DIR"] = d
+            env["SEAT_USAGE_ASKS"] = os.path.join(d, "asks.jsonl")
+            env["SEAT_USAGE_REVIEW_LOG"] = log_path
+            env["QUARTERMASTER_NO_UPDATE"] = "1"
+            return subprocess.run(
+                [sys.executable, str(BIN), *args],
+                capture_output=True, text=True, env=env, timeout=20,
+            )
+
+        args = ["--route", "lineup", "--cached", "--json", "--kind", "review", "--builder-vendor", "xai"]
+        first = run(empty, args)
+        second = run(graded, args)
+        assert first.returncode == 0 and second.returncode == 0, (first.stderr, second.stderr)
+        # reading_age_s moves with the clock between the two runs. The pick does not.
+        assert _pick_without_ages(first.stdout) == _pick_without_ages(second.stdout)
+        gate_args = ["--route", "review", "--cached", "--json", "--builder-vendor", "grok",
+                     "--repo", "rymiwe/example", "--pr", "4"]
+        gate_empty = run(empty, gate_args)
+        gate_full = run(graded, gate_args)
+        assert gate_empty.returncode == 0 and gate_full.returncode == 0, (gate_empty.stderr, gate_full.stderr)
+        assert _pick_without_ages(gate_empty.stdout) == _pick_without_ages(gate_full.stdout)
+        picked = json.loads(gate_empty.stdout)[0]
+        assert picked["builder_vendor"] == "xai" and len(picked["reviewers"]) == 1, picked
+        assert picked["reviewers"][0]["vendor"] != "xai"
+        # The grade log was not an input: both files gained a pick, and the graded
+        # findings are unchanged.
+        with open(graded) as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+        assert lines[0]["findings"][0]["grade"] == "false", lines[0]
+        assert len(lines) >= 2
+
+
+@test
+def review_grade_hides_model_vendor_and_seat_names():
+    with tempfile.TemporaryDirectory() as d:
+        log_path = os.path.join(d, "picks.jsonl")
+        home = os.path.join(d, "home")
+        os.makedirs(home)
+        env = os.environ.copy()
+        env["HOME"] = home
+        env["SEAT_USAGE_REVIEW_LOG"] = log_path
+        env["QUARTERMASTER_NO_UPDATE"] = "1"
+        record = {
+            "ts": 10, "id": "10.000000", "repo": "rymiwe/example", "pr": None, "ballot": "b1",
+            "builder_vendor": "xai", "route": "lineup",
+            "reviewers": [
+                {"seat": "claude", "family": "fable", "model": "fable", "vendor": "anthropic",
+                 "pace": "under", "headroom": 1.0, "used_pct": 10, "effort": "high"},
+                {"seat": "chatgpt", "family": "astra", "model": "gpt-6-astra", "vendor": "openai",
+                 "pace": "on", "headroom": 0.9, "used_pct": 40, "effort": "high"},
+            ],
+            "why": "ranked by pace then headroom: fable pace under headroom 1.00 used 10",
+            "findings": [],
+        }
+        with open(log_path, "w") as handle:
+            handle.write(json.dumps(record) + "\n")
+        findings = os.path.join(d, "findings.md")
+        with open(findings, "w") as handle:
+            handle.write("VERDICT: request changes\n1. P1 fable on the claude seat leaks anthropic\n"
+                         "2. P2 gpt-6-astra from openai on chatgpt\n")
+        attach = subprocess.run(
+            [sys.executable, str(BIN), "--review-findings", "--pick", "latest",
+             "--reviewer", "claude", "--file", findings],
+            capture_output=True, text=True, env=env, timeout=15,
+        )
+        assert attach.returncode == 0, attach.stderr
+        with open(findings, "w") as handle:
+            handle.write("1. grok cursor muse wonder argon gemini spark contributor\n")
+        attach_b = subprocess.run(
+            [sys.executable, str(BIN), "--review-findings", "--pick", "10.000000",
+             "--reviewer", "cursor", "--file", findings],
+            capture_output=True, text=True, env=env, timeout=15,
+        )
+        assert attach_b.returncode == 0, attach_b.stderr
+        shown = subprocess.run(
+            [sys.executable, str(BIN), "--grade-findings", "--pick", "latest",
+             "--grade", "f1=real", "--grade", "f2=false"],
+            capture_output=True, text=True, env=env, timeout=15,
+        )
+        assert shown.returncode == 0, shown.stderr
+        out = shown.stdout
+        assert "Reviewer A" in out and "Reviewer B" in out, out
+        assert "recorded f1=real" in out and "f2=false" in out, out
+        banned = ("fable", "astra", "grok", "claude", "cursor", "chatgpt", "anthropic", "openai",
+                  "xai", "google", "muse", "wonder", "argon", "gemini", "gpt-6-astra", "codex",
+                  "opus", "spark", "contributor", "meta", "agy")
+        for word in banned:
+            assert word not in out.lower(), (word, out)
+        with open(log_path) as handle:
+            saved = json.loads(handle.read().strip().splitlines()[-1])
+        grades = {item["id"]: item["grade"] for item in saved["findings"]}
+        assert grades["f1"] == "real" and grades["f2"] == "false", saved
+        # The second reviewer's finding is still blank.
+        assert any(item["grade"] == "" for item in saved["findings"]), saved
 
 
 @test
