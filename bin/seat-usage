@@ -2098,7 +2098,7 @@ def refresh(seats):
         _release_lock(lock)
 
 # Vendor is the model provider, not the seat that is billed (Ryan, 2026-10-08).
-_VENDOR_NAME = {"xai": "xAI", "anthropic": "Anthropic", "openai": "OpenAI", "meta": "Meta"}
+_VENDOR_NAME = {"xai": "xAI", "anthropic": "Anthropic", "openai": "OpenAI", "meta": "Meta", "google": "Google"}
 FAMILY_VENDOR = {}
 _FAMILY_NAME = {}
 load_config()
@@ -2165,9 +2165,13 @@ def _party(row):
             "vendor": row.get("vendor"), "effort": row.get("effort"), "variant": row.get("variant", "-")}
 
 
+_REVIEW_DISPLAY = {"argon": "Argon", "wonder": "Wonder"}
+
+
 def _name_list(voters):
     """'A', 'A and B', or 'A, B, and C'."""
-    names = [_FAMILY_NAME.get(v["family"], v["family"]) for v in voters]
+    names = [_FAMILY_NAME.get(v["family"]) or _REVIEW_DISPLAY.get(v["family"]) or v["family"]
+             for v in voters]
     if len(names) <= 1:
         return names[0] if names else ""
     if len(names) == 2:
@@ -2697,7 +2701,311 @@ def _emit_lineup(s, now, states, chair_row, builder_row, voters, rule):
             "usage": _usage_snapshot(states, s), "usage_age_s": _snapshot_age(s, now)}
 
 
-def route_lineup(s, now, builder=None, kind=None, author=None):
+# Review council and the one merge-gate reviewer. Not VOTER_ROSTER: design,
+# mixed, audit, and a lineup with no kind never see these rows. Gemini Argon
+# is scored from the google_argon_week cache fields. It is not a pool, so
+# design's usage snapshot stays the same. Muse wonder is the weekly Muse
+# pool with contributor mode off. A spark id or a contributor id is barred.
+REVIEW_ROSTER = (
+    {"family": "fable", "seat": "claude", "vendor": "anthropic", "model": "fable", "pick": "fable"},
+    {"family": "astra", "seat": "chatgpt", "vendor": "openai", "model": "gpt-6-astra", "pick": "pool", "pool": "codex"},
+    {"family": "grok", "seat": "grok", "vendor": "xai", "model": "grok", "pick": "pool", "pool": "grok"},
+    {"family": "argon", "seat": "google", "vendor": "google", "model": "gemini-4-argon-high", "pick": "argon"},
+    {"family": "wonder", "seat": "muse", "vendor": "meta", "model": "wonder", "pick": "muse",
+     "contributor_mode": "off"},
+)
+_REVIEW_VENDOR_ALIAS = {"grok": "xai"}
+_REVIEW_NEED = {"review": 1, "lineup": 2}
+
+
+def _review_model_barred(model):
+    """Spark models and Muse contributor mode are never review candidates."""
+    text = (model or "").casefold()
+    return "spark" in text or "contributor" in text
+
+
+def _normalize_vendor(name):
+    """A config vendor, plus grok as an alias for xai. None when unknown."""
+    if not isinstance(name, str):
+        return None
+    key = name.strip().lower()
+    if not key:
+        return None
+    key = _REVIEW_VENDOR_ALIAS.get(key, key)
+    known = set(FAMILY_VENDOR.values()) | set(_VENDOR_NAME)
+    if key in known:
+        return key
+    return None
+
+
+def _review_vendors_text():
+    names = sorted(set(FAMILY_VENDOR.values()) | set(_VENDOR_NAME))
+    return ", ".join(names) + " (grok is an alias for xai)"
+
+
+def _review_headroom(pace, pool_id, states):
+    factor = (SCORING.get("headroom") or {}).get(pace, 0.9)
+    if pool_id in POOLS:
+        factor *= _cohort_factor(pool_id, states)
+    return round(float(factor), 4)
+
+
+def _argon_reading(s, now):
+    """Pace of the Argon weekly cache fields. Same freshness rule as a pool."""
+    as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
+    stamp = as_of.get("google")
+    if not stamp:
+        return "unknown", "no reading", None
+    age = now - stamp
+    if age > route_fresh_s(s):
+        return "unknown", f"reading {int(age // 60)}m old", None
+    used = s.get("google_argon_week")
+    if not _is_number(used):
+        return "unknown", "no used %", None
+    reset = s.get("google_argon_week_reset_ts")
+    # Same order as pool_status: a clock that already passed is unknown,
+    # including a window that reads 100. Near cap is the scoring band at 95.
+    if not _is_number(reset) or reset <= now:
+        return "unknown", "reset passed", used
+    if used >= 100:
+        return "capped", None, used
+    if used >= NEAR_CAP:
+        return "near_cap", None, used
+    code = pace_code(used, reset, 7 * 86400, now)
+    if not code:
+        return "unknown", "no used %", used
+    return code, None, used
+
+
+def _review_skip(spec, reason):
+    row = {"family": spec["family"], "seat": spec.get("seat"), "vendor": spec["vendor"],
+           "model": spec["model"], "reason": reason}
+    if spec.get("contributor_mode"):
+        row["contributor_mode"] = spec["contributor_mode"]
+    return row
+
+
+def _review_metrics(pool_id, pace, used, states, s, now):
+    return {"pool": pool_id, "pace": pace, "headroom": _review_headroom(pace, pool_id, states),
+            "used_pct": used if _is_number(used) else None,
+            "reading_age_s": _reading_age(pool_id, s, now) if pool_id in POOLS else _reading_age_seat("google", s, now)}
+
+
+def _reading_age_seat(seat, s, now):
+    as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
+    stamp = as_of.get(seat)
+    if not stamp:
+        return None
+    return now - stamp
+
+
+def _review_row(spec, metrics, s, now, states, pool_id):
+    if pool_id in POOLS:
+        effort, mode, reason = _voter_effort(pool_id, s, now, states)
+        age = _reading_age(pool_id, s, now)
+    else:
+        effort, mode = ("low", "suggest") if metrics["pace"] == "ahead" else ("high", "default")
+        reason = f"voter effort {effort}"
+        age = metrics.get("reading_age_s")
+    row = {"role": "voter", "seat": spec["seat"], "family": spec["family"], "vendor": spec["vendor"],
+           "model": spec["model"], "effort": effort, "variant": "-", "mode": mode, "reason": reason,
+           "reading_age_s": age, "pace": metrics["pace"], "headroom": metrics["headroom"],
+           "used_pct": metrics["used_pct"], "pool": metrics.get("pool")}
+    if spec.get("contributor_mode"):
+        row["contributor_mode"] = spec["contributor_mode"]
+    if spec["family"] == "fable" and spec["seat"] != "claude":
+        row["seat"] = spec["seat"]
+    return row
+
+
+def _review_fable_spec(seat):
+    spec = dict(REVIEW_ROSTER[0])
+    spec["seat"] = seat
+    return spec
+
+
+def _review_candidates(states, s, now, excluded_vendor):
+    """Eligible review seats, and every seat that was not eligible.
+
+    An unknown reading (including one older than route_fresh_s) and a capped
+    seat are skipped. They do not ask by themselves. The builder's vendor is
+    skipped. Spark and contributor models are skipped. Fable uses the same
+    frontier as the design voter: the Claude slice, or Cursor Other Models
+    when that path is the one with room.
+    """
+    eligible, skipped = [], []
+    for index, spec in enumerate(REVIEW_ROSTER):
+        if _review_model_barred(spec.get("model")):
+            skipped.append(_review_skip(spec, "spark and contributor models are excluded"))
+            continue
+        if excluded_vendor and spec["vendor"] == excluded_vendor:
+            skipped.append(_review_skip(spec, f"shares builder vendor {excluded_vendor}"))
+            continue
+        pick = spec["pick"]
+        if pick == "fable":
+            status, payload = _fable_voter(states, s, now, False)
+            if status == "ask":
+                skipped.append(_review_skip(spec, payload))
+                continue
+            if status == "downgrade":
+                skipped.append(_review_skip(spec, payload.get("reason") or "no frontier pool with room"))
+                continue
+            if status != "row":
+                skipped.append(_review_skip(spec, "Fable unavailable"))
+                continue
+            seat = payload.get("seat") or "claude"
+            pool_id = "cursor_other" if seat == "cursor" else "fable"
+            pace = states[pool_id][0]
+            if pace in ("unknown", "capped"):
+                why = states[pool_id][1]
+                label = "Fable" if pool_id == "fable" else POOLS[pool_id]["label"]
+                skipped.append(_review_skip(spec, _unknown_text(label, why) if pace == "unknown" else f"{label} capped"))
+                continue
+            used = s.get(POOLS[pool_id]["used"])
+            metrics = _review_metrics(pool_id, pace, used, states, s, now)
+            seated = _review_fable_spec(seat)
+            row = _review_row(seated, metrics, s, now, states, pool_id)
+            row["effort"] = payload.get("effort") or row["effort"]
+            row["mode"] = payload.get("mode") or row["mode"]
+            row["reason"] = payload.get("reason") or row["reason"]
+            row["_index"] = index
+            eligible.append(row)
+            continue
+        if pick == "argon":
+            pace, why, used = _argon_reading(s, now)
+            if pace == "unknown":
+                skipped.append(_review_skip(spec, _unknown_text("Argon weekly", why)))
+                continue
+            if pace == "capped":
+                skipped.append(_review_skip(spec, "Argon weekly capped"))
+                continue
+            metrics = _review_metrics("google_argon_week", pace, used, states, s, now)
+            metrics["reading_age_s"] = _reading_age_seat("google", s, now)
+            row = _review_row(spec, metrics, s, now, states, "google_argon_week")
+            row["reading_age_s"] = metrics["reading_age_s"]
+            row["_index"] = index
+            eligible.append(row)
+            continue
+        if pick == "muse":
+            watched = ("muse_5h", "muse_week")
+            unknown = next((pid for pid in watched if states[pid][0] == "unknown"), None)
+            if unknown:
+                skipped.append(_review_skip(spec, _unknown_text(_ask_label(unknown), states[unknown][1])))
+                continue
+            capped = next((pid for pid in watched if states[pid][0] == "capped"), None)
+            if capped:
+                skipped.append(_review_skip(spec, f"{_ask_label(capped)} capped"))
+                continue
+            pool_id = "muse_week"
+        else:
+            pool_id = spec["pool"]
+            pace, why = states[pool_id]
+            if pace == "unknown":
+                skipped.append(_review_skip(spec, _unknown_text(_FAMILY_NAME.get(spec["family"], spec["family"]), why)))
+                continue
+            if pace == "capped":
+                label = POOLS[pool_id]["label"]
+                extra = f", {why}" if isinstance(why, str) and why.startswith("resets ") else ""
+                skipped.append(_review_skip(spec, f"{label} capped{extra}"))
+                continue
+        pace = states[pool_id][0]
+        used = s.get(POOLS[pool_id]["used"])
+        metrics = _review_metrics(pool_id, pace, used, states, s, now)
+        row = _review_row(spec, metrics, s, now, states, pool_id)
+        row["_index"] = index
+        eligible.append(row)
+    return eligible, skipped
+
+
+def _review_rank_key(row):
+    used = row.get("used_pct")
+    if not _is_number(used):
+        used = 101
+    return (_PACE_ORDER.get(row.get("pace"), 9), used, row.get("_index", 99))
+
+
+def _review_why(chosen):
+    parts = []
+    for row in chosen:
+        used = row.get("used_pct")
+        used_s = "-" if used is None else _fmt_pct(used)
+        parts.append(f"{row['family']} pace {row.get('pace')} headroom {row.get('headroom'):.2f} used {used_s}")
+    if not parts:
+        return "no eligible review seat"
+    return "ranked by pace then headroom: " + "; ".join(parts)
+
+
+def _pick_review_seats(states, s, now, excluded_vendor, need):
+    """The best `need` seats on distinct vendors. Ask when fewer are eligible.
+
+    Rank is the design pace order (under, open, on, ahead, then near_cap),
+    then lower used percent, then roster order. That is the same pace and
+    headroom table the scorer uses. A seat that loses the rank is listed as
+    skipped with that reason. The pick log is not read here.
+    """
+    eligible, skipped = _review_candidates(states, s, now, excluded_vendor)
+    ranked = sorted(eligible, key=_review_rank_key)
+    chosen = []
+    seen = set()
+    for row in ranked:
+        if len(chosen) >= need:
+            skipped.append(_review_skip(row, "lower pace and headroom rank"))
+            continue
+        if row["vendor"] in seen:
+            skipped.append(_review_skip(row, f"vendor {row['vendor']} already seated"))
+            continue
+        chosen.append(row)
+        seen.add(row["vendor"])
+    for row in chosen:
+        row.pop("_index", None)
+    if len(chosen) < need:
+        shown = _VENDOR_NAME.get(excluded_vendor, excluded_vendor or "unknown")
+        reason = (f"need {need} review seat(s) outside {shown}; {len(chosen)} eligible: {_ASK}")
+        return "ask", reason, chosen, skipped
+    return "ok", _review_why(chosen), chosen, skipped
+
+
+def _collect_review_voters(states, s, now, excluded_vendor):
+    status, why, chosen, skipped = _pick_review_seats(states, s, now, excluded_vendor, 2)
+    if status == "ask":
+        return "ask", (why, skipped)
+    return "ok", (chosen, skipped, why)
+
+
+def route_review(s, now, builder_vendor):
+    """One merge-gate reviewer whose vendor is not the builder's.
+
+    Unknown and capped seats are skipped. Ask only when none remain.
+    """
+    states = {pid: pool_status(pid, s, now) for pid in POOLS}
+    vendor = _normalize_vendor(builder_vendor)
+    if vendor is None:
+        asked = _lineup_ask(s, now, states, f"builder vendor {builder_vendor} is unknown: {_ASK}", [])
+        asked["role"] = "review"
+        asked["why"] = asked["reason"]
+        asked["builder_vendor"] = None
+        asked["reviewers"] = []
+        asked["skipped"] = []
+        return asked
+    status, why, chosen, skipped = _pick_review_seats(states, s, now, vendor, 1)
+    ages = [row.get("reading_age_s") for row in chosen]
+    ages.extend(row.get("reading_age_s") for row in skipped if isinstance(row.get("reading_age_s"), (int, float)))
+    known = [age for age in ages if isinstance(age, (int, float)) and not isinstance(age, bool)]
+    seated = max(known) if known else _snapshot_age(s, now)
+    if status == "ask":
+        row = {"role": "review", "mode": "ask", "reason": why, "why": why,
+               "builder_vendor": vendor, "reviewers": [], "skipped": skipped,
+               "reading_age_s": seated, "usage": _usage_snapshot(states, s),
+               "usage_age_s": _snapshot_age(s, now)}
+        return row
+    mode = chosen[0].get("mode") or "default"
+    return {"role": "review", "mode": mode, "reason": why, "why": why,
+            "builder_vendor": vendor, "reviewers": chosen, "skipped": skipped,
+            "reading_age_s": seated, "usage": _usage_snapshot(states, s),
+            "usage_age_s": _snapshot_age(s, now)}
+
+
+def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=None):
     """One lineup, or ask.
 
     With no kind, chair and builder come from one vendor and that vendor does
@@ -2705,9 +3013,15 @@ def route_lineup(s, now, builder=None, kind=None, author=None):
     both are over pace, or when both are capped. That is the pre-launch call.
 
     With a kind, the chair is routed on its own and may differ from the builder.
-    Design excludes nobody. Review and mixed exclude the author, defaulting to
-    the builder. Audit excludes the author when one is named. Fable is required
-    when the excluded vendor is xAI.
+    Design excludes nobody. Mixed excludes the author, defaulting to the
+    builder. Audit excludes the author when one is named. Fable is required
+    when the excluded vendor is xAI, except on kind review.
+
+    Kind review seats exactly two voters from REVIEW_ROSTER, on two vendors,
+    neither of them the builder's. `--builder-vendor` wins over `--author`
+    and over the resolved builder. An unknown or capped seat is skipped.
+    The lineup asks only when fewer than two eligible seats remain. Design,
+    mixed, audit, and a lineup with no kind do not use that roster.
 
     A builder family the caller already used is kept when that pool can take it,
     and dropped when the pool is capped. With a kind, an ahead pool can still
@@ -2751,19 +3065,61 @@ def route_lineup(s, now, builder=None, kind=None, author=None):
         excluded_vendor = chair_row["vendor"]
         excl = None
     else:
-        excl = _lineup_exclusion(kind, author, builder_row)
-        if excl.get("ask"):
-            return _lineup_ask(s, now, states, excl["ask"], [])
-        excluded_vendor = excl["vendor"]
+        if kind == "review" and builder_vendor is not None and str(builder_vendor).strip():
+            forced = _normalize_vendor(builder_vendor)
+            if forced is None:
+                asked = _lineup_ask(s, now, states,
+                                    f"builder vendor {builder_vendor} is unknown: {_ASK}", [])
+                asked["kind"] = "review"
+                asked["builder_vendor"] = None
+                asked["skipped"] = []
+                asked["why"] = asked["reason"]
+                return asked
+            # --builder-vendor wins. An author family that is not in the config
+            # does not ask when this flag names a real vendor.
+            if isinstance(author, str) and author not in FAMILY_VENDOR:
+                excl = {"vendor": forced, "name": _VENDOR_NAME.get(forced, forced),
+                        "family": None, "why": f"builder vendor {forced}", "author": author}
+            else:
+                excl = _lineup_exclusion(kind, author, builder_row)
+                if excl.get("ask"):
+                    return _lineup_ask(s, now, states, excl["ask"], [])
+                if excl.get("vendor") != forced:
+                    excl["why"] = f"builder vendor {forced}"
+                    excl["name"] = _VENDOR_NAME.get(forced, forced)
+                    if FAMILY_VENDOR.get(excl.get("family")) != forced:
+                        excl["family"] = None
+                excl["vendor"] = forced
+            excluded_vendor = forced
+        else:
+            excl = _lineup_exclusion(kind, author, builder_row)
+            if excl.get("ask"):
+                return _lineup_ask(s, now, states, excl["ask"], [])
+            excluded_vendor = excl["vendor"]
 
-    status, payload = _collect_voters(states, s, now, excluded_vendor)
-    if status == "ask":
-        return _lineup_ask(s, now, states, payload, [])
-    downgrade = None
-    if status == "downgrade":
-        voters, downgrade = payload
+    review_why = None
+    review_skipped = None
+    if kind == "review":
+        status, payload = _collect_review_voters(states, s, now, excluded_vendor)
+        if status == "ask":
+            why, review_skipped = payload
+            asked = _lineup_ask(s, now, states, why, [])
+            asked["kind"] = "review"
+            asked["builder_vendor"] = excluded_vendor
+            asked["skipped"] = review_skipped
+            asked["why"] = why
+            return asked
+        voters, review_skipped, review_why = payload
+        downgrade = None
     else:
-        voters = payload
+        status, payload = _collect_voters(states, s, now, excluded_vendor)
+        if status == "ask":
+            return _lineup_ask(s, now, states, payload, [])
+        downgrade = None
+        if status == "downgrade":
+            voters, downgrade = payload
+        else:
+            voters = payload
     if kind is None:
         rule = _rule_text(chair_row, builder_row, voters)
     else:
@@ -2774,6 +3130,10 @@ def route_lineup(s, now, builder=None, kind=None, author=None):
         row["author"] = excl["author"]
         row["excluded"] = {"vendor": excl["vendor"], "name": excl["name"],
                            "family": excl["family"], "why": excl["why"]}
+    if kind == "review":
+        row["builder_vendor"] = excluded_vendor
+        row["skipped"] = review_skipped or []
+        row["why"] = review_why
     if downgrade:
         row["downgrade"] = downgrade
     return row
@@ -3005,19 +3365,40 @@ def format_ask(row):
     return "\n".join(lines)
 
 
+def _fmt_headroom(value):
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def _skip_line(skip):
+    return f"  skipped: {skip.get('family') or '-'} | {skip.get('reason') or ''}"
+
+
 def format_lineup(row):
     age = row.get("reading_age_s")
     shown = "unknown" if age is None else f"{int(age // 60)}m"
     if row.get("mode") == "ask" or not row.get("lineup"):
-        return (f"route: lineup | - | - | - | - | ask | {row.get('reason')} | reading {shown}")
+        lines = [f"route: lineup | - | - | - | - | ask | {row.get('reason')} | reading {shown}"]
+        for skip in row.get("skipped") or []:
+            lines.append(_skip_line(skip))
+        return "\n".join(lines)
     lines = [f"route: lineup | {row['mode']} | {row.get('rule')} | reading {shown}"]
     for key in ("chair", "builder"):
         party = row["lineup"][key]
         lines.append(f"  {key}: {party['seat']} | {party['family']} | {party['effort']} | "
                      f"{party['variant']} | {party['vendor']}")
     for voter in row["lineup"]["voters"]:
-        lines.append(f"  voter: {voter['seat']} | {voter['family']} | {voter['effort']} | "
-                     f"{voter['variant']} | {voter['vendor']}")
+        line = (f"  voter: {voter['seat']} | {voter['family']} | {voter['effort']} | "
+                f"{voter['variant']} | {voter['vendor']}")
+        if "pace" in voter and "headroom" in voter:
+            used = voter.get("used_pct")
+            used_s = "-" if used is None else _fmt_pct(used)
+            line += f" | pace {voter['pace']} | headroom {_fmt_headroom(voter['headroom'])} | used {used_s}"
+        lines.append(line)
+    for skip in row.get("skipped") or []:
+        lines.append(_skip_line(skip))
     excl = row.get("excluded")
     if isinstance(excl, dict):
         if excl.get("vendor"):
@@ -3028,6 +3409,25 @@ def format_lineup(row):
     down = row.get("downgrade")
     if isinstance(down, dict) and down.get("reason"):
         lines.append(f"  downgrade: {down.get('family') or '-'} | {down['reason']}")
+    return "\n".join(lines)
+
+
+def format_review(row):
+    age = row.get("reading_age_s")
+    shown = "unknown" if age is None else f"{int(age // 60)}m"
+    if row.get("mode") == "ask" or not row.get("reviewers"):
+        lines = [f"route: review | - | - | - | - | ask | {row.get('reason')} | reading {shown}"]
+    else:
+        lines = [f"route: review | {row.get('mode')} | {row.get('reason')} | reading {shown}"]
+        for rev in row["reviewers"]:
+            used = rev.get("used_pct")
+            used_s = "-" if used is None else _fmt_pct(used)
+            lines.append(
+                f"  reviewer: {rev.get('seat')} | {rev.get('family')} | {rev.get('model')} | "
+                f"{rev.get('effort')} | {rev.get('vendor')} | pace {rev.get('pace')} | "
+                f"headroom {_fmt_headroom(rev.get('headroom'))} | used {used_s}")
+    for skip in row.get("skipped") or []:
+        lines.append(_skip_line(skip))
     return "\n".join(lines)
 
 
@@ -3065,13 +3465,14 @@ def cmd_route():
     if role == "voter":
         print("voters do not route", file=sys.stderr)
         raise SystemExit(2)
-    known = list(ROLES) + ["lineup", "host", "ask"]
+    known = list(ROLES) + ["lineup", "host", "ask", "review"]
     if role is not None and role not in known:
         print(f"unknown role {role}; roles: {', '.join(known)}", file=sys.stderr)
         raise SystemExit(2)
     builder = None
     kind = None
     author = None
+    builder_vendor = None
     if "--kind" in argv or "--author" in argv:
         if role != "lineup":
             print("--kind and --author apply to lineup", file=sys.stderr)
@@ -3086,6 +3487,23 @@ def cmd_route():
                 print("--author needs --kind", file=sys.stderr)
                 raise SystemExit(2)
             author = _opt(argv, "--author").strip().lower()
+    if "--builder-vendor" in argv:
+        builder_vendor = _opt(argv, "--builder-vendor")
+        if role == "review" or (role == "lineup" and kind == "review"):
+            if _normalize_vendor(builder_vendor) is None:
+                print(f"unknown builder vendor {builder_vendor}; vendors: {_review_vendors_text()}",
+                      file=sys.stderr)
+                raise SystemExit(2)
+        else:
+            print("--builder-vendor applies to --route review and --route lineup --kind review",
+                  file=sys.stderr)
+            raise SystemExit(2)
+    if role == "review" and builder_vendor is None:
+        print("--route review needs --builder-vendor", file=sys.stderr)
+        raise SystemExit(2)
+    repo = _opt(argv, "--repo") if "--repo" in argv else None
+    pr = _opt(argv, "--pr") if "--pr" in argv else None
+    ballot = _opt(argv, "--ballot") if "--ballot" in argv else None
     if role == "lineup" and "--builder-family" in argv:
         # Family only. Seat and effort are resolved once the summary is loaded.
         builder = {"role": "builder", "family": _opt(argv, "--builder-family")}
@@ -3096,7 +3514,7 @@ def cmd_route():
             ts = summary.get("ts") or 0
             age = f"{round((time.time() - ts) / 60)}m ago" if ts else "age unknown"
             print(f"[seat-usage] pull-only cached {age}", file=sys.stderr)
-    elif role == "lineup":
+    elif role == "lineup" or role == "review":
         summary = refresh(list(LINEUP_SEATS))
     elif role == "host":
         summary = refresh(list(HOST_SEATS))
@@ -3112,7 +3530,10 @@ def cmd_route():
         summary = refresh(seats)
     now = time.time()
     if role == "lineup":
-        rows = [route_lineup(summary, now, builder=builder, kind=kind, author=author)]
+        rows = [route_lineup(summary, now, builder=builder, kind=kind, author=author,
+                             builder_vendor=builder_vendor)]
+    elif role == "review":
+        rows = [route_review(summary, now, builder_vendor)]
     elif role == "host":
         rows = [route_host(summary, now)]
     elif role == "ask":
@@ -3123,6 +3544,8 @@ def cmd_route():
     # A cached poll must not append the ask log, the usage history, or the cache.
     if not cached:
         log_asks(rows, summary, now)
+    for row in rows:
+        _log_review_pick(row, repo, pr, ballot)
     if as_json:
         json.dump(rows, sys.stdout)
         sys.stdout.write("\n")
@@ -3130,6 +3553,8 @@ def cmd_route():
         for row in rows:
             if row.get("role") == "lineup":
                 print(format_lineup(row))
+            elif row.get("role") == "review":
+                print(format_review(row))
             elif row.get("role") == "host":
                 print(format_host(row))
             elif row.get("role") == "ask":
@@ -4396,8 +4821,269 @@ def cmd_draw():
         print(f"{pool:22} {kind or '-':7} {len(xs):>3} {med:>7.2f} {xs[-1]:>6.2f}")
     print("upper bounds: other sessions share these pools")
 
+def review_log_path():
+    """Where review picks are appended. Routing never reads this file."""
+    override = os.environ.get("SEAT_USAGE_REVIEW_LOG")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".local", "state", "seat-usage", "review-picks.jsonl")
+
+
+def _reviewer_log(row):
+    return {"seat": row.get("seat"), "family": row.get("family"), "model": row.get("model"),
+            "vendor": row.get("vendor"), "pace": row.get("pace"), "headroom": row.get("headroom"),
+            "used_pct": row.get("used_pct"), "effort": row.get("effort")}
+
+
+def _log_review_pick(row, repo, pr, ballot):
+    """Append one JSONL line for a settled review pick. Asks are not picks.
+
+    Nothing in the scorer reads this file. A write failure is silent.
+    """
+    if not isinstance(row, dict) or row.get("mode") == "ask":
+        return
+    if row.get("role") == "review":
+        reviewers = row.get("reviewers") or []
+        route = "review"
+        builder = row.get("builder_vendor")
+        why = row.get("why") or row.get("reason")
+    elif row.get("role") == "lineup" and row.get("kind") == "review":
+        reviewers = (row.get("lineup") or {}).get("voters") or []
+        route = "lineup"
+        builder = row.get("builder_vendor") or (row.get("excluded") or {}).get("vendor")
+        why = row.get("why") or row.get("reason")
+    else:
+        return
+    if not reviewers:
+        return
+    ts = time.time()
+    record = {"ts": ts, "id": f"{ts:.6f}", "repo": repo, "pr": pr, "ballot": ballot,
+              "builder_vendor": builder, "route": route,
+              "reviewers": [_reviewer_log(v) for v in reviewers],
+              "why": why, "findings": []}
+    path = review_log_path()
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+
+def _read_review_log(path):
+    rows = []
+    try:
+        handle = open(path)
+    except FileNotFoundError:
+        return rows
+    except Exception:
+        return rows
+    try:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(item, dict):
+                rows.append(item)
+    finally:
+        handle.close()
+    return rows
+
+
+def _write_review_log(path, rows):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        for row in rows:
+            handle.write(json.dumps(row) + "\n")
+    os.replace(tmp, path)
+
+
+def _pick_index(rows, pick):
+    if not rows:
+        return None
+    if pick == "latest":
+        return len(rows) - 1
+    for index, row in enumerate(rows):
+        if str(row.get("id")) == pick or str(row.get("ts")) == pick:
+            return index
+    return None
+
+
+def _parse_findings(text, reviewer):
+    found = []
+    for line in (text or "").splitlines():
+        raw = line.strip()
+        if not raw or raw.upper().startswith("VERDICT:"):
+            continue
+        if raw.lower() in ("no findings.", "no findings"):
+            continue
+        numbered = re.match(r"^(?:\d+[\.\)])\s*(?:P[0-3]\b[:\s-]*)?(.*)$", raw, re.I)
+        level = re.match(r"^(P[0-3])\b[:\s-]*(.*)$", raw, re.I)
+        if numbered and numbered.group(1).strip():
+            found.append(numbered.group(1).strip())
+        elif level and (level.group(2).strip() or level.group(1)):
+            found.append((level.group(2) or level.group(1)).strip())
+        elif found:
+            found[-1] = found[-1] + "\n" + raw
+    if not found:
+        body = "\n".join(line for line in (text or "").splitlines()
+                         if line.strip() and not line.strip().upper().startswith("VERDICT:")
+                         and line.strip().lower() not in ("no findings.", "no findings")).strip()
+        if body:
+            found.append(body)
+    return [{"id": f"f{i}", "reviewer": reviewer, "text": body, "grade": ""}
+            for i, body in enumerate(found, 1)]
+
+
+_GRADE_REDACTIONS = (
+    "gpt-6-astra", "gemini-4-argon-high", "gemini-4-argon-medium", "gemini-4-argon-low",
+    "gemini-4-argon", "wonder-full", "claude-fable", "supergrok", "antigravity",
+    "anthropic", "openai", "chatgpt", "google", "cursor", "claude", "fable", "astra",
+    "argon", "gemini", "grok", "opus", "muse", "wonder", "codex", "meta", "xai", "agy",
+    "spark", "contributor",
+)
+
+
+def _redact_grade(text):
+    out = text or ""
+    for token in sorted(_GRADE_REDACTIONS, key=len, reverse=True):
+        out = re.sub(rf"(?i)(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])", "[redacted]", out)
+    return out
+
+
+def _grade_letters(findings):
+    labels = {}
+    n = 0
+    for item in findings:
+        key = item.get("reviewer") or ""
+        if key not in labels:
+            labels[key] = f"Reviewer {chr(ord('A') + n)}"
+            n += 1
+    return labels
+
+
+def _print_grade(row):
+    """Sanitized findings. Model, vendor, and seat names are not printed."""
+    findings = row.get("findings") or []
+    labels = _grade_letters(findings)
+    print(f"pick {row.get('id') or ''}")
+    current = None
+    if not findings:
+        print("(no findings)")
+        return
+    for item in findings:
+        label = labels.get(item.get("reviewer") or "", "Reviewer A")
+        if label != current:
+            print(label)
+            current = label
+        print(f"  {item.get('id')}: {_redact_grade(item.get('text') or '')}")
+
+
+def cmd_attach_findings():
+    argv = sys.argv[1:]
+    pick = _opt(argv, "--pick") if "--pick" in argv else "latest"
+    reviewer = _opt(argv, "--reviewer") if "--reviewer" in argv else None
+    path = _opt(argv, "--file") if "--file" in argv else None
+    if not reviewer or not path:
+        print("--review-findings needs --reviewer and --file", file=sys.stderr)
+        raise SystemExit(2)
+    try:
+        with open(path) as handle:
+            text = handle.read()
+    except Exception as exc:
+        print(f"cannot read findings: {exc.__class__.__name__}", file=sys.stderr)
+        raise SystemExit(2)
+    log_path = review_log_path()
+    rows = _read_review_log(log_path)
+    index = _pick_index(rows, pick)
+    if index is None:
+        print("no review pick", file=sys.stderr)
+        raise SystemExit(2)
+    fresh = _parse_findings(text, reviewer)
+    existing = rows[index].get("findings") or []
+    if not isinstance(existing, list):
+        existing = []
+    # Keep findings already attached for other reviewers. Replace this reviewer's.
+    kept = [item for item in existing if isinstance(item, dict) and item.get("reviewer") != reviewer]
+    used = {item.get("id") for item in kept if isinstance(item, dict)}
+    n = 1
+    for item in fresh:
+        while f"f{n}" in used:
+            n += 1
+        item["id"] = f"f{n}"
+        used.add(item["id"])
+        n += 1
+    rows[index]["findings"] = kept + fresh
+    try:
+        _write_review_log(log_path, rows)
+    except Exception as exc:
+        print(f"cannot write review log: {exc.__class__.__name__}", file=sys.stderr)
+        raise SystemExit(2)
+    print(f"attached {len(fresh)}")
+
+
+def cmd_grade_findings():
+    argv = sys.argv[1:]
+    pick = _opt(argv, "--pick") if "--pick" in argv else "latest"
+    grades = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--grade":
+            if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                print("--grade needs id=real or id=false", file=sys.stderr)
+                raise SystemExit(2)
+            grades.append(argv[i + 1])
+            i += 2
+            continue
+        i += 1
+    log_path = review_log_path()
+    rows = _read_review_log(log_path)
+    index = _pick_index(rows, pick)
+    if index is None:
+        print("no review pick", file=sys.stderr)
+        raise SystemExit(2)
+    parsed = []
+    for item in grades:
+        if "=" not in item:
+            print("--grade needs id=real or id=false", file=sys.stderr)
+            raise SystemExit(2)
+        fid, grade = item.split("=", 1)
+        grade = grade.strip().lower()
+        if grade not in ("real", "false"):
+            print("--grade needs id=real or id=false", file=sys.stderr)
+            raise SystemExit(2)
+        parsed.append((fid.strip(), grade))
+    if parsed:
+        known = {item.get("id") for item in rows[index].get("findings") or [] if isinstance(item, dict)}
+        for fid, _grade in parsed:
+            if fid not in known:
+                print(f"unknown finding {fid}", file=sys.stderr)
+                raise SystemExit(2)
+        wanted = dict(parsed)
+        for item in rows[index]["findings"]:
+            if isinstance(item, dict) and item.get("id") in wanted:
+                item["grade"] = wanted[item["id"]]
+        try:
+            _write_review_log(log_path, rows)
+        except Exception as exc:
+            print(f"cannot write review log: {exc.__class__.__name__}", file=sys.stderr)
+            raise SystemExit(2)
+    _print_grade(rows[index])
+    if parsed:
+        print("recorded " + " ".join(f"{fid}={grade}" for fid, grade in parsed))
+
+
 def main():
     maybe_self_update()
+    if "--grade-findings" in sys.argv:
+        return cmd_grade_findings()
+    if "--review-findings" in sys.argv:
+        return cmd_attach_findings()
     if "--draw" in sys.argv:
         return cmd_draw()
     if "--route" in sys.argv:
