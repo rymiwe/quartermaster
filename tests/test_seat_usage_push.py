@@ -201,6 +201,39 @@ def cache_copy_drops_wrong_types():
     assert sp.build_cache_copy("not a dict") == {"as_of": {}, "v": 1}
 
 
+@test
+def cache_copy_round_trips_read_state_and_drops_anything_else():
+    until = NOW + 540
+    raw = google_cache(
+        read_state={"claude": "rate_limited", "chatgpt": "usage_failed", "session": "fresh",
+                    "claude_plan": "max_5x"},
+        rate_limited_until={"claude": until, "chatgpt": until, "session": until},
+    )
+    # A free-text reason and a non-enum value never survive. chatgpt is usage_failed,
+    # so its epoch is not a rate-limit deadline and is dropped too.
+    raw["read_state"]["grok"] = "HTTPError 429 fixture-token"
+    copy = sp.build_cache_copy(raw)
+    assert copy["read_state"] == {"claude": "rate_limited", "chatgpt": "usage_failed"}, copy.get("read_state")
+    assert copy["rate_limited_until"] == {"claude": until}, copy.get("rate_limited_until")
+    blob = json.dumps(copy)
+    assert "fixture-token" not in blob and "max_5x" not in blob and "HTTPError" not in blob, blob
+    # Pull filters again, so a hand-edited gist cannot widen the enum.
+    import tempfile
+    saved = (sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_get)
+    with tempfile.TemporaryDirectory() as t:
+        try:
+            _with_paths(t)
+            sp.write_json(sp.CONFIG, {"id": "abc123"})
+            sp.gh_get = lambda path: {"files": {sp.CACHE_FILE: {"content": json.dumps(raw)}}}
+            assert sp.pull() == 0
+            landed = json.load(open(sp.CACHE))
+            assert landed["read_state"] == copy["read_state"], landed.get("read_state")
+            assert landed["rate_limited_until"] == {"claude": until}, landed.get("rate_limited_until")
+            assert "fixture-token" not in json.dumps(landed)
+        finally:
+            sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_get = saved
+
+
 def _with_paths(t):
     sp.CACHE, sp.MUSE_FILE = f"{t}/c/latest.json", f"{t}/q/muse-usage.json"
     sp.CONFIG, sp.STATE = f"{t}/gist.json", f"{t}/push.json"

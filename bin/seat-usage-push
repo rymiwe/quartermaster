@@ -18,9 +18,11 @@ A systemd --user timer runs it every 5 minutes (systemd/ in quartermaster).
 The widget is quartermaster's android/ and reads the gist through api.github.com.
 
 The same gist also carries CACHE_FILE, a copy of latest.json cut to
-CACHE_NUMBERS (numbers only), CACHE_FLAGS (true/false only) and as_of stamps
-for known seats. No string from the cache is copied: no plan, status, lines,
-errors, cookie flag or burn text. One machine (BLD) does every reading and
+CACHE_NUMBERS (numbers only), CACHE_FLAGS (true/false only), as_of stamps
+for known seats, and read_state (a fixed per-seat code: fresh, token_expired,
+rate_limited, usage_failed) plus rate_limited_until (an epoch, only for
+rate_limited). No other string is copied: no plan, status, lines, errors,
+cookie flag, or burn text. One machine (BLD) does every reading and
 pushes; a reader (the shared VM) runs --pull and draws meters from that copy
 without any vendor login. --pull filters again, so a gist edited by hand
 still cannot put a string into the reader's cache. It also writes Muse's
@@ -100,6 +102,8 @@ CACHE_NUMBERS = frozenset([
 CACHE_FLAGS = frozenset(["bot_exhausted", "grok_exhausted", "claude_renews", "codex_renews",
                          "cursor_renews", "grok_renews", "claude_max"])
 AS_OF_SEATS = frozenset(["claude", "chatgpt", "cursor", "grokbot", "grok", "muse", "google"])
+# The only strings that may leave the machine. Anything else is dropped.
+READ_STATES = frozenset(("fresh", "token_expired", "rate_limited", "usage_failed"))
 
 
 def _finite(v):
@@ -108,12 +112,25 @@ def _finite(v):
 
 
 def build_cache_copy(cache):
-    """latest.json cut to the allowlist. Pure. Strings never survive."""
+    """latest.json cut to the allowlist. Pure.
+
+    Strings do not survive, except read_state's fixed codes. A backoff epoch
+    is a number and only travels with rate_limited.
+    """
     cache = cache if isinstance(cache, dict) else {}
     out = {k: cache[k] for k in CACHE_NUMBERS if _finite(cache.get(k))}
     out.update({k: cache[k] for k in CACHE_FLAGS if isinstance(cache.get(k), bool)})
     as_of = cache.get("as_of") if isinstance(cache.get("as_of"), dict) else {}
     out["as_of"] = {k: v for k, v in as_of.items() if k in AS_OF_SEATS and _finite(v)}
+    raw_state = cache.get("read_state") if isinstance(cache.get("read_state"), dict) else {}
+    state = {k: v for k, v in raw_state.items() if k in AS_OF_SEATS and v in READ_STATES}
+    if state:
+        out["read_state"] = state
+    raw_until = cache.get("rate_limited_until") if isinstance(cache.get("rate_limited_until"), dict) else {}
+    until = {k: v for k, v in raw_until.items()
+             if k in state and state[k] == "rate_limited" and _finite(v)}
+    if until:
+        out["rate_limited_until"] = until
     out["v"] = 1
     return out
 
