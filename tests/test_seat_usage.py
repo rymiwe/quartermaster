@@ -588,6 +588,52 @@ def f6_older_fresh_as_of_keeps_base():
 
 
 @test
+def failed_reread_keeps_numbers_and_takes_the_new_read_state():
+    until = NOW + 600
+    base = {
+        "v": 1, "ts": NOW - 50,
+        "as_of": {"claude": NOW - 20},
+        "claude_week": 12, "claude_week_reset_ts": NOW + 3 * 86400,
+        "read_state": {"claude": "fresh"},
+        "lines": ["claude   | old claude"],
+    }
+    # No as_of: the numbers stay, and the failure code still replaces fresh.
+    expired = {
+        "ts": NOW, "as_of": {},
+        "read_state": {"claude": "token_expired"},
+        "lines": ["claude   | token expired 1.0h ago; run `claude` once to refresh"],
+    }
+    merged = su.merge_summary(base, expired, ["claude"], now=NOW)
+    assert merged["claude_week"] == 12, merged
+    assert "claude" not in merged["as_of"], merged["as_of"]
+    assert merged["read_state"] == {"claude": "token_expired"}, merged.get("read_state")
+    assert "rate_limited_until" not in merged
+    # Older stamp than the cache (kept_base): numbers stay, a failure code still wins.
+    limited = {
+        "ts": NOW, "as_of": {"claude": NOW - 100},
+        "claude_week": 99,
+        "read_state": {"claude": "rate_limited"},
+        "rate_limited_until": {"claude": until},
+        "lines": ["claude   | old numbers"],
+    }
+    held = su.merge_summary(base, limited, ["claude"], now=NOW)
+    assert held["claude_week"] == 12 and held["as_of"]["claude"] == NOW - 20, held
+    assert held["read_state"] == {"claude": "rate_limited"}, held.get("read_state")
+    assert held["rate_limited_until"] == {"claude": until}, held.get("rate_limited_until")
+    # An older successful read does not wipe a newer failure code.
+    newer = dict(base, read_state={"claude": "usage_failed"})
+    older_ok = {
+        "ts": NOW, "as_of": {"claude": NOW - 100},
+        "claude_week": 99,
+        "read_state": {"claude": "fresh"},
+        "lines": ["claude   | stale success"],
+    }
+    kept = su.merge_summary(newer, older_ok, ["claude"], now=NOW)
+    assert kept["claude_week"] == 12 and kept["as_of"]["claude"] == NOW - 20, kept
+    assert kept["read_state"] == {"claude": "usage_failed"}, kept.get("read_state")
+
+
+@test
 def f7_failed_grok_reread_ors_exhausted():
     base = {
         "v": 1,
@@ -888,6 +934,11 @@ class _AnthropicHandler(BaseHTTPRequestHandler):
             elif mode == "bare429":
                 # 429 with the rate_limit_error body and no Retry-After.
                 self._send(429, {"Content-Type": "application/json"}, _RATE_BODY)
+            elif mode == "zero429":
+                # The live usage endpoint sends Retry-After: 0. That is not a wait.
+                self._send(429, {"Retry-After": "0", "Content-Type": "application/json"}, _RATE_BODY)
+            elif mode == "error":
+                self._send(500, {"Content-Type": "application/json"}, b"{}")
             elif mode == "denied":
                 self._send(401, {"Content-Type": "application/json"}, _EXPIRED_BODY)
             else:
@@ -1117,6 +1168,8 @@ def retry_after_countdown_is_one_deadline():
     assert su._retry_after_deadline(None, t0) is None
     assert su._retry_after_deadline("token has expired", t0) is None
     assert su._retry_after_deadline("-5", t0) is None
+    assert su._retry_after_deadline("0", t0) is None
+    assert su._retry_after_deadline("0.0", t0) is None
 
 
 @test
@@ -1132,6 +1185,7 @@ def usage_429_keeps_as_of_until_retry_after():
             assert server.retry_sent == ["1705"], server.retry_sent
             assert "claude" not in missed["as_of"], missed["as_of"]
             assert any("usage failed: HTTPError" in ln for ln in missed["lines"]), missed["lines"]
+            assert missed["read_state"]["claude"] == "rate_limited", missed.get("read_state")
             stored = json.load(open(su._rate_limit_path()))
             assert stored[f"{usage}#429s"] == 1, stored
             delta = stored[usage] - t0
@@ -1151,6 +1205,8 @@ def usage_429_keeps_as_of_until_retry_after():
             assert server.usage_hits == 2, server.usage_hits
             assert fresh["as_of"]["claude"] == success_as_of, fresh["as_of"]
             assert fresh["fable"] == 33 and fresh["claude_week"] == 22 and fresh["claude_5h"] == 11, fresh
+            assert fresh["read_state"]["claude"] == "fresh", fresh.get("read_state")
+            assert "rate_limited_until" not in fresh, fresh.get("rate_limited_until")
             assert any("weekly Fable 33%" in ln for ln in fresh["lines"]), fresh["lines"]
             cleared = json.load(open(su._rate_limit_path()))
             assert usage not in cleared, cleared
@@ -1272,6 +1328,8 @@ def expired_claude_token_makes_no_http_call():
             assert server.profile_hits == 1 and server.usage_hits == 1, (server.profile_hits, server.usage_hits)
             assert bare["lines"] == ["claude   | token expired 6.0h ago; run `claude` once to refresh"], bare["lines"]
             assert "claude" not in bare["as_of"], bare["as_of"]
+            assert bare["read_state"]["claude"] == "token_expired", bare.get("read_state")
+            assert "fixture-token" not in json.dumps(bare["read_state"])
             _assert_no_secret(json.dumps(bare))
 
 
@@ -1341,6 +1399,14 @@ def usage_429_with_cache_shows_stale_reading():
             assert line.endswith(" | stale (reading 2.0h old)"), line
             assert limited["as_of"]["claude"] == su.NOW - 2 * 3600, limited["as_of"]
             assert limited["fable"] == 33, limited
+            assert limited["read_state"]["claude"] == "rate_limited", limited.get("read_state")
+            assert server.profile_hits == 1, server.profile_hits
+            until = limited["rate_limited_until"]["claude"]
+            assert su._is_number(until) and until > time.time(), until
+            line_state = su.claude_read_state_line(limited, su.NOW)
+            assert line_state.startswith("claude stale 120m: rate_limited until "), line_state
+            assert line_state.endswith(su._clock(until)), line_state
+            _assert_no_secret(line_state)
 
 
 @test
@@ -1440,6 +1506,130 @@ def usage_min_interval_default_is_600():
         capture_output=True, text=True, timeout=30, env=env,
     )
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
+
+
+@test
+def retry_after_zero_uses_the_backoff_not_a_zero_wait():
+    with anthropic_server() as server:
+        profile, usage = server_urls(server)
+        with seat_http_sandbox(profile, usage):
+            server.usage_mode = "zero429"
+            t0 = time.time()
+            limited = _quiet_cache()
+            assert server.usage_hits == 1, server.usage_hits
+            assert limited["read_state"]["claude"] == "rate_limited", limited.get("read_state")
+            stored = json.load(open(su._rate_limit_path()))
+            assert stored[f"{usage}#429s"] == 1, stored
+            assert 295 <= stored[usage] - t0 <= 310, stored[usage] - t0
+            again = _quiet_cache()
+            assert server.usage_hits == 1, server.usage_hits
+            assert again["read_state"]["claude"] == "rate_limited", again.get("read_state")
+            stored[usage] = time.time() - 1
+            with open(su._rate_limit_path(), "w") as f:
+                json.dump(stored, f)
+            t1 = time.time()
+            _quiet_cache()
+            nxt = json.load(open(su._rate_limit_path()))
+            assert nxt[f"{usage}#429s"] == 2, nxt
+            assert 590 <= nxt[usage] - t1 <= 620, nxt[usage] - t1
+
+
+@test
+def usage_exception_sets_usage_failed_and_does_not_hammer():
+    with anthropic_server() as server:
+        profile, usage = server_urls(server)
+        with seat_http_sandbox(profile, usage):
+            su.USAGE_MIN_INTERVAL_S = 300
+            fresh = _quiet_cache()
+            assert fresh["read_state"]["claude"] == "fresh", fresh.get("read_state")
+            assert server.profile_hits == 1 and server.usage_hits == 1
+            stored = json.load(open(su._rate_limit_path()))
+            stored[su.ANTHROPIC_USAGE_URL] = time.time() - 1
+            with open(su._rate_limit_path(), "w") as f:
+                json.dump(stored, f)
+            server.usage_mode = "error"
+            failed = _quiet_cache()
+            assert server.usage_hits == 2, server.usage_hits
+            assert server.profile_hits == 1, server.profile_hits
+            assert failed["read_state"]["claude"] == "usage_failed", failed.get("read_state")
+            assert failed["as_of"]["claude"] == fresh["as_of"]["claude"], failed["as_of"]
+            assert "HTTPError" not in json.dumps(failed["read_state"])
+            line = su.claude_read_state_line(failed, time.time())
+            assert line.startswith("claude stale ") and line.endswith(": usage_failed"), line
+            held = _quiet_cache()
+            assert server.usage_hits == 2, server.usage_hits
+            assert held["read_state"]["claude"] == "usage_failed", held.get("read_state")
+
+
+@test
+def cached_plan_skips_profile_after_both_floors_expire():
+    with anthropic_server() as server:
+        profile, usage = server_urls(server)
+        with seat_http_sandbox(profile, usage):
+            su.USAGE_MIN_INTERVAL_S = 300
+            first = _quiet_cache()
+            assert first["read_state"]["claude"] == "fresh"
+            assert server.profile_hits == 1 and server.usage_hits == 1
+            stored = json.load(open(su._rate_limit_path()))
+            stored[usage] = time.time() - 1
+            stored[profile] = time.time() - 1
+            with open(su._rate_limit_path(), "w") as f:
+                json.dump(stored, f)
+            second = _quiet_cache()
+            assert server.usage_hits == 2, server.usage_hits
+            assert server.profile_hits == 1, server.profile_hits
+            assert second["claude_plan"] == "max" and second["read_state"]["claude"] == "fresh", second
+            # The usage read holds the profile URL too, so the next call is quiet.
+            quiet = _quiet_cache()
+            assert server.usage_hits == 2 and server.profile_hits == 1, (server.usage_hits, server.profile_hits)
+            assert quiet["read_state"]["claude"] == "fresh", quiet.get("read_state")
+
+
+@test
+def cache_without_read_state_renders_as_before():
+    assert su.claude_read_state_line({"as_of": {"claude": NOW}, "claude_week": 10}) is None
+    assert su.claude_read_state_line({"read_state": {"claude": "fresh"}, "as_of": {"claude": NOW}}) is None
+    assert su.claude_read_state_line({"read_state": {"claude": "token has expired, leak"}, "as_of": {}}) is None
+    now = time.time()
+    cache = snap()
+    cache["ts"] = now
+    cache["as_of"] = {"claude": now - 120, "chatgpt": now, "cursor": now, "grokbot": now, "grok": now}
+    cache["lines"] = ["claude   | max active | weekly all 10%"]
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "latest.json"), "w") as f:
+            json.dump(cache, f)
+        env = os.environ.copy()
+        env["QUARTERMASTER_NO_UPDATE"] = "1"
+        env["SEAT_USAGE_CACHE_DIR"] = d
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        shown = subprocess.run([sys.executable, str(BIN), "--cached"], capture_output=True, text=True, env=env, timeout=15)
+        route = subprocess.run([sys.executable, str(BIN), "--route", "bounded-question", "--cached"],
+                               capture_output=True, text=True, env=env, timeout=15)
+    assert shown.returncode == 0, shown.stderr
+    assert "read_state" not in shown.stdout and "rate_limited" not in shown.stdout, shown.stdout
+    assert "claude   | max active | weekly all 10%" in shown.stdout, shown.stdout
+    assert route.returncode == 0, route.stderr
+    assert route.stdout.startswith("route: bounded-question |"), route.stdout
+    assert "rate_limited" not in route.stdout and route.stderr == "", (route.stdout, route.stderr)
+    # A pulled-style cache that does carry the code shows it on the status line and on --route.
+    cache["read_state"] = {"claude": "rate_limited"}
+    cache["rate_limited_until"] = {"claude": now + 600}
+    cache["as_of"]["claude"] = now - 300 * 60
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "latest.json"), "w") as f:
+            json.dump(cache, f)
+        env = os.environ.copy()
+        env["QUARTERMASTER_NO_UPDATE"] = "1"
+        env["SEAT_USAGE_CACHE_DIR"] = d
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        shown = subprocess.run([sys.executable, str(BIN), "--cached"], capture_output=True, text=True, env=env, timeout=15)
+        route = subprocess.run([sys.executable, str(BIN), "--route", "bounded-question", "--cached"],
+                               capture_output=True, text=True, env=env, timeout=15)
+    clock = datetime.fromtimestamp(now + 600).strftime("%I:%M %p").lstrip("0")
+    expect = f"claude stale 300m: rate_limited until {clock}"
+    assert shown.returncode == 0 and expect in shown.stdout, shown.stdout
+    assert route.returncode == 0 and expect in route.stdout, route.stdout
+    assert route.stdout.startswith("route: bounded-question |"), route.stdout
 
 
 def grok_builder():
