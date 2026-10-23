@@ -4484,6 +4484,56 @@ def review_failure_record_round_trip_and_expiry():
         assert unknown.returncode == 2 and "not-a-seat" not in unknown.stderr
 
 
+def _fable_outcome(row):
+    voters = [v for v in (row.get("lineup") or {}).get("voters") or [] if v["family"] == "fable"]
+    skipped = [item for item in row.get("skipped") or [] if item["family"] == "fable"]
+    return voters, skipped
+
+
+@test
+def review_blocked_fable_falls_through_and_an_ask_is_not_graded():
+    # A stale Claude reading plus a block must not hide a healthy Cursor seat.
+    stale = snap(cursor_api_pct=10)
+    stale["as_of"] = dict(stale["as_of"])
+    stale["as_of"]["claude"] = NOW - 400 * 60
+    stale["read_state"] = {"claude": "rate_limited"}
+    voters, skipped = _fable_outcome(su.route_lineup(stale, NOW, kind="review", builder_vendor="xai"))
+    if voters:
+        assert voters[0]["seat"] == "cursor", voters
+    else:
+        assert skipped and skipped[0]["code"] == "lower_rank" and skipped[0].get("seat") == "cursor", skipped
+    assert all(item.get("code") not in ("stale", "unknown") for item in skipped), skipped
+    # Both frontier seats closed: the block code wins over the stale ask.
+    shut = snap(cursor_api_pct=100, fable=100, claude_week=100, claude_5h=100)
+    shut["as_of"] = dict(shut["as_of"])
+    shut["as_of"]["claude"] = NOW - 400 * 60
+    shut["read_state"] = {"claude": "rate_limited"}
+    held_voters, held_skipped = _fable_outcome(su.route_lineup(shut, NOW, kind="review", builder_vendor="xai"))
+    assert not held_voters, held_voters
+    assert held_skipped and held_skipped[0]["code"] == "read_state:rate_limited", held_skipped
+    # --exclude-seat is the same block when the reading itself is stale.
+    aged = snap(cursor_api_pct=10)
+    aged["as_of"] = dict(aged["as_of"])
+    aged["as_of"]["claude"] = NOW - 400 * 60
+    su._REVIEW_FORCE_EXCLUDE.add("claude")
+    try:
+        forced_voters, forced_skipped = _fable_outcome(
+            su.route_lineup(aged, NOW, kind="review", builder_vendor="xai"))
+    finally:
+        su._REVIEW_FORCE_EXCLUDE.clear()
+    if forced_voters:
+        assert forced_voters[0]["seat"] == "cursor", forced_voters
+    else:
+        assert forced_skipped and forced_skipped[0]["code"] == "lower_rank", forced_skipped
+    assert all(item.get("code") not in ("stale", "unknown") for item in forced_skipped), forced_skipped
+    # A log of only exclusion asks is not a pick. A later ask does not steal the last real one.
+    assert su._pick_index([{"reviewers": [], "id": "ask"}], "latest") is None
+    assert su._pick_index([
+        {"reviewers": [{"family": "argon"}], "id": "settled"},
+        {"reviewers": [], "id": "ask"},
+    ], "latest") == 0
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:

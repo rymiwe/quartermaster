@@ -3053,11 +3053,17 @@ def _review_seat_block(seat, s, failures):
     return None
 
 
-def _review_fable_unblocked(payload, states, s, now, failures):
-    """The Fable row, or another frontier seat that is not blocked. None when all are."""
-    seat = payload.get("seat") or "claude"
-    if not _review_seat_block(seat, s, failures):
-        return payload
+def _review_fable_block(s, failures):
+    """(seat, (code, human)) for claude, else cursor. None when neither is blocked."""
+    for seat in ("claude", "cursor"):
+        block = _review_seat_block(seat, s, failures)
+        if block:
+            return seat, block
+    return None
+
+
+def _review_fable_open(states, s, now, failures):
+    """Best frontier seat that is not blocked and has room. None when there is none."""
     absent = _fable_slice_absent(states, s)
     ready, _unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
 
@@ -3069,11 +3075,22 @@ def _review_fable_unblocked(payload, states, s, now, failures):
 
     for pid in sorted(ready, key=key):
         alt = POOLS[pid]["seat"]
-        if alt == seat or _review_seat_block(alt, s, failures):
+        if _review_seat_block(alt, s, failures):
             continue
         effort, mode, reason = _voter_effort(pid, s, now, states)
         return _voter("fable", alt, pid, s, now, effort, mode, reason)
     return None
+
+
+def _review_fable_unblocked(payload, states, s, now, failures):
+    """The Fable row, or another frontier seat that is not blocked. None when all are."""
+    seat = payload.get("seat") or "claude"
+    if not _review_seat_block(seat, s, failures):
+        return payload
+    opened = _review_fable_open(states, s, now, failures)
+    if opened and opened.get("seat") == seat:
+        return None
+    return opened
 
 
 def _review_model_barred(model):
@@ -3217,25 +3234,39 @@ def _review_candidates(states, s, now, excluded_vendor):
         pick = spec["pick"]
         if pick == "fable":
             status, payload = _fable_voter(states, s, now, False)
-            if status == "ask":
-                text = payload if isinstance(payload, str) else "Fable unavailable"
-                code = "stale" if ("reading " in text and " old" in text) else "unknown"
-                skipped.append(_review_skip(spec, text, code))
-                continue
-            if status == "downgrade":
-                why = payload.get("reason") or "no frontier pool with room"
-                skipped.append(_review_skip(spec, why, "capped" if "capped" in why or "full" in why else "unknown"))
-                continue
-            if status != "row":
-                skipped.append(_review_skip(spec, "Fable unavailable", "unknown"))
-                continue
-            opened = _review_fable_unblocked(payload, states, s, now, failures)
+            opened = None
+            if status == "row":
+                opened = _review_fable_unblocked(payload, states, s, now, failures)
+            elif _review_fable_block(s, failures):
+                # An ask or a full window must not hide a block, and must not
+                # skip the other frontier seat when that seat is open.
+                opened = _review_fable_open(states, s, now, failures)
             if opened is None:
-                seat = payload.get("seat") or "claude"
-                block = _review_seat_block(seat, s, failures) or ("unknown", "Fable unavailable")
-                shown = dict(spec)
-                shown["seat"] = seat
-                skipped.append(_review_skip(shown, block[1], block[0]))
+                blocked = _review_fable_block(s, failures)
+                if blocked and status != "row":
+                    seat, block = blocked
+                    shown = dict(spec)
+                    shown["seat"] = seat
+                    skipped.append(_review_skip(shown, block[1], block[0]))
+                    continue
+                if status == "ask":
+                    text = payload if isinstance(payload, str) else "Fable unavailable"
+                    code = "stale" if ("reading " in text and " old" in text) else "unknown"
+                    skipped.append(_review_skip(spec, text, code))
+                    continue
+                if status == "downgrade":
+                    why = payload.get("reason") or "no frontier pool with room"
+                    code = "capped" if "capped" in why or "full" in why else "unknown"
+                    skipped.append(_review_skip(spec, why, code))
+                    continue
+                if status == "row":
+                    seat = payload.get("seat") or "claude"
+                    block = _review_seat_block(seat, s, failures) or ("unknown", "Fable unavailable")
+                    shown = dict(spec)
+                    shown["seat"] = seat
+                    skipped.append(_review_skip(shown, block[1], block[0]))
+                    continue
+                skipped.append(_review_skip(spec, "Fable unavailable", "unknown"))
                 continue
             payload = opened
             seat = payload.get("seat") or "claude"
@@ -5296,9 +5327,10 @@ def _exclusion_log(skip):
 def _log_review_pick(row, repo, pr, ballot):
     """Append one JSONL line for a review route, including every exclusion.
 
-    A settled pick lists who sat. An ask with nobody seated is still logged
-    when seats were excluded, so an exclusion is not only on stdout. Nothing
-    in the scorer reads this file. A write failure is silent.
+    A settled pick lists who sat. An ask leaves reviewers empty and is still
+    logged when seats were excluded, so an exclusion is not only on stdout.
+    Grading skips a row with no reviewers. Nothing in the scorer reads this
+    file. A write failure is silent.
     """
     if not isinstance(row, dict):
         return
@@ -5373,7 +5405,7 @@ def _pick_index(rows, pick):
         for index in range(len(rows) - 1, -1, -1):
             if rows[index].get("reviewers"):
                 return index
-        return len(rows) - 1
+        return None
     for index, row in enumerate(rows):
         if str(row.get("id")) == pick or str(row.get("ts")) == pick:
             return index
