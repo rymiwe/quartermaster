@@ -2852,26 +2852,25 @@ def _lineup_exclusion(kind, author, builder_row, caller_passed_builder=False):
     was not None. The resolved builder row is not that signal: with no
     caller builder the router still fills a builder from pace.
 
-    Review excludes a named author family, or that caller-passed builder
-    when no author was named. With neither, a review excludes nobody.
-    author "human" and author "none" exclude nobody on kind review.
-    Mixed still defaults the author to the builder. Audit excludes the
-    author when one is named. Design excludes nobody. An unknown author
-    family is an ask. human and none are unknown families on every kind
-    except review.
+    Review and mixed exclude a named author family, or that caller-passed
+    builder when no author was named. With neither, they exclude nobody.
+    author "human" and author "none" exclude nobody on review and mixed.
+    Audit excludes the author when one is named. Design excludes nobody.
+    An unknown author family is an ask. human and none are unknown
+    families on audit and design.
     """
     if kind == "design":
         if author and author not in FAMILY_VENDOR:
             return {"ask": f"author family {author} has no vendor: {_ASK}"}
         return {"vendor": None, "name": None, "family": None,
                 "why": "design judges a packet the chair framed", "author": author}
-    if kind == "review" and author in ("human", "none"):
+    if kind in ("review", "mixed") and author in ("human", "none"):
         why = "human author" if author == "human" else "author none"
         return {"vendor": None, "name": None, "family": None,
                 "why": why, "author": author}
-    if kind == "review" and not author and not caller_passed_builder:
+    if kind in ("review", "mixed") and not author and not caller_passed_builder:
         return {"vendor": None, "name": None, "family": None,
-                "why": "review author unknown", "author": None}
+                "why": f"{kind} author unknown", "author": None}
     if kind in ("review", "mixed"):
         family = author or builder_row.get("family")
     elif kind == "audit":
@@ -3465,8 +3464,9 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
     both are over pace, or when both are capped. That is the pre-launch call.
 
     With a kind, the chair is routed on its own and may differ from the builder.
-    Design excludes nobody. Mixed excludes the author, defaulting to the
-    builder even when the caller passed no builder. Audit excludes the author
+    Design excludes nobody. Mixed excludes the author, or the caller-passed
+    builder when no author was named. With neither, or with `--author human`
+    or `--author none`, mixed excludes nobody. Audit excludes the author
     when one is named. Fable is required when the excluded vendor is xAI,
     except on kind review.
 
