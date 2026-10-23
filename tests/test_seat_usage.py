@@ -2212,13 +2212,17 @@ def lineup_kind_excludes_the_author_not_the_chair():
     assert design_skip["mode"] != "ask" and design_skip["lineup"] is not None, design_skip
     assert "fable" not in _voter_families(design_skip), design_skip
     assert "approve a downgraded leg" in design_skip["downgrade"]["reason"], design_skip
+    # No author and no caller builder: the pace-picked builder is not the author.
+    # Fable is still skipped because both frontier seats are full. Grok can vote.
     review_ask = su.route_lineup(blocked, NOW, kind="review")
     assert review_ask["mode"] != "ask" and review_ask["lineup"] is not None, review_ask
+    assert review_ask["excluded"]["vendor"] is None, review_ask
     assert "fable" not in _voter_families(review_ask), review_ask
     assert "astra" in _voter_families(review_ask), review_ask
-    assert "wonder" in _voter_families(review_ask), review_ask
+    assert "grok" in _voter_families(review_ask), review_ask
     assert "downgrade" not in review_ask, review_ask
     assert any(item["family"] == "fable" for item in review_ask["skipped"]), review_ask
+    assert not any(item.get("code") == "builder_vendor" for item in review_ask["skipped"]), review_ask
 
     missing = su.route_lineup(snap(), NOW, kind="review", author="composer")
     assert missing["mode"] == "ask" and "no vendor" in missing["reason"], missing
@@ -2226,6 +2230,89 @@ def lineup_kind_excludes_the_author_not_the_chair():
     assert design_typo["mode"] == "ask" and "no vendor" in design_typo["reason"], design_typo
     bad = su.route_lineup(snap(), NOW, kind="host")
     assert bad["mode"] == "ask" and "unknown kind" in bad["reason"], bad
+
+
+def _review_eligible_families(row):
+    """Seated review voters, plus seats that lost only on rank."""
+    names = set(_voter_families(row))
+    for item in row.get("skipped") or []:
+        if item.get("code") == "lower_rank" and item.get("family"):
+            names.add(item["family"])
+    return names
+
+
+@test
+def review_without_author_or_builder_excludes_nobody():
+    def check(s):
+        row = su.route_lineup(s, NOW, kind="review")
+        assert row["mode"] != "ask", row
+        excl = row["excluded"]
+        assert excl["vendor"] is None and excl["name"] is None and excl["family"] is None, excl
+        assert excl["why"] == "review author unknown", excl
+        assert row["author"] is None, row
+        assert not any(item.get("code") == "builder_vendor" for item in row.get("skipped") or []), row
+        assert "grok" in _review_eligible_families(row), row
+        return row
+
+    plain = check(snap())
+    assert plain["lineup"]["builder"]["family"] == "grok", plain
+    ahead = check(snap(cursor_auto_pct=80, grok_pct=80))
+    assert ahead["lineup"]["builder"]["family"] == "opus", ahead
+    # Mixed still defaults the author to whoever won the builder slot.
+    mixed = su.route_lineup(snap(), NOW, kind="mixed")
+    assert mixed["excluded"]["vendor"] == "xai" and mixed["author"] == "grok", mixed
+    mixed_ahead = su.route_lineup(snap(cursor_auto_pct=80, grok_pct=80), NOW, kind="mixed")
+    assert mixed_ahead["excluded"]["vendor"] == "anthropic" and mixed_ahead["author"] == "opus", mixed_ahead
+
+
+@test
+def review_author_human_and_none_exclude_nobody():
+    for author in ("human", "none"):
+        row = su.route_lineup(snap(), NOW, kind="review", author=author)
+        assert row["mode"] != "ask", row
+        assert row["author"] == author, row
+        excl = row["excluded"]
+        assert excl["vendor"] is None and excl["name"] is None and excl["family"] is None, excl
+        assert not any(item.get("code") == "builder_vendor" for item in row.get("skipped") or []), row
+        assert "grok" in _review_eligible_families(row), row
+        # A named human or none wins over a caller-passed builder.
+        named = su.route_lineup(snap(), NOW, builder=grok_builder(), kind="review", author=author)
+        assert named["mode"] != "ask" and named["excluded"]["vendor"] is None, named
+        assert named["lineup"]["builder"]["family"] == "grok", named
+    ahead = su.route_lineup(snap(cursor_auto_pct=80, grok_pct=80), NOW, kind="review", author="human")
+    assert ahead["mode"] != "ask" and ahead["excluded"]["vendor"] is None, ahead
+    assert ahead["lineup"]["builder"]["family"] == "opus", ahead
+    assert "grok" in _review_eligible_families(ahead), ahead
+    # A caller-passed builder vendor still wins, including over human.
+    forced = su.route_lineup(snap(), NOW, kind="review", author="human", builder_vendor="xai")
+    assert forced["mode"] != "ask" and forced["excluded"]["vendor"] == "xai", forced
+    assert any(item.get("family") == "grok" and item.get("code") == "builder_vendor"
+               for item in forced["skipped"]), forced
+    # Other kinds do not treat human or none as "exclude nobody".
+    for kind in ("mixed", "audit", "design"):
+        for author in ("human", "none"):
+            asked = su.route_lineup(snap(), NOW, kind=kind, author=author)
+            assert asked["mode"] == "ask" and "no vendor" in asked["reason"], (kind, author, asked)
+
+    now = time.time()
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "latest.json"), "w") as f:
+            json.dump(_shift_snap(now), f)
+        env = os.environ.copy()
+        env["HOME"] = d
+        env["SEAT_USAGE_CACHE_DIR"] = d
+        env["SEAT_USAGE_ASKS"] = os.path.join(d, "asks.jsonl")
+        for author in ("human", "none"):
+            proc = subprocess.run(
+                [sys.executable, str(BIN), "--route", "lineup", "--kind", "review",
+                 "--author", author, "--cached", "--json"],
+                capture_output=True, text=True, env=env, timeout=15,
+            )
+            assert proc.returncode == 0, (author, proc.returncode, proc.stderr, proc.stdout)
+            row = json.loads(proc.stdout)[0]
+            assert row["mode"] != "ask" and row["author"] == author, row
+            assert row["excluded"]["vendor"] is None, row
+            assert not any(item.get("code") == "builder_vendor" for item in row.get("skipped") or []), row
 
 
 def _absent_fable(cursor=10, **kw):
