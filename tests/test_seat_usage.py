@@ -4336,6 +4336,154 @@ def google_opus_pool_wins_only_when_the_pools_ahead_of_it_cannot():
     assert su.route("builder", held, NOW)["seat"] != "google", "the 5h window blocks the weekly pool"
 
 
+def _codes(skipped):
+    return {item["family"]: item.get("code") for item in skipped}
+
+
+@test
+def review_exclusions_are_coded_and_argon_leads_when_healthy():
+    # Argon at 4% leads the non-builder seats. Muse contributor/spark is not a roster row.
+    fresh = _argon(snap(codex=80, grok_pct=70, muse_week=60, muse_5h=20, fable=90), 4)
+    row = su.route_lineup(fresh, NOW, kind="review", builder_vendor="anthropic")
+    assert row["mode"] != "ask", row
+    families = [v["family"] for v in row["lineup"]["voters"]]
+    assert families[0] == "argon", row["why"]
+    assert "wonder" in families, families
+    assert all("spark" not in (v.get("model") or "") and "contributor" not in (v.get("model") or "")
+               for v in row["lineup"]["voters"])
+    wonder = next(v for v in row["lineup"]["voters"] if v["family"] == "wonder")
+    assert wonder["contributor_mode"] == "off" and wonder["model"] == "wonder", wonder
+    codes = _codes(row["skipped"])
+    assert codes["fable"] == "builder_vendor", codes
+    assert codes.get("astra") == "lower_rank", codes
+    text = su.format_lineup(row)
+    assert "skipped: fable | builder_vendor |" in text, text
+    assert "skipped: argon" not in text, text
+    # The one-reviewer route shares the exclusion codes and still seats one.
+    gate = su.route_review(fresh, NOW, "anthropic")
+    assert len(gate["reviewers"]) == 1 and gate["reviewers"][0]["family"] == "argon", gate
+    assert _codes(gate["skipped"])["fable"] == "builder_vendor"
+    # A 365m Muse reading is an exclusion with code stale, in text and json.
+    stale = _argon(snap(), 10)
+    stale["as_of"] = dict(stale["as_of"])
+    stale["as_of"]["muse"] = NOW - 365 * 60
+    held = su.route_lineup(stale, NOW, kind="review", builder_vendor="xai")
+    muse = next(item for item in held["skipped"] if item["family"] == "wonder")
+    assert muse["code"] == "stale", muse
+    assert "365m old" in muse["reason"] and "Muse 5h" in muse["reason"], muse
+    shown = su.format_lineup(held)
+    assert "skipped: wonder | stale |" in shown and "365m old" in shown, shown
+    # Capped, read_state, and a recent failure each carry their own code.
+    capped = _argon(snap(grok_pct=100), 12)
+    capped_row = su.route_lineup(capped, NOW, kind="review", builder_vendor="anthropic")
+    grok = next(item for item in capped_row["skipped"] if item["family"] == "grok")
+    assert grok["code"] == "capped", grok
+    limited = _argon(snap(), 8)
+    limited["read_state"] = {"claude": "rate_limited", "google": "fresh"}
+    limited["cursor_api_pct"] = 100
+    limited_row = su.route_lineup(limited, NOW, kind="review", builder_vendor="xai")
+    fable = next(item for item in limited_row["skipped"] if item["family"] == "fable")
+    assert fable["code"] == "read_state:rate_limited", fable
+    assert "fable" not in [v["family"] for v in limited_row["lineup"]["voters"]], limited_row["why"]
+    # A cache with no read_state still seats Fable. The field is optional.
+    bare = su.route_lineup(_argon(snap(), 8), NOW, kind="review", builder_vendor="xai")
+    assert "fable" in [v["family"] for v in bare["lineup"]["voters"]], bare["why"]
+    assert "read_state" not in json.dumps(bare["lineup"]["voters"])
+
+
+@test
+def review_failure_record_round_trip_and_expiry():
+    now = time.time()
+    with tempfile.TemporaryDirectory() as d:
+        cache = os.path.join(d, "latest.json")
+        body = _shift_snap(now, google_argon_week=6, google_argon_week_reset_ts=now + 3 * 86400)
+        with open(cache, "w") as handle:
+            json.dump(body, handle)
+        fail = os.path.join(d, "failures.jsonl")
+        log = os.path.join(d, "picks.jsonl")
+        home = os.path.join(d, "home")
+        os.makedirs(home)
+        env = os.environ.copy()
+        env["HOME"] = home
+        env["SEAT_USAGE_CACHE_DIR"] = d
+        env["SEAT_USAGE_FAILURES"] = fail
+        env["SEAT_USAGE_REVIEW_LOG"] = log
+        env["SEAT_USAGE_ASKS"] = os.path.join(d, "asks.jsonl")
+        env["QUARTERMASTER_NO_UPDATE"] = "1"
+        env.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
+
+        def run(args, extra=None):
+            this = dict(env)
+            if extra:
+                this.update(extra)
+            return subprocess.run(
+                [sys.executable, str(BIN), *args],
+                capture_output=True, text=True, env=this, timeout=20,
+            )
+
+        recorded = run(["--record-failure", "grok", "--reason", "max_turns"])
+        assert recorded.returncode == 0, recorded.stderr
+        assert recorded.stdout.strip() == "recorded grok max_turns", recorded.stdout
+        rejected = run(["--record-failure", "grok", "--reason", "fixture-token-secret"])
+        assert rejected.returncode == 2, rejected.stderr
+        assert "fixture-token-secret" not in rejected.stderr and "fixture-token-secret" not in rejected.stdout
+        with open(fail) as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
+        assert lines == [{"ts": lines[0]["ts"], "seat": "grok", "reason": "max_turns"}], lines
+        assert "fixture" not in json.dumps(lines)
+        args = ["--route", "lineup", "--cached", "--json", "--kind", "review",
+                "--builder-vendor", "anthropic", "--repo", "rymiwe/example", "--pr", "3"]
+        routed = run(args)
+        assert routed.returncode == 0, routed.stderr
+        row = json.loads(routed.stdout)[0]
+        grok = next(item for item in row["skipped"] if item["family"] == "grok")
+        assert grok["code"] == "failed_recently:max_turns", grok
+        assert all(v["family"] != "grok" for v in row["lineup"]["voters"]), row["why"]
+        text = run(["--route", "lineup", "--cached", "--kind", "review", "--builder-vendor", "anthropic"])
+        assert "skipped: grok | failed_recently:max_turns |" in text.stdout, text.stdout
+        with open(log) as handle:
+            logged = [json.loads(line) for line in handle if line.strip()]
+        assert logged and any(
+            item.get("code") == "failed_recently:max_turns" and item.get("family") == "grok"
+            for item in logged[-1].get("exclusions") or []
+        ), logged[-1]
+        # credits on the cursor seat is no_credits, and a spark model is never a voter.
+        credits = run(["--record-failure", "cursor", "--reason", "credits"])
+        assert credits.returncode == 0, credits.stderr
+        cursor_body = _shift_snap(now, fable=100, cursor_api_pct=10,
+                                  google_argon_week=6, google_argon_week_reset_ts=now + 3 * 86400)
+        with open(cache, "w") as handle:
+            json.dump(cursor_body, handle)
+        # Drop the grok failure so the cursor case is the one under test.
+        with open(fail, "w") as handle:
+            handle.write(json.dumps({"ts": now, "seat": "cursor", "reason": "credits"}) + "\n")
+        seated = run(["--route", "lineup", "--cached", "--json", "--kind", "review",
+                      "--builder-vendor", "xai"])
+        assert seated.returncode == 0, seated.stderr
+        cursor_row = json.loads(seated.stdout)[0]
+        fable = next(item for item in cursor_row["skipped"] if item["family"] == "fable")
+        assert fable["code"] == "no_credits", fable
+        assert all("spark" not in (v.get("model") or "") for v in (cursor_row["lineup"] or {}).get("voters") or [])
+        # An expired line does not exclude. TTL is 1s and the stamp is an hour old.
+        with open(fail, "w") as handle:
+            handle.write(json.dumps({"ts": now - 3600, "seat": "chatgpt", "reason": "auth"}) + "\n")
+        healthy = _shift_snap(now, google_argon_week=40, google_argon_week_reset_ts=now + 3 * 86400)
+        with open(cache, "w") as handle:
+            json.dump(healthy, handle)
+        expired = run(args, {"SEAT_USAGE_FAILURE_TTL_S": "1"})
+        assert expired.returncode == 0, expired.stderr
+        expired_row = json.loads(expired.stdout)[0]
+        assert all(item.get("code") != "failed_recently:auth" for item in expired_row["skipped"]), expired_row["skipped"]
+        astra = next(item for item in expired_row["skipped"] if item["family"] == "astra") if any(
+            item["family"] == "astra" for item in expired_row["skipped"]) else None
+        if astra is not None:
+            assert astra["code"] == "lower_rank", astra
+        else:
+            assert any(v["family"] == "astra" for v in expired_row["lineup"]["voters"]), expired_row["why"]
+        unknown = run(["--record-failure", "not-a-seat", "--reason", "auth"])
+        assert unknown.returncode == 2 and "not-a-seat" not in unknown.stderr
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:
