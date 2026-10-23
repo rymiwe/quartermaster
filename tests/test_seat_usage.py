@@ -588,6 +588,52 @@ def f6_older_fresh_as_of_keeps_base():
 
 
 @test
+def failed_reread_keeps_numbers_and_takes_the_new_read_state():
+    until = NOW + 600
+    base = {
+        "v": 1, "ts": NOW - 50,
+        "as_of": {"claude": NOW - 20},
+        "claude_week": 12, "claude_week_reset_ts": NOW + 3 * 86400,
+        "read_state": {"claude": "fresh"},
+        "lines": ["claude   | old claude"],
+    }
+    # No as_of: the numbers stay, and the failure code still replaces fresh.
+    expired = {
+        "ts": NOW, "as_of": {},
+        "read_state": {"claude": "token_expired"},
+        "lines": ["claude   | token expired 1.0h ago; run `claude` once to refresh"],
+    }
+    merged = su.merge_summary(base, expired, ["claude"], now=NOW)
+    assert merged["claude_week"] == 12, merged
+    assert "claude" not in merged["as_of"], merged["as_of"]
+    assert merged["read_state"] == {"claude": "token_expired"}, merged.get("read_state")
+    assert "rate_limited_until" not in merged
+    # Older stamp than the cache (kept_base): numbers stay, a failure code still wins.
+    limited = {
+        "ts": NOW, "as_of": {"claude": NOW - 100},
+        "claude_week": 99,
+        "read_state": {"claude": "rate_limited"},
+        "rate_limited_until": {"claude": until},
+        "lines": ["claude   | old numbers"],
+    }
+    held = su.merge_summary(base, limited, ["claude"], now=NOW)
+    assert held["claude_week"] == 12 and held["as_of"]["claude"] == NOW - 20, held
+    assert held["read_state"] == {"claude": "rate_limited"}, held.get("read_state")
+    assert held["rate_limited_until"] == {"claude": until}, held.get("rate_limited_until")
+    # An older successful read does not wipe a newer failure code.
+    newer = dict(base, read_state={"claude": "usage_failed"})
+    older_ok = {
+        "ts": NOW, "as_of": {"claude": NOW - 100},
+        "claude_week": 99,
+        "read_state": {"claude": "fresh"},
+        "lines": ["claude   | stale success"],
+    }
+    kept = su.merge_summary(newer, older_ok, ["claude"], now=NOW)
+    assert kept["claude_week"] == 12 and kept["as_of"]["claude"] == NOW - 20, kept
+    assert kept["read_state"] == {"claude": "usage_failed"}, kept.get("read_state")
+
+
+@test
 def f7_failed_grok_reread_ors_exhausted():
     base = {
         "v": 1,

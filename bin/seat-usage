@@ -1989,7 +1989,12 @@ def line_seat(line):
     return line.split("|", 1)[0].strip()
 
 def _take_read_state(out, base, fresh, seats, kept_base):
-    """Keep each seat's fixed read_state. A seat this run replaced without one drops it."""
+    """Keep each seat's fixed read_state. A seat this run replaced without one drops it.
+
+    A failure code recorded on this run wins even when the numbers stay (no new
+    as_of, or kept_base because the stamp is older). An older successful "fresh"
+    does not replace a newer cache.
+    """
     fresh_as_of = fresh.get("as_of") or {}
     base_state = base.get("read_state") if isinstance(base.get("read_state"), dict) else {}
     fresh_state = fresh.get("read_state") if isinstance(fresh.get("read_state"), dict) else {}
@@ -1997,7 +2002,11 @@ def _take_read_state(out, base, fresh, seats, kept_base):
     fresh_until = fresh.get("rate_limited_until") if isinstance(fresh.get("rate_limited_until"), dict) else {}
     state, until = {}, {}
     for seat in set(base_state) | set(fresh_state):
-        use_fresh = seat in seats and seat not in kept_base and (seat in fresh_state or seat in fresh_as_of)
+        code_fresh = fresh_state.get(seat)
+        failure = seat in seats and code_fresh in ("token_expired", "rate_limited", "usage_failed")
+        use_fresh = failure or (
+            seat in seats and seat not in kept_base and (seat in fresh_state or seat in fresh_as_of)
+        )
         src_state = fresh_state if use_fresh else base_state
         src_until = fresh_until if use_fresh else base_until
         code = src_state.get(seat)
