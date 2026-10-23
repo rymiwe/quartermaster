@@ -5281,6 +5281,19 @@ for line in sys.stdin:
         assert su.refresh_muse_usage(time.time(), path=str(dest), binary=str(decoy), timeout=5) is False
         assert not called.exists()
         assert json.loads(dest.read_text())["exhausted"] is True
+        with local_tz("UTC"):
+            shown = su.format_muse_line(got, time.time())
+            assert shown.startswith("muse     | quota exhausted, resets "), shown
+            assert "%" not in shown and "99" not in shown, shown
+            assert su.muse_line(time.time(), path=str(dest)) == shown
+            both = dict(got)
+            both["window"] = {"used_percent": 99, "window_duration_mins": 300, "resets_at": 1792972800}
+            both["weekly"] = {"used_percent": 99, "resets_at": "2026-10-26T00:00:00Z"}
+            both_line = su.format_muse_line(both, time.time())
+            assert both_line.startswith("muse     | quota exhausted, resets "), both_line
+            assert "Weekly" not in both_line, both_line
+        past_doc = {"captured_at": got["captured_at"], "exhausted": True, "exhausted_resets_at": 1}
+        assert su.format_muse_line(past_doc, time.time()) is None
 
 
 @test

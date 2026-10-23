@@ -4476,11 +4476,27 @@ def _muse_local(ts):
 def format_muse_line(data, now):
     """One Muse line from Conclave's object, or None when the shape does not match.
 
+    An exhausted record whose reset is still ahead says the quota is exhausted
+    and when it resets. No used percent is printed. A reset already past falls
+    through to the snapshot, or None when there is no snapshot.
+
     {captured_at, window{used_percent, window_duration_mins, resets_at},
      weekly{used_percent, resets_at}}. Times are local. A reset is an ISO
     string or a unix time. Stale once the captured window's resets_at is no
     longer in the future.
     """
+    exhausted = _muse_file_exhausted(data)
+    if exhausted is not None:
+        reset = exhausted.get("reset")
+        if _is_number(reset) and reset > now:
+            reset_s = _muse_local(reset)
+            if reset_s:
+                line = f"{'muse':9}| quota exhausted, resets {reset_s}"
+                captured = exhausted.get("captured")
+                captured_s = _muse_local(captured) if _is_number(captured) else None
+                if captured_s:
+                    line += f" | as of {captured_s}"
+                return line
     snap = _muse_snapshot(data)
     if snap is None:
         return None
