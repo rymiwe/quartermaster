@@ -9,10 +9,14 @@ context when routing is decided.
 A Muse line is read from ~/.cache/quartermaster/muse-usage.json. Conclave
 writes that file, and a live run asks `muse serve` for a new reading when
 the file is missing, older than about 10 minutes, or its 5h reset is not a
-current window. That ask is one short reply. A parsed snapshot is copied
-into this cache (muse_5h, muse_week, and their resets, stamped
-as_of["muse"]), including one whose 5h window has already reset. That
-stamp is a routing input: wonder-full votes on those pools. A missing or
+current window. That ask is one short reply. It passes --contributor-mode
+off and does not pin a model, so the host's configured model is used. A
+parsed snapshot is copied into this cache (muse_5h, muse_week, and their
+resets, stamped as_of["muse"]), including one whose 5h window has already
+reset. That stamp is a routing input: wonder-full votes on those pools.
+A turn/completed whose error.quota is present records muse_exhausted and
+muse_exhausted_reset_ts, stamps as_of["muse"], and does not invent a used
+percent. Any other turn failure leaves the file unchanged. A missing or
 unreadable file drops that stamp and records the reason.
 SEAT_USAGE_SKIP_MUSE=1 skips the ask. --cached never asks.
 --help and -h print this text and exit before a self-update, a reader, a
@@ -83,8 +87,7 @@ ROUTE_FRESH_PULLED_S = ROUTE_FRESHNESS_DEFAULT_S["pulled"]
 # after the status-line lock and before the seat reads, so that wait and the
 # later sequential reads sit outside the age. While the floor still blocks,
 # the age at the route clock is therefore strictly under the live window.
-# ROUTE_HOLD_MARGIN_S (next to LOCK_TIMEOUT) is the budget those two delays
-# get. A 429 backoff is a different hold: it may outlive the window, and the
+# A 429 backoff is a different hold: it may outlive the window, and the
 # reading then goes stale instead of being called early.
 USAGE_MIN_INTERVAL_S = float(os.environ.get("SEAT_USAGE_MIN_INTERVAL_S") or 600)   # tests set 0
 USAGE_BACKOFF_S = 300
@@ -1267,7 +1270,10 @@ SEAT_KEYS = {
         "grok_products", "grok_exhausted", "grok_402_h", "grok_renews_ts", "grok_renews",
     ),
     # Lineup and ask read these. Launch roles do not: Muse has no strength there.
-    "muse": ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts"),
+    "muse": (
+        "muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts",
+        "muse_exhausted", "muse_exhausted_reset_ts",
+    ),
 }
 LINE_SEATS = ("claude", "chatgpt", "cursor", "grokbot", "grok")
 
@@ -1885,6 +1891,23 @@ def route_fresh_s(s):
     """How old a reading may be before a route treats it as unknown."""
     return ROUTE_FRESH_PULLED_S if _is_number(s.get("pulled_ts")) else ROUTE_FRESH_S
 
+def _muse_quota_capped(meta, s, now):
+    """('capped', reason) while a typed Muse quota reset is still ahead, else None.
+
+    The reset is when the fact expires. A reading older than route_fresh_s
+    stays capped until that reset; a reset already past falls through to the
+    usual unknown or stale rules. No used percent is required.
+    """
+    if meta.get("seat") != "muse" or s.get("muse_exhausted") is not True:
+        return None
+    reset = s.get("muse_exhausted_reset_ts")
+    if not _is_number(reset) or reset <= now:
+        return None
+    shown = _muse_local(reset)
+    when = shown if shown else _reopen(reset, now)
+    return "capped", f"Muse quota exhausted, resets {when}"
+
+
 def pool_status(pool_id, s, now):
     """'unknown' | 'capped' | 'near_cap' | 'open' | 'under' | 'on' | 'ahead', plus why when unknown.
 
@@ -1894,14 +1917,22 @@ def pool_status(pool_id, s, now):
     (20 on a pulled copy, see route_fresh_s),
     used% is absent or not a number (absent is never 0%), or the reset is
     missing or already past. grok is also capped when grok_exhausted.
+    Muse with no as_of is unknown, "no usage source". Muse is capped when
+    muse_exhausted is true and muse_exhausted_reset_ts is still ahead. That
+    does not invent a used percent. A quota reset already past is not that cap.
     A 5h pool (facts.window 5h) is open when the plan has no session keys, or
     when a used% under 100 has no reset still in the future. At 100% with a
     future reset it is capped. Otherwise it follows pace, and it never burns.
     """
     meta = POOLS[pool_id]
+    quota = _muse_quota_capped(meta, s, now)
+    if quota:
+        return quota
     as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
     stamp = as_of.get(meta["seat"])
     if not stamp:
+        if meta.get("seat") == "muse":
+            return "unknown", "no usage source"
         return "unknown", "no reading"
     # A term that ended before the reset leaves nothing to spend. Billing fact,
     # not a usage reading, so its age does not matter.
@@ -1915,6 +1946,10 @@ def pool_status(pool_id, s, now):
     used = s.get(meta["used"])
     short = (meta.get("facts") or {}).get("window") == "5h"
     if not _is_number(used):
+        # A quota whose reset already passed left no measured percent. That is
+        # not the "this plan has no session window" open state.
+        if meta.get("seat") == "muse" and s.get("muse_exhausted") is True:
+            return "unknown", "no used %"
         # No 5h keys means this plan has no session window. That must not
         # block the weekly pool the way a failed reading would.
         if short:
@@ -2131,11 +2166,6 @@ def _load_cache():
     return {"ts": 0, "as_of": {}, "v": 1, "lines": []}
 
 LOCK_TIMEOUT = 30
-# Lock wait plus one 8s timeout for each seat refresh() reads after Claude
-# (codex, cursor, grok). The route clock is taken before those reads, and
-# the Claude stamp is the floor's arm time, so this budget is not added to
-# USAGE_MIN_INTERVAL_S. The Anthropic call rate stays one call per 600s.
-ROUTE_HOLD_MARGIN_S = LOCK_TIMEOUT + 3 * 8
 
 class _LockHandle:
     """Cache lock. owned=False is an inherited descriptor and must not be unlocked."""
@@ -2434,11 +2464,29 @@ def _lineup_ask(s, now, states, reason, alternatives):
 
 
 def _unknown_text(label, why):
-    """An aged reading says it is old. A missing stamp or used% is a failed reading."""
+    """An aged reading says it is old. A missing stamp or used% is a failed reading.
+
+    Muse with no file and no copied fields names the missing source.
+    """
     why = why or "unknown"
+    if why == "no usage source":
+        return "muse: no usage source"
     if why.startswith("reading ") and why.endswith(" old"):
         return f"{label} {why}: {_ASK}"
     return f"{label} reading unknown: {_FIX_ASK}"
+
+
+def _capped_skip_text(label, why):
+    """Skip text for a capped pool.
+
+    A Muse quota reason is the text pool_status recorded. The code stays
+    `capped`, the same word used for a spent pool (grok_exhausted, used at
+    100). `no_credits` is the failure-log reason `credits`, not this window.
+    """
+    if isinstance(why, str) and why.startswith("Muse quota exhausted"):
+        return why
+    extra = f", {why}" if isinstance(why, str) and why.startswith("resets ") else ""
+    return f"{label} capped{extra}"
 
 
 def _reopen(ts, now):
@@ -3373,7 +3421,8 @@ def _review_candidates(states, s, now, excluded_vendor):
                 continue
             capped = next((pid for pid in watched if states[pid][0] == "capped"), None)
             if capped:
-                skipped.append(_review_skip(spec, f"{_ask_label(capped)} capped", "capped"))
+                skipped.append(_review_skip(
+                    spec, _capped_skip_text(_ask_label(capped), states[capped][1]), "capped"))
                 continue
             pool_id = "muse_week"
         else:
@@ -3390,8 +3439,7 @@ def _review_candidates(states, s, now, excluded_vendor):
                 continue
             if pace == "capped":
                 label = POOLS[pool_id]["label"]
-                extra = f", {why}" if isinstance(why, str) and why.startswith("resets ") else ""
-                skipped.append(_review_skip(spec, f"{label} capped{extra}", "capped"))
+                skipped.append(_review_skip(spec, _capped_skip_text(label, why), "capped"))
                 continue
         pace = states[pool_id][0]
         used = s.get(POOLS[pool_id]["used"])
@@ -3563,14 +3611,14 @@ def _mixed_vendor_count(voters):
 
 
 def _mixed_ask_reason(excluded_vendor, voters, skipped):
-    if excluded_vendor:
-        shown = _VENDOR_NAME.get(excluded_vendor, excluded_vendor)
-    else:
-        shown = "nobody"
     vendors = _mixed_vendor_count(voters)
     word = "vendor" if vendors == 1 else "vendors"
-    return (f"need 2 voters from 2 vendors outside {shown}; "
-            f"{len(voters)} eligible across {vendors} {word}; "
+    if excluded_vendor:
+        shown = _VENDOR_NAME.get(excluded_vendor, excluded_vendor)
+        head = f"need 2 voters from 2 vendors outside {shown}"
+    else:
+        head = "need 2 voters from 2 vendors"
+    return (f"{head}; {len(voters)} eligible across {vendors} {word}; "
             f"skipped: {_format_skips(skipped)}: {_ASK}")
 
 
@@ -3659,8 +3707,7 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
             seat = POOLS[pid]["seat"] if pid in POOLS else spec["seat"]
             label = _ask_label(pid) if pid in POOLS else family
             why_c = states[pid][1] if pid in states else None
-            extra = f", {why_c}" if isinstance(why_c, str) and why_c.startswith("resets ") else ""
-            skipped.append(_mixed_skip(family, seat, f"{label} capped{extra}", "capped"))
+            skipped.append(_mixed_skip(family, seat, _capped_skip_text(label, why_c), "capped"))
     return _mixed_finish(voters, skipped, downgrade, excluded_vendor)
 
 
@@ -4469,7 +4516,15 @@ MUSE_REFRESH_S = 540
 MUSE_RESET_SKEW_S = 6 * 60 * 60
 
 def muse_reading_is_current(data, now):
-    """True when the file is a recent snapshot of a plausible 5h window."""
+    """True when the file is a recent snapshot of a plausible 5h window.
+
+    A quota observation is current for the same cadence. It is a reading,
+    so the next run does not open another turn until that cadence passes.
+    """
+    exhausted = _muse_file_exhausted(data)
+    if exhausted is not None:
+        captured = exhausted.get("captured")
+        return _is_number(captured) and now - captured < MUSE_REFRESH_S
     snap = _muse_snapshot(data)
     if snap is None:
         return False
@@ -4564,15 +4619,54 @@ def _msp_read(proc, buf, deadline):
         buf[0] += chunk
     return None
 
+def _muse_serve_argv(binary):
+    """Host argv. Contributor mode is always off. No model is pinned.
+
+    The host's configured model is used. A pin would have to pass
+    _review_model_barred: a spark id or a contributor id is barred, and this
+    reader does not pass --model.
+    """
+    return [binary, "serve", "--provider", "meta", "--contributor-mode", "off",
+            "--no-session-log", "--disable-shell", "--disable-write"]
+
+
+def _muse_turn_outcome(msg, now):
+    """One host message during a turn.
+
+    'usage' is a subscription object. 'quota' is a turn/completed whose
+    error.quota key is present; the message text is not read. 'fail' is any
+    other stopping turn failure. None means keep reading.
+    """
+    if not isinstance(msg, dict):
+        return None
+    if msg.get("method") == "usage/changed" and isinstance(msg.get("params"), dict):
+        return "usage", msg.get("params")
+    if msg.get("method") != "turn/completed":
+        return None
+    params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+    error = params.get("error") if isinstance(params.get("error"), dict) else None
+    if error is not None and "quota" in error:
+        quota = error.get("quota") if isinstance(error.get("quota"), dict) else {}
+        return "quota", {
+            "quota_exhausted": True,
+            "resets_at": _muse_ms(quota.get("resetsAtMs")),
+            "observed_at": now if _is_number(now) else time.time(),
+        }
+    if params.get("terminal") == "failed" or error is not None:
+        return "fail", None
+    return None
+
+
 def _muse_protocol_usage(binary, timeout):
-    """Last subscription usage from a short Muse host, or None.
+    """Last subscription usage from a short Muse host, a quota record, or None.
 
     A new host has nothing stored. usage/read is empty until a reply arrives,
-    so an empty read is followed by one one-word turn. The host is closed
-    either way.
+    so an empty read is followed by one one-word turn. A turn/completed whose
+    error.quota is present is the exhausted record. Any other turn failure is
+    None, and the file is left unchanged. The host is closed either way.
     """
     proc = subprocess.Popen(
-        [binary, "serve", "--provider", "meta", "--no-session-log", "--disable-shell", "--disable-write"],
+        _muse_serve_argv(binary),
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         cwd="/tmp", start_new_session=True,
     )
@@ -4638,9 +4732,14 @@ def _muse_protocol_usage(binary, timeout):
                 msg = _msp_read(proc, buf, deadline)
                 if msg is None:
                     break
-                if msg.get("method") == "usage/changed":
-                    usage = msg.get("params")
+                outcome = _muse_turn_outcome(msg, time.time())
+                if outcome and outcome[0] == "usage":
+                    usage = outcome[1]
                     break
+                if outcome and outcome[0] == "quota":
+                    return outcome[1]
+                if outcome and outcome[0] == "fail":
+                    return None
                 if msg.get("id") == 4 and "error" in msg:
                     return None
         return usage
@@ -4682,11 +4781,40 @@ def refresh_muse_usage(now=None, path=None, binary=None, timeout=40):
         usage = _muse_protocol_usage(binary, timeout)
     except Exception:
         return False
+    if isinstance(usage, dict) and usage.get("quota_exhausted") is True:
+        observed = usage.get("observed_at")
+        if not _is_number(observed):
+            observed = now
+        doc = {
+            "captured_at": datetime.fromtimestamp(observed, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "exhausted": True,
+        }
+        if _is_number(usage.get("resets_at")):
+            doc["exhausted_resets_at"] = usage["resets_at"]
+        _write_muse_file(path, doc)
+        return True
     doc = muse_document_from_protocol(usage)
     if doc is None:
         return False
     _write_muse_file(path, doc)
     return True
+
+def _muse_file_exhausted(data):
+    """{reset, captured} when the file is a quota record, else None.
+
+    `exhausted` or `muse_exhausted` true is the flag. The reset is
+    exhausted_resets_at or muse_exhausted_reset_ts. A file without the flag
+    is not this record, so an older cache still parses.
+    """
+    if not isinstance(data, dict):
+        return None
+    if data.get("exhausted") is not True and data.get("muse_exhausted") is not True:
+        return None
+    reset = _muse_epoch(data.get("exhausted_resets_at"))
+    if reset is None:
+        reset = _muse_epoch(data.get("muse_exhausted_reset_ts"))
+    return {"reset": reset, "captured": _muse_epoch(data.get("captured_at"))}
+
 
 def apply_muse(summary, now, path=None):
     """Copy a parsed Muse snapshot into summary.
@@ -4695,8 +4823,11 @@ def apply_muse(summary, now, path=None):
     Muse has no chair or builder strength.
 
     A 5h window whose reset has passed is still stored. The printed line says
-    so. A missing file or a shape that does not match drops as_of["muse"],
-    records errors["muse"], and leaves numbers already in summary alone.
+    so. An exhausted file sets muse_exhausted and the reset, stamps
+    as_of["muse"], and drops used percents it does not carry. A normal
+    snapshot clears that flag. A missing file or a shape that does not match
+    drops as_of["muse"], records errors["muse"], and leaves numbers already
+    in summary alone.
     """
     if not isinstance(summary, dict):
         return summary
@@ -4704,18 +4835,42 @@ def apply_muse(summary, now, path=None):
         path = muse_usage_path()
     as_of = dict(summary.get("as_of") or {})
     errors = dict(summary.get("errors") or {})
-    snap = None
+    raw = None
     try:
         with open(path) as f:
-            snap = _muse_snapshot(json.load(f))
+            raw = json.load(f)
     except Exception:
-        snap = None
-    if snap is not None:
+        raw = None
+    exhausted = _muse_file_exhausted(raw)
+    snap = None if exhausted else (_muse_snapshot(raw) if raw is not None else None)
+    if exhausted is not None:
+        summary["muse_exhausted"] = True
+        if _is_number(exhausted.get("reset")):
+            summary["muse_exhausted_reset_ts"] = exhausted["reset"]
+        else:
+            summary.pop("muse_exhausted_reset_ts", None)
+        carried = _muse_snapshot(raw)
+        if carried is not None:
+            summary["muse_5h"] = carried["current"]
+            summary["muse_5h_reset_ts"] = carried["window_reset"]
+            summary["muse_week"] = carried["weekly"]
+            summary["muse_week_reset_ts"] = carried["weekly_reset"]
+        else:
+            for key in ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts"):
+                summary.pop(key, None)
+        if _is_number(exhausted.get("captured")):
+            as_of["muse"] = exhausted["captured"]
+        else:
+            as_of["muse"] = now
+        errors.pop("muse", None)
+    elif snap is not None:
         summary["muse_5h"] = snap["current"]
         summary["muse_5h_reset_ts"] = snap["window_reset"]
         summary["muse_week"] = snap["weekly"]
         summary["muse_week_reset_ts"] = snap["weekly_reset"]
         as_of["muse"] = snap["captured"]
+        summary.pop("muse_exhausted", None)
+        summary.pop("muse_exhausted_reset_ts", None)
         errors.pop("muse", None)
     else:
         as_of.pop("muse", None)
@@ -5237,8 +5392,12 @@ def seat_rows(s, now=None):
                               num("grok_window_s"), stale_name="gk"))
 
     mu = groups["mu"]
+    quota_reset = num("muse_exhausted_reset_ts")
     if not ok("muse"):
         mu["bars"].append({"kind": "failed", "name": "mu", "seat": "muse"})
+    elif s.get("muse_exhausted") is True and quota_reset is not None and quota_reset > now:
+        # Same empty bar grok_exhausted uses. The reset is the quota reset.
+        mu["bars"].append({"kind": "empty", "name": "mu", "seat": "muse", "reset_ts": quota_reset})
     else:
         if num("muse_5h") is not None:
             mu["bars"].append(bar("mu 5h", "muse", "muse_5h", 218, num("muse_5h"), num("muse_5h_reset_ts"),

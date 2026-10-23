@@ -2869,7 +2869,10 @@ def muse_missing_or_broken_fixture_says_no_data_yet():
 
 @test
 def muse_pools_seat_a_voter_and_do_not_change_launch_routes():
-    assert su.SEAT_KEYS["muse"] == ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts")
+    assert su.SEAT_KEYS["muse"] == (
+        "muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts",
+        "muse_exhausted", "muse_exhausted_reset_ts",
+    )
     assert "muse_5h" in su.POOLS and "muse_week" in su.POOLS
     assert su.FAMILY_VENDOR["muse"] == "meta"
     assert su.FAMILY_VENDOR["wonder-full"] == "meta"
@@ -2900,7 +2903,7 @@ def muse_pools_seat_a_voter_and_do_not_change_launch_routes():
     assert "wonder-full" not in [v["family"] for v in capped["lineup"]["voters"]], capped
     missing = su.route_lineup(without_as_of(snap(), "muse"), NOW)
     assert missing["mode"] == "ask" and missing["lineup"] is None, missing
-    assert "Muse" in missing["reason"], missing
+    assert missing["reason"] == "muse: no usage source", missing
     # A named model on the snapshot is not a route input.
     extra = snap(model="muse-spark-1.3")
     for role in ("bounded-question", "hard-bug", "builder", "chair"):
@@ -4982,7 +4985,6 @@ def held_claude_floor_stays_inside_live_freshness():
     # reading in the 10m bucket while the floor still blocks. The route clock
     # is taken before the later seats, so their time is not added to the age.
     delay = su.LOCK_TIMEOUT
-    assert su.ROUTE_HOLD_MARGIN_S >= su.LOCK_TIMEOUT + 3 * 8
     with anthropic_server() as server:
         profile, usage = server_urls(server)
         with seat_http_sandbox(profile, usage):
@@ -5027,6 +5029,21 @@ def held_claude_floor_stays_inside_live_freshness():
                 assert st != "unknown", (st, why, age)
                 # The import-time stamp at this same route clock is 10m old.
                 assert int((route_now - start) // 60) == 10, route_now - start
+                # cmd_route takes that clock. time.time() after the later seat
+                # is already in the 10m bucket, so reverting the selection fails.
+                clock.t = arm + su.USAGE_MIN_INTERVAL_S - 1
+                argv = sys.argv
+                sys.argv = [str(BIN), "--route", "bounded-question"]
+                buf = io.StringIO()
+                try:
+                    with contextlib.redirect_stdout(buf):
+                        su.cmd_route()
+                finally:
+                    sys.argv = argv
+                routed = buf.getvalue()
+                assert "10m old" not in routed, routed
+                assert "fable" in routed, routed
+                assert clock.t - summary["as_of"]["claude"] > su.ROUTE_FRESH_S
             finally:
                 su.time.time = real_time
                 su.get = real_get
@@ -5071,7 +5088,7 @@ def mixed_skips_stale_and_unknown_and_asks_only_when_short():
     assert "wonder-full" not in _voter_families(muse_row), muse_row
     muse = next(item for item in muse_row["skipped"] if item["family"] == "wonder-full")
     assert muse["code"] == "unknown" and muse["seat"] == "muse", muse
-    assert "Muse 5h reading unknown" in muse["reason"], muse
+    assert muse["reason"] == "muse: no usage source", muse
     # One eligible voter after skips asks, and the reason lists seats and codes.
     thin = without_as_of(snap(codex=100), "muse")
     thin["as_of"]["claude"] = NOW - 650
@@ -5093,12 +5110,15 @@ def mixed_skips_stale_and_unknown_and_asks_only_when_short():
     assert same["mode"] == "ask", same
     assert sorted(_voter_families(same) if same.get("lineup") else []) == [], same
     assert "need 2 voters from 2 vendors" in same["reason"], same["reason"]
+    assert "outside nobody" not in same["reason"], same["reason"]
+    assert not same["reason"].startswith("need 2 voters from 2 vendors outside"), same["reason"]
     # The excluded vendor is not counted and is not listed as a skip.
     held = without_as_of(snap(), "chatgpt")
     held["as_of"]["grok"] = NOW - 650
     excluded = su.route_lineup(held, NOW, kind="mixed", author="fable")
     assert excluded["mode"] == "ask", excluded
     assert excluded["excluded"]["vendor"] == "anthropic", excluded
+    assert "outside Anthropic" in excluded["reason"], excluded["reason"]
     assert all(item["family"] != "fable" for item in excluded["skipped"]), excluded["skipped"]
     assert "claude/" not in excluded["reason"], excluded["reason"]
     seated = [item["family"] for item in excluded["skipped"]]
@@ -5195,6 +5215,191 @@ def mixed_json_lists_skipped_and_review_still_skips_its_own_way():
         assert reviewed["mode"] != "ask", reviewed
         assert any(item["family"] == "fable" and item["code"] == "stale" for item in reviewed["skipped"]), reviewed
         assert "fable" not in _voter_families(reviewed)
+
+
+def _drop_muse_percents(summary):
+    for key in ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts"):
+        summary.pop(key, None)
+    return summary
+
+
+@test
+def muse_quota_turn_records_exhausted_and_not_a_used_percent():
+    resets_ms = 1792972800000  # 2026-10-26T00:00:00Z, from the sanitized probe
+    message = "nope"
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        argv_path = d / "argv.txt"
+        binary = d / "muse"
+        _muse_stub(binary, '''
+import json, sys
+open(%r, "w").write("\\n".join(sys.argv))
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"ok": True}}), flush=True)
+    elif method == "usage/read":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {}}), flush=True)
+    elif method == "session/start":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"session": {"sessionId": "s1"}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"status": "accepted"}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "turn/completed", "params": {
+            "terminal": "failed",
+            "error": {"kind": "modelError", "message": %s, "retryable": False,
+                      "quota": {"limitKind": "tierLimit", "resetsAtMs": %d}},
+        }}), flush=True)
+        break
+''' % (str(argv_path), json.dumps(message), resets_ms))
+        dest = d / "muse-usage.json"
+        dest.write_text(json.dumps({
+            "captured_at": "2026-10-22T17:50:29Z",
+            "window": {"used_percent": 99, "window_duration_mins": 300, "resets_at": 1792972800},
+            "weekly": {"used_percent": 99, "resets_at": "2026-10-26T00:00:00Z"},
+        }))
+        assert su.refresh_muse_usage(time.time(), path=str(dest), binary=str(binary), timeout=5) is True
+        argv = argv_path.read_text().splitlines()
+        assert "--contributor-mode" in argv and argv[argv.index("--contributor-mode") + 1] == "off", argv
+        assert "--model" not in argv, argv
+        raw = dest.read_text()
+        got = json.loads(raw)
+        assert got["exhausted"] is True, got
+        assert got["exhausted_resets_at"] == 1792972800, got
+        assert "used_percent" not in raw and "usedPercent" not in raw, raw
+        assert message not in raw, raw
+        summary = {"v": 1, "as_of": {}, "muse_5h": 99, "muse_week": 99,
+                   "muse_5h_reset_ts": 1, "muse_week_reset_ts": 1}
+        su.apply_muse(summary, time.time(), path=str(dest))
+        assert summary["muse_exhausted"] is True, summary
+        assert summary["muse_exhausted_reset_ts"] == 1792972800, summary
+        assert "muse_5h" not in summary and "muse_week" not in summary, summary
+        assert abs(summary["as_of"]["muse"] - su._muse_epoch(got["captured_at"])) < 1, summary
+        called = d / "called"
+        decoy = d / "decoy"
+        _muse_stub(decoy, 'open(%r, "w").write("called\\n")\n' % str(called))
+        assert su.refresh_muse_usage(time.time(), path=str(dest), binary=str(decoy), timeout=5) is False
+        assert not called.exists()
+        assert json.loads(dest.read_text())["exhausted"] is True
+
+
+@test
+def muse_non_quota_failure_records_nothing():
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        binary = d / "muse"
+        _muse_stub(binary, r'''
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"ok": True}}), flush=True)
+    elif method == "usage/read":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {}}), flush=True)
+    elif method == "session/start":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"session": {"sessionId": "s1"}}}), flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"status": "accepted"}}), flush=True)
+        print(json.dumps({"jsonrpc": "2.0", "method": "turn/completed", "params": {
+            "terminal": "failed",
+            "error": {"kind": "modelError", "message": "Subscription quota exhausted. Your usage window resets.",
+                      "retryable": False},
+        }}), flush=True)
+        break
+''')
+        dest = d / "muse-usage.json"
+        before = json.dumps({"captured_at": "2026-10-22T17:50:29Z", "window": {"used_percent": 99,
+                             "window_duration_mins": 300, "resets_at": 1},
+                             "weekly": {"used_percent": 99, "resets_at": 2}})
+        dest.write_text(before)
+        assert su.refresh_muse_usage(time.time(), path=str(dest), binary=str(binary), timeout=5) is False
+        assert dest.read_text() == before
+        absent = d / "missing.json"
+        assert su.refresh_muse_usage(time.time(), path=str(absent), binary=str(binary), timeout=5) is False
+        assert not absent.exists()
+
+
+@test
+def muse_exhausted_routes_capped_until_the_reset_and_names_a_missing_source():
+    reset = NOW + 3 * 86400
+    s = _drop_muse_percents(snap())
+    s["muse_exhausted"] = True
+    s["muse_exhausted_reset_ts"] = reset
+    s["as_of"] = dict(s["as_of"], muse=NOW - 5000)
+    with local_tz("UTC"):
+        for pid in ("muse_5h", "muse_week"):
+            st, why = su.pool_status(pid, s, NOW)
+            assert st == "capped", (pid, st, why)
+            assert why == "Muse quota exhausted, resets " + su._muse_local(reset), why
+        mixed = su.route_lineup(s, NOW, kind="mixed")
+        review = su.route_review(s, NOW, "xai")
+    assert mixed["mode"] != "ask", mixed
+    assert "wonder-full" not in [v["family"] for v in mixed["lineup"]["voters"]], mixed
+    muse = next(item for item in mixed["skipped"] if item["family"] == "wonder-full")
+    assert muse["code"] == "capped" and muse["reason"].startswith("Muse quota exhausted, resets "), muse
+    assert "no_credits" not in json.dumps(mixed["skipped"]), mixed["skipped"]
+    text = su.format_lineup(mixed)
+    assert "skipped: wonder-full | capped | Muse quota exhausted, resets " in text, text
+    wonder = next(item for item in review["skipped"] if item["family"] == "wonder")
+    assert wonder["code"] == "capped" and wonder["reason"] == muse["reason"], wonder
+    assert "wonder" not in [v["family"] for v in review["reviewers"]], review
+    shown = su.format_review(review)
+    assert "skipped: wonder | capped | Muse quota exhausted, resets " in shown, shown
+    rows = {g["id"]: g for g in su.seat_rows(s, NOW)}
+    assert rows["mu"]["bars"] == [{"kind": "empty", "name": "mu", "seat": "muse", "reset_ts": reset}], rows["mu"]
+    # A reset already past is not capped. An old stamp is stale, as before.
+    past = _drop_muse_percents(snap())
+    past["muse_exhausted"] = True
+    past["muse_exhausted_reset_ts"] = NOW - 1
+    past["as_of"] = dict(past["as_of"], muse=NOW - 5000)
+    st, why = su.pool_status("muse_week", past, NOW)
+    assert st == "unknown" and why.startswith("reading ") and why.endswith(" old"), (st, why)
+    past_row = su.route_lineup(past, NOW, kind="mixed")
+    past_muse = next(item for item in past_row["skipped"] if item["family"] == "wonder-full")
+    assert past_muse["code"] == "stale", past_muse
+    fresh_past = _drop_muse_percents(snap())
+    fresh_past["muse_exhausted"] = True
+    fresh_past["muse_exhausted_reset_ts"] = NOW - 1
+    st5, why5 = su.pool_status("muse_5h", fresh_past, NOW)
+    assert st5 == "unknown" and why5 == "no used %", (st5, why5)
+    # No file, no fields, and a pull-only copy without Muse fields stay unknown.
+    mute = without_as_of(snap(), "muse")
+    mute_row = su.route_lineup(mute, NOW, kind="mixed")
+    mute_muse = next(item for item in mute_row["skipped"] if item["family"] == "wonder-full")
+    assert mute_muse["code"] == "unknown" and mute_muse["reason"] == "muse: no usage source", mute_muse
+    asked = su.route_lineup(mute, NOW)
+    assert asked["mode"] == "ask" and asked["reason"] == "muse: no usage source", asked
+    bare = {k: v for k, v in snap().items() if not str(k).startswith("muse")}
+    bare["as_of"] = {k: v for k, v in bare["as_of"].items() if k != "muse"}
+    bare["pulled_ts"] = NOW
+    bare_row = su.route_lineup(bare, NOW, kind="mixed")
+    bare_muse = next(item for item in bare_row["skipped"] if item["family"] == "wonder-full")
+    assert bare_muse["reason"] == "muse: no usage source" and bare_muse["code"] == "unknown", bare_muse
+    now = time.time()
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d) / "home"
+        cache_dir = Path(d) / "cache"
+        home.mkdir()
+        cache_dir.mkdir()
+        body = _shift_snap(now)
+        _drop_muse_percents(body)
+        body["muse_exhausted"] = True
+        body["muse_exhausted_reset_ts"] = now + 3 * 86400
+        body["as_of"]["muse"] = now
+        (cache_dir / "latest.json").write_text(json.dumps(body))
+        proc = _run_bin(home, cache_dir, ["--route", "lineup", "--kind", "mixed", "--cached", "--json"])
+        assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
+        row = json.loads(proc.stdout)[0]
+        item = next(x for x in row["skipped"] if x["family"] == "wonder-full")
+        assert item["code"] == "capped" and item["reason"].startswith("Muse quota exhausted, resets "), item
+        text = _run_bin(home, cache_dir, ["--route", "lineup", "--kind", "mixed", "--cached"])
+        assert "skipped: wonder-full | capped | Muse quota exhausted, resets " in text.stdout, text.stdout
+        reviewed = _run_bin(home, cache_dir, ["--route", "review", "--builder-vendor", "xai", "--cached", "--json"])
+        assert reviewed.returncode == 0, reviewed.stderr
+        rev = json.loads(reviewed.stdout)[0]
+        rev_item = next(x for x in rev["skipped"] if x["family"] == "wonder")
+        assert rev_item["code"] == "capped" and rev_item["reason"].startswith("Muse quota exhausted, resets "), rev_item
 
 
 def main():

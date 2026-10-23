@@ -26,7 +26,9 @@ cookie flag, or burn text. One machine (BLD) does every reading and
 pushes; a reader (the shared VM) runs --pull and draws meters from that copy
 without any vendor login. --pull filters again, so a gist edited by hand
 still cannot put a string into the reader's cache. It also writes Muse's
-muse-usage.json from the muse_* numbers so seat-meters can draw Muse.
+muse-usage.json from the muse_* numbers, or from muse_exhausted and
+muse_exhausted_reset_ts when those are the only Muse fields, so a reader
+can show Muse capped. No used percent is invented.
 """
 import hashlib, json, os, re, signal, subprocess, sys, tempfile, time
 
@@ -96,10 +98,12 @@ CACHE_NUMBERS = frozenset([
     "bot_pct", "bot_reset_ts", "bot_window_s",
     "grok_pct", "grok_reset_ts", "grok_window_s", "grok_402_h", "grok_renews_ts",
     "muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts",
+    "muse_exhausted_reset_ts",
 ] + _GOOGLE + _CAPS)
 # claude_max is the Claude plan as one bit (seat-usage derives it from the plan
 # name on the reading machine), so a reader can route Fable without the name.
-CACHE_FLAGS = frozenset(["bot_exhausted", "grok_exhausted", "claude_renews", "codex_renews",
+# muse_exhausted is the typed quota flag. Absent on an older gist.
+CACHE_FLAGS = frozenset(["bot_exhausted", "grok_exhausted", "muse_exhausted", "claude_renews", "codex_renews",
                          "cursor_renews", "grok_renews", "claude_max"])
 AS_OF_SEATS = frozenset(["claude", "chatgpt", "cursor", "grokbot", "grok", "muse", "google"])
 # The only strings that may leave the machine. Anything else is dropped.
@@ -136,15 +140,27 @@ def build_cache_copy(cache):
 
 
 def muse_doc(copy):
-    """Muse's own file, rebuilt from the copied muse_* numbers. None without both windows."""
+    """Muse's own file, from the copied numbers or from the exhausted flag.
+
+    Both windows are enough. muse_exhausted with its reset is enough on its
+    own, and no used percent is filled in. None when neither is present.
+    An older copy without the flag still builds the window document.
+    """
     p5, r5, pw, rw = (copy.get(k) for k in ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts"))
-    if not all(_finite(v) for v in (p5, r5, pw, rw)):
+    has_windows = all(_finite(v) for v in (p5, r5, pw, rw))
+    exhausted = copy.get("muse_exhausted") is True and _finite(copy.get("muse_exhausted_reset_ts"))
+    if not has_windows and not exhausted:
         return None
     at = (copy.get("as_of") or {}).get("muse") or copy.get("ts")
     iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
-    return {"captured_at": iso(at) if _finite(at) else None,
-            "window": {"used_percent": p5, "window_duration_mins": 300, "resets_at": iso(r5)},
-            "weekly": {"used_percent": pw, "resets_at": iso(rw)}}
+    doc = {"captured_at": iso(at) if _finite(at) else None}
+    if has_windows:
+        doc["window"] = {"used_percent": p5, "window_duration_mins": 300, "resets_at": iso(r5)}
+        doc["weekly"] = {"used_percent": pw, "resets_at": iso(rw)}
+    if exhausted:
+        doc["exhausted"] = True
+        doc["exhausted_resets_at"] = copy["muse_exhausted_reset_ts"]
+    return doc
 
 
 def num(v):

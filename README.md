@@ -130,7 +130,7 @@ A reader host (Surface, or the shared VM) does not read seats. It renders the co
         systemctl --user link "$PWD/systemd/seat-usage-pull.service" "$PWD/systemd/seat-usage-pull.timer"
         systemctl --user enable --now seat-usage-pull.timer
 
-    The service runs `seat-usage-push --pull`. That refilters, writes `~/.cache/seat-usage/latest.json` with `pulled_ts`, and writes `~/.cache/quartermaster/muse-usage.json` when both Muse windows are in the copy. It does not run `seat-usage`.
+    The service runs `seat-usage-push --pull`. That refilters, writes `~/.cache/seat-usage/latest.json` with `pulled_ts`, and writes `~/.cache/quartermaster/muse-usage.json` when both Muse windows are in the copy, or when the copy has `muse_exhausted` and `muse_exhausted_reset_ts` and no used percent. It does not run `seat-usage`.
 
 4. Verify, without printing the gist id:
 
