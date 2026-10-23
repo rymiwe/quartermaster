@@ -11,10 +11,12 @@ writes that file, and a live run asks `muse serve` for a new reading when
 the file is missing, older than about 10 minutes, or its 5h reset is not a
 current window. That ask is one short reply. A parsed snapshot is copied
 into this cache (muse_5h, muse_week, and their resets, stamped
-as_of["muse"]), including one whose 5h window has already reset. It is
-display-only and is not a routing input. A missing or unreadable file
-drops that stamp and records the reason. SEAT_USAGE_SKIP_MUSE=1 skips the
-ask. --cached never asks.
+as_of["muse"]), including one whose 5h window has already reset. That
+stamp is a routing input: wonder-full votes on those pools. A missing or
+unreadable file drops that stamp and records the reason.
+SEAT_USAGE_SKIP_MUSE=1 skips the ask. --cached never asks.
+--help and -h print this text and exit before a self-update, a reader, a
+lock, or a cache write.
 Google AI Pro is read from the signed-in Antigravity CLI: `agy -p "/usage"`
 (binary `agy` on PATH, else ~/.local/bin/agy; SEAT_USAGE_AGY overrides).
 The table's percent is remaining; stored percents are used (100 - remaining)
@@ -74,7 +76,16 @@ ROUTE_FRESH_PULLED_S = ROUTE_FRESHNESS_DEFAULT_S["pulled"]
 # read clears the streak and holds both Anthropic URLs for
 # USAGE_MIN_INTERVAL_S. The profile call is skipped while the cached plan is
 # usable, so a refresh is one request. A 401 or 429 on profile arms the same
-# backoff and does not call usage. The floor stays <= ROUTE_FRESH_S.
+# backoff and does not call usage. The floor stays equal to ROUTE_FRESH_S on
+# purpose: shortening it would call Anthropic more often, which is what the
+# floor was added to stop. as_of["claude"] is the same clock that arms the
+# floor (when the body lands), not import time. The route clock is taken
+# after the status-line lock and before the seat reads, so that wait and the
+# later sequential reads sit outside the age. While the floor still blocks,
+# the age at the route clock is therefore strictly under the live window.
+# ROUTE_HOLD_MARGIN_S (next to LOCK_TIMEOUT) is the budget those two delays
+# get. A 429 backoff is a different hold: it may outlive the window, and the
+# reading then goes stale instead of being called early.
 USAGE_MIN_INTERVAL_S = float(os.environ.get("SEAT_USAGE_MIN_INTERVAL_S") or 600)   # tests set 0
 USAGE_BACKOFF_S = 300
 USAGE_BACKOFF_MAX_S = 7200
@@ -320,11 +331,14 @@ def _usage_get(headers, timeout=8):
         limits.pop(_streak_key(url, "401"), None)
         now = time.time()
         # One interval for both endpoints, so the profile call is not due
-        # again in the same window as this usage read.
+        # again in the same window as this usage read. This same clock is
+        # as_of["claude"]. Import time is earlier by the lock wait and this
+        # call, and that gap left a held reading older than the live window
+        # while the floor still blocked the next one.
         _arm_min_interval(limits, url, now)
         _arm_min_interval(limits, ANTHROPIC_PROFILE_URL, now)
         _store_if_changed(limits, had)
-        return body
+        return body, now
     finally:
         _release_rate_lock(lock)
 
@@ -663,7 +677,9 @@ def when(ts):
 def claude():
     # Local expiry and an on-disk backoff both return before any HTTP call.
     # A live usage deadline is served from the last reading, as_of included.
-    # Route already treats a stamp older than 10 minutes as unknown.
+    # A fresh body stamps as_of with the clock that armed the min-interval
+    # floor, not with the import-time NOW. Route treats a stamp older than
+    # the live window as unknown.
     try:
         d = json.load(open(f"{H}/.claude/.credentials.json")).get("claudeAiOauth") or {}
         if "accessToken" not in d:
@@ -698,7 +714,7 @@ def claude():
         except Exception as e:
             plan, status = "?", f"profile failed: {_err(e)}"
     try:
-        u = _usage_get(hdr)
+        u, landed = _usage_get(hdr)
         parts = []
         scoped = False
         for l in u.get("limits", []):
@@ -722,7 +738,7 @@ def claude():
         if is_max is not None:
             SUMMARY["claude_max"] = is_max
         claude_renewal(status)
-        SUMMARY["as_of"]["claude"] = NOW
+        SUMMARY["as_of"]["claude"] = landed
         _set_read_state("claude", "fresh")
         out.append(f"claude   | {plan} {status} | " + " | ".join(parts))
     except _RateLimited as e:
@@ -1951,7 +1967,10 @@ def _reading_age(pool_id, s, now):
     stamp = as_of.get(seat)
     if not stamp:
         return None
-    return now - stamp
+    # A stamp taken while this refresh was still reading is newer than the
+    # route clock. That reading is fresh; the age is zero, not negative.
+    age = now - stamp
+    return age if age > 0 else 0
 
 def _row(role, s, now, mode, reason, **over):
     base = ROLES[role]["default"]
@@ -2112,6 +2131,11 @@ def _load_cache():
     return {"ts": 0, "as_of": {}, "v": 1, "lines": []}
 
 LOCK_TIMEOUT = 30
+# Lock wait plus one 8s timeout for each seat refresh() reads after Claude
+# (codex, cursor, grok). The route clock is taken before those reads, and
+# the Claude stamp is the floor's arm time, so this budget is not added to
+# USAGE_MIN_INTERVAL_S. The Anthropic call rate stays one call per 600s.
+ROUTE_HOLD_MARGIN_S = LOCK_TIMEOUT + 3 * 8
 
 class _LockHandle:
     """Cache lock. owned=False is an inherited descriptor and must not be unlocked."""
@@ -2263,17 +2287,25 @@ def _store_merged(base, lines, seats, now, stamp_now):
         pass
     return merged
 
+# Clock for the route decision that follows refresh(). Set after the lock
+# wait and before the seat reads. None until the first refresh in this process.
+_ROUTE_NOW = None
+
 def refresh(seats):
     """Reread the named seats under the status-line lock and merge them into the cache.
 
     Seats are claude, chatgpt (codex), cursor (also grokbot), grok. Waits up to 30s
     for ~/.cache/seat-usage/.lock; on timeout returns the cache unchanged.
+    _ROUTE_NOW is time.time() once that wait is over and before the reads, so
+    a floor-held Claude reading is judged before the later seats can age it.
     """
-    global SUMMARY
+    global SUMMARY, _ROUTE_NOW
     if pull_only():
+        _ROUTE_NOW = time.time()
         return _load_cache()
     wanted = set(seats)
     lock = _acquire_lock(LOCK_TIMEOUT)
+    _ROUTE_NOW = time.time()
     base = _load_cache()
     if lock is None:
         return base
@@ -2309,7 +2341,8 @@ load_config()
 # nobody for design, the author's vendor for review and mixed, and the named
 # author for audit. A capped pool drops the leg. A pool that is ahead of
 # pace still votes, at low. A capped Muse window drops it. An unknown
-# reading asks.
+# reading asks, except mixed, which skips it and asks only when fewer
+# than two vendors remain.
 VOTER_ROSTER = (
     {"family": "fable", "seat": "claude", "pools": ("fable", "claude_week", "claude_5h")},
     {"family": "astra", "seat": "chatgpt", "pools": ("codex",)},
@@ -3188,7 +3221,8 @@ def _reading_age_seat(seat, s, now):
     stamp = as_of.get(seat)
     if not stamp:
         return None
-    return now - stamp
+    age = now - stamp
+    return age if age > 0 else 0
 
 
 def _review_row(spec, metrics, s, now, states, pool_id):
@@ -3456,6 +3490,180 @@ def route_review(s, now, builder_vendor):
             "usage_age_s": _snapshot_age(s, now)}
 
 
+_READ_STATE_FAIL = ("token_expired", "rate_limited", "usage_failed")
+
+
+def _read_state_block(seat, s):
+    """(code, human) for a failed read_state, else None.
+
+    The same three codes _review_seat_block uses. A recent failure and
+    --exclude-seat stay on the review path.
+    """
+    state = s.get("read_state") if isinstance(s.get("read_state"), dict) else {}
+    code = state.get(seat)
+    if code in _READ_STATE_FAIL:
+        return f"read_state:{code}", f"{seat} read_state {code}"
+    return None
+
+
+def _mixed_face(family, seat):
+    return {"family": family, "seat": seat, "vendor": FAMILY_VENDOR.get(family)}
+
+
+def _mixed_skip(family, seat, reason, code):
+    row = _review_skip(_mixed_face(family, seat), reason, code)
+    if row.get("model") is None:
+        row.pop("model", None)
+    return row
+
+
+def _first_unknown(states, pids):
+    for pid in pids:
+        if states[pid][0] == "unknown":
+            return pid, states[pid][1]
+    return None, None
+
+
+def _fable_unknown_pool(states, s):
+    """The pool _fable_voter would ask on, or (None, None)."""
+    absent = _fable_slice_absent(states, s)
+    if not absent:
+        found = _first_unknown(states, ("fable", "claude_week", "claude_5h"))
+        if found[0]:
+            return found
+    _ready, unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
+    if unknown:
+        return unknown[0]
+    return None, None
+
+
+def _mixed_unknown_label(family, pid):
+    if family == "fable":
+        return "Fable" if pid == "fable" else POOLS[pid]["label"]
+    if family == "wonder-full":
+        return _ask_label(pid)
+    return _FAMILY_NAME.get(family, family)
+
+
+def _mixed_blocks(item):
+    code = item.get("code") or ""
+    return code in ("stale", "unknown") or code.startswith("read_state:")
+
+
+def _format_skips(skipped):
+    parts = []
+    for item in skipped:
+        seat = item.get("seat") or item.get("family") or "-"
+        parts.append(f"{seat}/{item.get('code') or '-'}")
+    return ", ".join(parts) if parts else "none"
+
+
+def _mixed_vendor_count(voters):
+    return len({v.get("vendor") for v in voters if v.get("vendor")})
+
+
+def _mixed_ask_reason(excluded_vendor, voters, skipped):
+    if excluded_vendor:
+        shown = _VENDOR_NAME.get(excluded_vendor, excluded_vendor)
+    else:
+        shown = "nobody"
+    vendors = _mixed_vendor_count(voters)
+    word = "vendor" if vendors == 1 else "vendors"
+    return (f"need 2 voters from 2 vendors outside {shown}; "
+            f"{len(voters)} eligible across {vendors} {word}; "
+            f"skipped: {_format_skips(skipped)}: {_ASK}")
+
+
+def _mixed_finish(voters, skipped, downgrade, excluded_vendor):
+    """Lineup, downgrade, or ask. Caps alone still leave a one-voter lineup."""
+    blocking = [item for item in skipped if _mixed_blocks(item)]
+    short = _mixed_vendor_count(voters) < 2
+    if short and (blocking or len(voters) >= 2):
+        return "ask", (_mixed_ask_reason(excluded_vendor, voters, skipped), skipped)
+    if not voters and not downgrade:
+        reason = f"nothing usable left: {_ASK}"
+        if skipped:
+            reason = f"nothing usable left; skipped: {_format_skips(skipped)}: {_ASK}"
+        return "ask", (reason, skipped)
+    if downgrade:
+        return "downgrade", (voters, downgrade, skipped)
+    return "ok", (voters, skipped)
+
+
+def _collect_mixed_voters(states, s, now, excluded_vendor):
+    """Mixed voters. Stale, unknown, and failed read_state seats are skipped.
+
+    The council needs two voters from two vendors, neither of them the
+    excluded vendor. Ask only when a stale, unknown, or read_state skip
+    leaves fewer than that, or when the only eligible voters share one
+    vendor. Capped seats are listed and do not by themselves turn a
+    one-voter lineup into an ask. The excluded vendor is not counted and
+    is not a skip row. Recent failures and --exclude-seat are not applied.
+    """
+    excluded = {excluded_vendor} if excluded_vendor else set()
+    voters, skipped = [], []
+    downgrade = None
+    for spec in VOTER_ROSTER:
+        family = spec["family"]
+        if FAMILY_VENDOR.get(family) in excluded:
+            continue
+        pid = None
+        why = None
+        if family == "fable":
+            status, payload = _fable_voter(states, s, now, excluded_vendor == "xai")
+            if status == "ask":
+                pid, why = _fable_unknown_pool(states, s)
+        elif family == "grok":
+            status, payload = _other_voter("grok", "grok", states, s, now)
+            if status == "ask":
+                pid, why = "grok", states["grok"][1]
+            elif status == "skip":
+                pid = "grok"
+        elif family == "wonder-full":
+            status, payload = _muse_voter(states, s, now, skip_ahead=False)
+            if status == "ask":
+                pid, why = _first_unknown(states, ("muse_5h", "muse_week"))
+            elif status == "skip":
+                pid = next((p for p in ("muse_5h", "muse_week") if states[p][0] == "capped"), "muse_week")
+        else:
+            pid = spec["pools"][0]
+            status, payload = _other_voter(family, pid, states, s, now)
+            if status == "ask":
+                why = states[pid][1]
+        if status == "downgrade":
+            downgrade = payload
+            continue
+        if status == "row":
+            seat = payload.get("seat") or spec["seat"]
+            block = _read_state_block(seat, s)
+            if block:
+                skipped.append(_mixed_skip(family, seat, block[1], block[0]))
+                continue
+            voters.append(payload)
+            continue
+        if status == "ask":
+            seat = POOLS[pid]["seat"] if pid in POOLS else spec["seat"]
+            block = _read_state_block(seat, s)
+            if block:
+                skipped.append(_mixed_skip(family, seat, block[1], block[0]))
+                continue
+            if pid in POOLS and why is not None:
+                reason = _unknown_text(_mixed_unknown_label(family, pid), why)
+                code = _review_unknown_code(why)
+            else:
+                reason = payload if isinstance(payload, str) else "reading unknown"
+                code = "unknown"
+            skipped.append(_mixed_skip(family, seat, reason, code))
+            continue
+        if status == "skip":
+            seat = POOLS[pid]["seat"] if pid in POOLS else spec["seat"]
+            label = _ask_label(pid) if pid in POOLS else family
+            why_c = states[pid][1] if pid in states else None
+            extra = f", {why_c}" if isinstance(why_c, str) and why_c.startswith("resets ") else ""
+            skipped.append(_mixed_skip(family, seat, f"{label} capped{extra}", "capped"))
+    return _mixed_finish(voters, skipped, downgrade, excluded_vendor)
+
+
 def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=None):
     """One lineup, or ask.
 
@@ -3482,8 +3690,12 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
     A builder family the caller already used is kept when that pool can take it,
     and dropped when the pool is capped. With a kind, an ahead pool can still
     take that family. A voter is dropped only when its pool is capped. Ahead of
-    pace still votes, at low. An unknown reading asks. Voter effort follows burn.
-    One voter is a weaker lineup, not an ask.
+    pace still votes, at low. Design, audit, and a lineup with no kind ask on
+    the first unknown reading. Mixed skips a stale, unknown, or failed
+    read_state and asks only when fewer than two vendors remain. A capped
+    seat is listed and still leaves a one-voter lineup in place. Voter effort
+    follows burn. One voter is a weaker lineup, not an ask, when the shortfall
+    is only caps.
     """
     states = {pid: pool_status(pid, s, now) for pid in POOLS}
     family = None if builder is None else builder.get("family")
@@ -3555,6 +3767,7 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
 
     review_why = None
     review_skipped = None
+    mixed_skipped = None
     if kind == "review":
         status, payload = _collect_review_voters(states, s, now, excluded_vendor)
         if status == "ask":
@@ -3567,6 +3780,23 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
             return asked
         voters, review_skipped, review_why = payload
         downgrade = None
+    elif kind == "mixed":
+        status, payload = _collect_mixed_voters(states, s, now, excluded_vendor)
+        if status == "ask":
+            why, mixed_skipped = payload
+            asked = _lineup_ask(s, now, states, why, [])
+            asked["kind"] = "mixed"
+            asked["skipped"] = mixed_skipped
+            if excl is not None:
+                asked["author"] = excl.get("author")
+                asked["excluded"] = {"vendor": excl.get("vendor"), "name": excl.get("name"),
+                                     "family": excl.get("family"), "why": excl.get("why")}
+            return asked
+        downgrade = None
+        if status == "downgrade":
+            voters, downgrade, mixed_skipped = payload
+        else:
+            voters, mixed_skipped = payload
     else:
         status, payload = _collect_voters(states, s, now, excluded_vendor)
         if status == "ask":
@@ -3590,6 +3820,8 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
         row["builder_vendor"] = excluded_vendor
         row["skipped"] = review_skipped or []
         row["why"] = review_why
+    if kind == "mixed":
+        row["skipped"] = mixed_skipped or []
     if downgrade:
         row["downgrade"] = downgrade
     return row
@@ -4018,7 +4250,13 @@ def cmd_route():
                 if seat not in seats:
                     seats.append(seat)
         summary = refresh(seats)
-    now = time.time()
+    # Cached routes have no live read. A live route uses the clock refresh()
+    # took after the lock and before the seat reads, so those reads cannot
+    # push a floor-held Claude stamp over the live window.
+    if cached:
+        now = time.time()
+    else:
+        now = _ROUTE_NOW if _ROUTE_NOW is not None else time.time()
     if role == "lineup":
         rows = [route_lineup(summary, now, builder=builder, kind=kind, author=author,
                              builder_vendor=builder_vendor)]
@@ -6032,6 +6270,9 @@ def cmd_record_failure():
 
 
 def main():
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print(__doc__)
+        return
     maybe_self_update()
     if "--record-failure" in sys.argv:
         cmd_record_failure()

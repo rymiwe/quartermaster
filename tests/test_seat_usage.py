@@ -1202,10 +1202,10 @@ def usage_429_keeps_as_of_until_retry_after():
                 json.dump({usage: past}, f)
             server.usage_mode = "ok"
             su.NOW = time.time()
-            success_as_of = su.NOW
             fresh = _quiet_cache()
+            success_as_of = fresh["as_of"]["claude"]
             assert server.usage_hits == 2, server.usage_hits
-            assert fresh["as_of"]["claude"] == success_as_of, fresh["as_of"]
+            assert su.NOW <= success_as_of <= time.time(), fresh["as_of"]
             assert fresh["fable"] == 33 and fresh["claude_week"] == 22 and fresh["claude_5h"] == 11, fresh
             assert fresh["read_state"]["claude"] == "fresh", fresh.get("read_state")
             assert "rate_limited_until" not in fresh, fresh.get("rate_limited_until")
@@ -1282,7 +1282,8 @@ def usage_429_keeps_as_of_until_retry_after():
             su.NOW = time.time()
             renewed = _quiet_cache()
             assert server.usage_hits == 4, server.usage_hits
-            assert renewed["as_of"]["claude"] == su.NOW, renewed["as_of"]
+            # The stamp is the clock that armed the floor, after this call started.
+            assert su.NOW <= renewed["as_of"]["claude"] <= time.time(), renewed["as_of"]
             assert renewed["as_of"]["claude"] != success_as_of
             assert server.bad_auth == 0, server.bad_auth
 
@@ -1453,7 +1454,7 @@ def usage_429_without_retry_after_backs_off_and_doubles():
             server.usage_mode = "ok"
             su.NOW = time.time()
             renewed = _quiet_cache()
-            assert renewed["as_of"]["claude"] == su.NOW, renewed["as_of"]
+            assert su.NOW <= renewed["as_of"]["claude"] <= time.time(), renewed["as_of"]
             assert json.load(open(su._rate_limit_path())) == {}
 
 
@@ -4936,6 +4937,264 @@ def learning_helper_ignores_ungraded_and_suspect():
     # Routing writes picks. It does not filter or read them back for a score.
     assert "_read_review_log" not in inspect.getsource(su.cmd_route)
     assert "graded_findings_for_learning" not in inspect.getsource(su.cmd_route)
+
+
+@test
+def help_exits_before_readers_locks_or_cache_writes():
+    with anthropic_server() as server:
+        profile, usage = server_urls(server)
+        with tempfile.TemporaryDirectory() as home:
+            bindir = Path(home) / "bin"
+            bindir.mkdir()
+            for name in ("agy", "muse"):
+                path = bindir / name
+                path.write_text(
+                    "#!/bin/sh\nprintf '%s\\n' " + repr(name) + " >> \"$HOME/invoked\"\nexit 0\n"
+                )
+                path.chmod(0o755)
+            env = {
+                "PATH": f"{bindir}:/usr/bin:/bin",
+                "HOME": home,
+                "SEAT_USAGE_ANTHROPIC_PROFILE": profile,
+                "SEAT_USAGE_ANTHROPIC_USAGE": usage,
+                "SEAT_USAGE_PULL_ONLY_FILE": "/nonexistent/pull-only",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+            for flag in ("--help", "-h"):
+                proc = subprocess.run(
+                    [sys.executable, str(BIN), flag, "--route", "lineup"],
+                    capture_output=True, text=True, env=env, timeout=20,
+                )
+                assert proc.returncode == 0, (flag, proc.returncode, proc.stderr, proc.stdout)
+                assert proc.stdout.startswith("Print one line per subscription seat"), proc.stdout[:80]
+                assert "usage failed" not in proc.stdout and "usage failed" not in proc.stderr
+                assert proc.stderr == "", proc.stderr
+            assert server.profile_hits == 0 and server.usage_hits == 0, (server.profile_hits, server.usage_hits)
+            assert not (Path(home) / "invoked").exists()
+            assert not (Path(home) / ".cache").exists()
+            assert not (Path(home) / ".config").exists()
+            assert not (Path(home) / ".local").exists()
+
+
+@test
+def held_claude_floor_stays_inside_live_freshness():
+    # Import-time as_of plus a floor armed after the response leaves a held
+    # reading in the 10m bucket while the floor still blocks. The route clock
+    # is taken before the later seats, so their time is not added to the age.
+    delay = su.LOCK_TIMEOUT
+    assert su.ROUTE_HOLD_MARGIN_S >= su.LOCK_TIMEOUT + 3 * 8
+    with anthropic_server() as server:
+        profile, usage = server_urls(server)
+        with seat_http_sandbox(profile, usage):
+            su.USAGE_MIN_INTERVAL_S = su.ROUTE_FRESH_S
+            start = 1_700_000_000.0
+            clock = _FloorClock(start)
+            su.NOW = start
+            real_time = su.time.time
+            real_get = su.get
+
+            def jumping_get(url, headers, timeout=8):
+                if url == su.ANTHROPIC_USAGE_URL:
+                    clock.t += delay
+                return real_get(url, headers, timeout)
+
+            su.time.time = clock
+            su.get = jumping_get
+            try:
+                first = _quiet_cache()
+                assert server.usage_hits == 1, server.usage_hits
+                arm = clock.t
+                assert first["as_of"]["claude"] == arm, (first["as_of"], start, arm)
+                stored = json.load(open(su._rate_limit_path()))
+                assert stored[su.ANTHROPIC_USAGE_URL] == arm + su.USAGE_MIN_INTERVAL_S, stored
+                clock.t = arm + su.USAGE_MIN_INTERVAL_S - 1
+
+                def later(_url=None, _headers=None, timeout=8):
+                    clock.t += 8
+                    return []
+
+                su.codex = lambda: later()
+                su.cursor = lambda: later()
+                su.grok = lambda: later()
+                summary = su.refresh(["claude", "chatgpt", "cursor", "grok"])
+                assert server.usage_hits == 1, server.usage_hits
+                route_now = su._ROUTE_NOW
+                assert route_now < stored[su.ANTHROPIC_USAGE_URL]
+                age = route_now - summary["as_of"]["claude"]
+                assert age < su.ROUTE_FRESH_S, age
+                assert clock.t - summary["as_of"]["claude"] > su.ROUTE_FRESH_S
+                st, why = su.pool_status("fable", summary, route_now)
+                assert st != "unknown", (st, why, age)
+                # The import-time stamp at this same route clock is 10m old.
+                assert int((route_now - start) // 60) == 10, route_now - start
+            finally:
+                su.time.time = real_time
+                su.get = real_get
+
+
+class _FloorClock:
+    def __init__(self, t):
+        self.t = float(t)
+
+    def __call__(self):
+        return self.t
+
+
+@test
+def mixed_skips_stale_and_unknown_and_asks_only_when_short():
+    stale = snap()
+    stale["as_of"] = dict(stale["as_of"])
+    stale["as_of"]["claude"] = NOW - 650
+    row = su.route_lineup(stale, NOW, kind="mixed")
+    assert row["mode"] != "ask" and row["lineup"] is not None, row
+    assert "fable" not in _voter_families(row), row
+    assert _voter_families(row) == ["astra", "grok", "wonder-full"], row
+    fable = next(item for item in row["skipped"] if item["family"] == "fable")
+    assert fable["code"] == "stale" and fable["seat"] == "claude", fable
+    assert fable["vendor"] == "anthropic", fable
+    assert "10m old" in fable["reason"], fable
+    text = su.format_lineup(row)
+    assert "skipped: fable | stale |" in text, text
+    assert "ask |" not in text.splitlines()[0], text
+    # Design, audit, and a lineup with no kind still ask on the first unknown.
+    for kind in (None, "design", "audit"):
+        if kind is None:
+            asked = su.route_lineup(stale, NOW)
+        else:
+            asked = su.route_lineup(stale, NOW, kind=kind)
+        assert asked["mode"] == "ask" and "old" in asked["reason"], (kind, asked["reason"])
+        assert "skipped" not in asked, (kind, asked)
+    # Muse with no reading is skipped, code unknown, and the others still sit.
+    mute = without_as_of(snap(), "muse")
+    muse_row = su.route_lineup(mute, NOW, kind="mixed")
+    assert muse_row["mode"] != "ask", muse_row
+    assert "wonder-full" not in _voter_families(muse_row), muse_row
+    muse = next(item for item in muse_row["skipped"] if item["family"] == "wonder-full")
+    assert muse["code"] == "unknown" and muse["seat"] == "muse", muse
+    assert "Muse 5h reading unknown" in muse["reason"], muse
+    # One eligible voter after skips asks, and the reason lists seats and codes.
+    thin = without_as_of(snap(codex=100), "muse")
+    thin["as_of"]["claude"] = NOW - 650
+    short = su.route_lineup(thin, NOW, kind="mixed")
+    assert short["mode"] == "ask" and short["lineup"] is None, short
+    codes = {item["seat"]: item["code"] for item in short["skipped"]}
+    assert codes["claude"] == "stale" and codes["muse"] == "unknown", short["skipped"]
+    assert codes["chatgpt"] == "capped" and "grok" not in codes, short["skipped"]
+    assert "claude/stale" in short["reason"] and "muse/unknown" in short["reason"], short["reason"]
+    assert "chatgpt/capped" in short["reason"] and "ask Ryan" in short["reason"], short["reason"]
+    assert "skipped: fable | stale |" in su.format_lineup(short), su.format_lineup(short)
+    # Two eligible voters on one vendor ask. Caps are not what made it short.
+    saved_vendor = su.FAMILY_VENDOR.get("astra")
+    try:
+        su.FAMILY_VENDOR["astra"] = "anthropic"
+        same = su.route_lineup(snap(grok_pct=100, muse_week=100, muse_5h=100), NOW, kind="mixed")
+    finally:
+        su.FAMILY_VENDOR["astra"] = saved_vendor
+    assert same["mode"] == "ask", same
+    assert sorted(_voter_families(same) if same.get("lineup") else []) == [], same
+    assert "need 2 voters from 2 vendors" in same["reason"], same["reason"]
+    # The excluded vendor is not counted and is not listed as a skip.
+    held = without_as_of(snap(), "chatgpt")
+    held["as_of"]["grok"] = NOW - 650
+    excluded = su.route_lineup(held, NOW, kind="mixed", author="fable")
+    assert excluded["mode"] == "ask", excluded
+    assert excluded["excluded"]["vendor"] == "anthropic", excluded
+    assert all(item["family"] != "fable" for item in excluded["skipped"]), excluded["skipped"]
+    assert "claude/" not in excluded["reason"], excluded["reason"]
+    seated = [item["family"] for item in excluded["skipped"]]
+    assert "astra" in seated and "grok" in seated, excluded["skipped"]
+    # Caps alone still produce the one-voter weaker lineup.
+    capped = snap(codex=100, grok_pct=100, muse_week=100, muse_5h=100)
+    weaker = su.route_lineup(capped, NOW, kind="mixed")
+    assert weaker["mode"] != "ask" and _voter_families(weaker) == ["fable"], weaker
+    assert "weaker:" in weaker["reason"], weaker["reason"]
+    cap_codes = {item["family"]: item["code"] for item in weaker["skipped"]}
+    assert cap_codes == {"astra": "capped", "grok": "capped", "wonder-full": "capped"}, cap_codes
+    assert "need 2 voters" not in weaker["reason"], weaker["reason"]
+    # A failed read_state is skipped. A recent failure log is not, and
+    # --exclude-seat still does not apply to mixed.
+    flagged = snap()
+    flagged["read_state"] = {"chatgpt": "usage_failed"}
+    state_row = su.route_lineup(flagged, NOW, kind="mixed")
+    assert "astra" not in _voter_families(state_row), state_row
+    assert any(item["code"] == "read_state:usage_failed" for item in state_row["skipped"]), state_row
+    with tempfile.TemporaryDirectory() as d:
+        fail = os.path.join(d, "failures.jsonl")
+        old = os.environ.get("SEAT_USAGE_FAILURES")
+        os.environ["SEAT_USAGE_FAILURES"] = fail
+        try:
+            assert su.record_seat_failure("grok", "max_turns", now=NOW) == "grok"
+            logged = su.route_lineup(snap(), NOW, kind="mixed")
+        finally:
+            if old is None:
+                os.environ.pop("SEAT_USAGE_FAILURES", None)
+            else:
+                os.environ["SEAT_USAGE_FAILURES"] = old
+    assert "grok" in _voter_families(logged), logged
+    assert not any(str(item.get("code", "")).startswith("failed_recently") for item in logged.get("skipped") or [])
+    with tempfile.TemporaryDirectory() as home:
+        proc = subprocess.run(
+            [sys.executable, str(BIN), "--route", "lineup", "--kind", "mixed", "--exclude-seat", "grok"],
+            capture_output=True, text=True,
+            env={"PATH": "/usr/bin:/bin", "HOME": home, "PYTHONDONTWRITEBYTECODE": "1",
+                 "SEAT_USAGE_PULL_ONLY_FILE": "/nonexistent/pull-only"},
+            timeout=20,
+        )
+    assert proc.returncode == 2, (proc.returncode, proc.stderr)
+    assert "exclude-seat" in proc.stderr, proc.stderr
+
+
+@test
+def mixed_json_lists_skipped_and_review_still_skips_its_own_way():
+    now = time.time()
+    with tempfile.TemporaryDirectory() as d:
+        body = _shift_snap(now)
+        body["as_of"] = dict(body["as_of"])
+        body["as_of"]["claude"] = now - 650
+        body["as_of"].pop("muse", None)
+        with open(os.path.join(d, "latest.json"), "w") as handle:
+            json.dump(body, handle)
+        home = os.path.join(d, "home")
+        os.makedirs(home)
+        env = os.environ.copy()
+        env["HOME"] = home
+        env["SEAT_USAGE_CACHE_DIR"] = d
+        env["SEAT_USAGE_ASKS"] = os.path.join(d, "asks.jsonl")
+        env["QUARTERMASTER_NO_UPDATE"] = "1"
+        proc = subprocess.run(
+            [sys.executable, str(BIN), "--route", "lineup", "--cached", "--json", "--kind", "mixed"],
+            capture_output=True, text=True, env=env, timeout=20,
+        )
+        assert proc.returncode == 0, proc.stderr
+        row = json.loads(proc.stdout)[0]
+        assert row["mode"] != "ask" and row["kind"] == "mixed", row
+        assert "lineup" in row and row["lineup"]["voters"], row
+        codes = {item["family"]: item["code"] for item in row["skipped"]}
+        assert codes["fable"] == "stale" and codes["wonder-full"] == "unknown", row["skipped"]
+        for item in row["skipped"]:
+            assert set(item) >= {"family", "seat", "vendor", "reason", "code"}, item
+        text = subprocess.run(
+            [sys.executable, str(BIN), "--route", "lineup", "--cached", "--kind", "mixed"],
+            capture_output=True, text=True, env=env, timeout=20,
+        )
+        assert "skipped: fable | stale |" in text.stdout, text.stdout
+        assert "skipped: wonder-full | unknown |" in text.stdout, text.stdout
+        # Review's own skip list is unchanged by the mixed path. Muse is put
+        # back so two vendors remain and the stale Fable skip is the check.
+        review_body = json.loads(json.dumps(body))
+        review_body["as_of"]["muse"] = now
+        with open(os.path.join(d, "latest.json"), "w") as handle:
+            json.dump(review_body, handle)
+        review = subprocess.run(
+            [sys.executable, str(BIN), "--route", "lineup", "--cached", "--json",
+             "--kind", "review", "--builder-vendor", "xai"],
+            capture_output=True, text=True, env=env, timeout=20,
+        )
+        assert review.returncode == 0, review.stderr
+        reviewed = json.loads(review.stdout)[0]
+        assert reviewed["mode"] != "ask", reviewed
+        assert any(item["family"] == "fable" and item["code"] == "stale" for item in reviewed["skipped"]), reviewed
+        assert "fable" not in _voter_families(reviewed)
 
 
 def main():

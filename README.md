@@ -17,7 +17,7 @@ Snapshot of Ryan's "router core": `seat-usage` (reads per-seat/pool usage for Cl
 | `install.sh` | links or copies the two commands into the frozen paths |
 | `bin/seat-meters` | optional: draws the cached reading as a PNG laid out like orderly's meters panel (needs Pillow; no network). `seat-meters [--text] [out.png]`: a `Next host` line from `seat-usage --route host --cached --json`, one card per subscription with its cached renewal, orderly's model-family chips by orderly's rules (every family whose pools include the row, in orderly's family order; no plan or cap hides one; Google AI Pro's come from `google_ai_pro` in `config/pools.json`, as orderly gets them through `seat_rows`) and orderly's `$` on-demand chip on the Cursor and Grok Bot rows from `cursor_ondemand`, and orderly's Fable slice row on every Claude card: its percent, or `not on this plan` (`not on <plan>` with a plan name) with a muted title and an empty full-width track when the cache says the plan isn't Max (a plan name without `max`, or with no plan name, `claude_max` false) and the Claude read finished, else `unknown · seat-usage has no value`; orderly's ended plans (set not to renew, `<seat>_renews` false, with the paid-through stamp past) as a muted row with a full-width striped grey track and `sub ended` in place of usage, kept off the shared time scale and sunk below the active cards, a subscription's rows together; and a `55% · 5h 1% · resets Wed` stats line per pool, with orderly's red `caps 10d early` after the percent when the cache carries that pool's `<pool>_caps_early_s`; `--text` also prints the layout's words as JSON instead of the path. The cards run in orderly's order down two columns, cut where the columns come out most even, so the picture is no narrower than a 9:19.5 phone screen and a phone shows it at full width (a third column only if it would still be narrower); the type is orderly's at 1.7x so the smallest text is about 24 px when the picture is 1080 px wide. This is the only layout: `--phone`, which used to pick it over a wide one, is still accepted and does nothing. Cache path from `SEAT_USAGE_CACHE`. Google AI Pro is its own card |
 | `bin/seat-usage-push` | optional: copies an allowlist of the cache to a secret gist for the phone widget, plus a numbers-only cache copy that `--pull` lands on a reader |
-| `systemd/` | the `seat-usage-push` timer (every 5 minutes) |
+| `systemd/` | the `seat-usage-push` timer (every 5 minutes) and the `seat-usage-pull` timer for a pull-only reader |
 | `android/` | Seats, the Android home-screen widget that reads that gist |
 
 ## Installed-path contract
@@ -108,6 +108,45 @@ Desktop setup. `install.sh` does not install these; link them by hand:
 **Cap projection.** Each time it writes the cache, seat-usage projects every pool that has a used % and a reset time (the pools in `config/pools.json` plus the three Google AI Pro pools). Each pool is measured at its own reading's time (`as_of`), so a reading carried forward keeps its projection. The burn rate is linear from the window's start: used % divided by the time since the window opened (window length minus time left). At that rate the pool reaches 100% after `(100 - used) × elapsed / used` more seconds. If that comes before the reset, `<pool>_caps_early_s` (e.g. `claude_week_caps_early_s`, `google_gemini_5h_caps_early_s`) is the number of seconds early, rounded. No key means no projection. That covers: no reading, 0% used, already at 100% (the pool is capped, not projected), the pool reaching 100% at or after the reset, a reset that has passed by write time or was more than one window away at the reading, an unknown window, and the first 10% of a window (`CAPS_MIN_ELAPSED`), where one large job projects a cap that is not real. The projection is computed on the reading machine and travels in the push copy as plain numbers. A pulled copy shows them only once the gatherer runs a seat-usage that writes them.
 
 One reader, one gatherer: the same gist also gets `latest.json`, a copy of the cache cut to an allowlist of numbers (percents, reset times, windows, ages, on-demand dollars, `as_of` stamps) and a few true/false flags (exhausted, renews, `claude_max`). No string is copied: no plan or status text, `lines`, `errors`, `burn`, or cookie flag. On the machine that does every reading (BLD) nothing changes beyond installing the timer above. On a reader with no vendor logins (the shared VM), put `{"id": "<gist id>"}` in `~/.config/seat-usage/gist.json` and run `seat-usage-push --pull`. It refilters, writes `~/.cache/seat-usage/latest.json` and Muse's `~/.cache/quartermaster/muse-usage.json`, and never runs `seat-usage`. `seat-meters` and `seat-usage --route ... --cached` then read that copy. `--pull` stamps the copy with `pulled_ts` (set after the filter, so a gist cannot supply it). On a copy with that stamp a route treats a reading as unknown only after 20 minutes instead of 10, because the gatherer pushes every 5 minutes and refreshes at 10. Both limits are `route_freshness_s` in `config/pools.json` (`{"live": 600, "pulled": 1200}`, in seconds); a missing or non-positive value falls back to those defaults. A live `seat-usage` run that merges into the cache drops `pulled_ts`, so live caches keep the 10-minute rule. `claude_max` is the Claude plan as one bit, set on the reading machine. A `weekly_scoped` (Fable slice) limit in the usage reading makes it true, since only Max has one. Otherwise the OAuth profile's `rate_limit_tier` (`claude_plan`) decides: a name with `max` is true, `claude_ai` (Pro) is false, and any other name, or a failed profile read, leaves it out (unknown). Routes read the flag first and the plan name only on an older cache. Off Max (`claude_max` false) no role ranks the Claude Fable slice, and the `bounded-question` role (the one whose primary is Fable) never seats Fable on Claude: it scores only the pools off the Claude seat that serve Fable (Other Models), as the council's Fable voter does. With the plan unknown the role keeps its hold default. The reader's meters show no plan name in the ChatGPT header and no error footer, because those are strings. `seat-usage-push --dry-run --cache` prints the copy.
+
+### Reader host (pull-only) setup
+
+A reader host (Surface, or the shared VM) does not read seats. It renders the copy BLD pushed. BLD keeps the push timer above. The reader needs four things:
+
+1. The marker file, so this host never reads live. `SEAT_USAGE_PULL_ONLY=1` is the same switch for one process.
+
+        mkdir -p ~/.config/seat-usage
+        touch ~/.config/seat-usage/pull-only
+
+2. The gist id, and a `gh` login that can read that secret gist. There is no unauthenticated fetch. The file is only the id:
+
+        printf '%s\n' '{"id": "<gist id>"}' > ~/.config/seat-usage/gist.json
+
+    Put the real id in that file on the machine. Do not commit it.
+
+3. The pull timer, every 5 minutes, same cadence as the push. `install.sh` does not link these.
+
+        ln -s "$PWD/bin/seat-usage-push" ~/.local/bin/seat-usage-push
+        systemctl --user link "$PWD/systemd/seat-usage-pull.service" "$PWD/systemd/seat-usage-pull.timer"
+        systemctl --user enable --now seat-usage-pull.timer
+
+    The service runs `seat-usage-push --pull`. That refilters, writes `~/.cache/seat-usage/latest.json` with `pulled_ts`, and writes `~/.cache/quartermaster/muse-usage.json` when both Muse windows are in the copy. It does not run `seat-usage`.
+
+4. Verify, without printing the gist id:
+
+        systemctl --user list-timers seat-usage-pull.timer
+        seat-usage-push --pull
+        test -f ~/.config/seat-usage/pull-only
+        SEAT_USAGE_PULL_ONLY=1 seat-usage --route lineup --cached --kind mixed
+
+    Stderr should say `pull-only cached`. A pulled copy has no `seats` rows, so the status line draws no seat bars. The numbers are the accounts BLD's CLIs are signed into.
+
+Rollback: stop the timer and remove the marker. The cache file can stay.
+
+    systemctl --user disable --now seat-usage-pull.timer
+    rm ~/.config/seat-usage/pull-only
+
+Without the marker, `seat-usage` reads live again. On a host with no vendor logins those reads fail.
 
 Phone setup: install `seats.apk` from the `seats-latest` release, add the Seats widget, and paste the gist id or URL. CI (`.github/workflows/seats-widget.yml`) rebuilds that release on every push to `main` that touches `android/`.
 
