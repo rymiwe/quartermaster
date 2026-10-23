@@ -1294,7 +1294,9 @@ def outcomes_files():
     Each run line carries the task role and seat agreement: a seats list, or
     the lineup's chair, builder, and voters. agreed is whether that seat
     matched the verdict. SEAT_USAGE_OUTCOMES is an extra log of
-    {role, pool, agreed} lines.
+    {role, pool, agreed} lines. Review grades are not a track record.
+    Steering, when it exists, must call graded_findings_for_learning
+    and must not read review-picks here.
     """
     home = os.path.expanduser("~")
     outcomes = os.environ.get("SEAT_USAGE_OUTCOMES") or os.path.join(
@@ -5306,7 +5308,11 @@ def cmd_draw():
     print("upper bounds: other sessions share these pools")
 
 def review_log_path():
-    """Where review picks are appended. Routing never reads this file."""
+    """Where review picks are appended. Routing never reads this file.
+
+    A later steering change must not open it either. The only sanctioned
+    read of grades is graded_findings_for_learning.
+    """
     override = os.environ.get("SEAT_USAGE_REVIEW_LOG")
     if override:
         return override
@@ -5329,8 +5335,10 @@ def _log_review_pick(row, repo, pr, ballot):
 
     A settled pick lists who sat. An ask leaves reviewers empty and is still
     logged when seats were excluded, so an exclusion is not only on stdout.
-    Grading skips a row with no reviewers. Nothing in the scorer reads this
-    file. A write failure is silent.
+    Grading skips a row with no reviewers. Findings are stored with grade
+    blank. Nothing in the scorer reads this file. A later steering change
+    must call graded_findings_for_learning instead of opening it. A write
+    failure is silent.
     """
     if not isinstance(row, dict):
         return
@@ -5412,7 +5420,83 @@ def _pick_index(rows, pick):
     return None
 
 
+_ALLOWED_GRADERS = ("ryan", "blind-grader")
+_MARK_BACKUP_DIR = "/workspace/conclave/tmp/council/blind-grading/backup"
+# Chair launchers set one of these in the chair process only.
+# CONCLAVE_CHAIR_MODEL is not a marker: the stack runner publishes it for
+# the whole ballot, and voters inherit it.
+_CHAIR_ENV_FLAGS = ("CONCLAVE_CHAIR", "COUNCIL_CHAIR")
+
+
+def _chair_block_reason():
+    """Why this process must not write a grade, or None if it may.
+
+    Set SEAT_USAGE_ROLE=chair, CONCLAVE_CHAIR=1, or COUNCIL_CHAIR=1 on the
+    chair process before it starts. A grader process leaves those unset and
+    passes --grader ryan or --grader blind-grader (or SEAT_USAGE_GRADER).
+    Conclave does not export the marker yet. Export CONCLAVE_CHAIR=1 from
+    the chair launcher only; do not export it for voters or the grader.
+    """
+    role = (os.environ.get("SEAT_USAGE_ROLE") or "").strip().lower()
+    if role == "chair":
+        return "SEAT_USAGE_ROLE=chair"
+    for name in _CHAIR_ENV_FLAGS:
+        val = (os.environ.get(name) or "").strip().lower()
+        if val in ("1", "true", "yes"):
+            return name + "=" + val
+    return None
+
+
+def _resolve_grader(argv):
+    if "--grader" in argv:
+        grader = (_opt(argv, "--grader") or "").strip().lower()
+    else:
+        grader = (os.environ.get("SEAT_USAGE_GRADER") or "").strip().lower()
+    if grader not in _ALLOWED_GRADERS:
+        return None
+    return grader
+
+
+def _blank_finding(reviewer, body, i):
+    # grade is always blank here. Attached input cannot set it.
+    return {"id": f"f{i}", "reviewer": reviewer, "text": body, "grade": ""}
+
+
+def _json_finding_bodies(stripped):
+    """Finding texts from a JSON file. Grades in that JSON are not returned."""
+    if not stripped or stripped[0] not in "[{":
+        return None
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(parsed, dict):
+        if "findings" not in parsed:
+            return None
+        parsed = parsed.get("findings")
+    if not isinstance(parsed, list):
+        return None
+    bodies = []
+    for item in parsed:
+        if isinstance(item, str):
+            if item.strip():
+                bodies.append(item.strip())
+            continue
+        if not isinstance(item, dict):
+            continue
+        body = item.get("text")
+        if not isinstance(body, str):
+            body = item.get("body") if isinstance(item.get("body"), str) else ""
+        if body.strip():
+            bodies.append(body.strip())
+    return bodies
+
+
 def _parse_findings(text, reviewer):
+    stripped = (text or "").strip()
+    json_bodies = _json_finding_bodies(stripped)
+    if json_bodies is not None:
+        return [_blank_finding(reviewer, body, i) for i, body in enumerate(json_bodies, 1)]
     found = []
     for line in (text or "").splitlines():
         raw = line.strip()
@@ -5434,8 +5518,7 @@ def _parse_findings(text, reviewer):
                          and line.strip().lower() not in ("no findings.", "no findings")).strip()
         if body:
             found.append(body)
-    return [{"id": f"f{i}", "reviewer": reviewer, "text": body, "grade": ""}
-            for i, body in enumerate(found, 1)]
+    return [_blank_finding(reviewer, body, i) for i, body in enumerate(found, 1)]
 
 
 _GRADE_REDACTIONS = (
@@ -5447,9 +5530,37 @@ _GRADE_REDACTIONS = (
 )
 
 
-def _redact_grade(text):
+def _redact_tokens(row):
+    """Names the blind text must not contain, besides _GRADE_REDACTIONS.
+
+    Every string on reviewers[] (model, vendor, seat, family, and the rest)
+    and every finding's reviewer label. The letter map is not a token.
+    """
+    tokens = []
+    for rev in row.get("reviewers") or []:
+        if isinstance(rev, str):
+            tokens.append(rev)
+        elif isinstance(rev, dict):
+            for val in rev.values():
+                if isinstance(val, str):
+                    tokens.append(val)
+    for item in row.get("findings") or []:
+        if isinstance(item, dict) and isinstance(item.get("reviewer"), str):
+            tokens.append(item.get("reviewer"))
+    return tokens
+
+
+def _redact_grade(text, extra=()):
     out = text or ""
-    for token in sorted(_GRADE_REDACTIONS, key=len, reverse=True):
+    seen = []
+    for token in list(_GRADE_REDACTIONS) + list(extra or []):
+        if not isinstance(token, str):
+            continue
+        token = token.strip()
+        if len(token) < 2 or token in seen:
+            continue
+        seen.append(token)
+    for token in sorted(seen, key=len, reverse=True):
         out = re.sub(rf"(?i)(?<![A-Za-z0-9]){re.escape(token)}(?![A-Za-z0-9])", "[redacted]", out)
     return out
 
@@ -5465,21 +5576,86 @@ def _grade_letters(findings):
     return labels
 
 
-def _print_grade(row):
-    """Sanitized findings. Model, vendor, and seat names are not printed."""
-    findings = row.get("findings") or []
+def _reviewer_identity(row, label):
+    wanted = (label or "").strip().lower()
+    for rev in row.get("reviewers") or []:
+        if not isinstance(rev, dict):
+            continue
+        for key in ("seat", "family", "model", "vendor"):
+            val = rev.get(key)
+            if isinstance(val, str) and val.strip().lower() == wanted:
+                return {
+                    "reviewer": label,
+                    "model": rev.get("model") or "",
+                    "vendor": rev.get("vendor") or "",
+                    "seat": rev.get("seat") or "",
+                    "family": rev.get("family") or "",
+                }
+    return {"reviewer": label, "model": "", "vendor": "", "seat": "", "family": ""}
+
+
+def _blind_letters(row):
+    """Reviewer label -> 'Reviewer A', and letter -> model/vendor identity.
+
+    Letters follow first appearance in findings. The identity is stored in
+    the sidecar and printed only by --unblind.
+    """
+    findings = [item for item in (row.get("findings") or []) if isinstance(item, dict)]
     labels = _grade_letters(findings)
-    print(f"pick {row.get('id') or ''}")
-    current = None
+    mapping = {}
+    for key, label in labels.items():
+        letter = label.split()[-1]
+        mapping[letter] = _reviewer_identity(row, key)
+    return labels, mapping
+
+
+def _blind_text(row):
+    findings = [item for item in (row.get("findings") or []) if isinstance(item, dict)]
+    letters, mapping = _blind_letters(row)
+    extra = _redact_tokens(row)
+    lines = [f"pick {row.get('id') or ''}"]
     if not findings:
-        print("(no findings)")
-        return
+        lines.append("(no findings)")
+        return "\n".join(lines) + "\n", mapping
+    current = None
     for item in findings:
-        label = labels.get(item.get("reviewer") or "", "Reviewer A")
+        label = letters.get(item.get("reviewer") or "", "Reviewer A")
         if label != current:
-            print(label)
+            lines.append(label)
             current = label
-        print(f"  {item.get('id')}: {_redact_grade(item.get('text') or '')}")
+        lines.append(f"  {item.get('id')}: {_redact_grade(item.get('text') or '', extra)}")
+    return "\n".join(lines) + "\n", mapping
+
+
+def _blind_map_path(log_path):
+    if log_path.endswith(".jsonl"):
+        return log_path[:-len(".jsonl")] + ".blindmap.json"
+    return log_path + ".blindmap.json"
+
+
+def _load_blind_maps(path):
+    try:
+        with open(path) as handle:
+            data = json.load(handle)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_blind_maps(path, data):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(data, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, path)
+
+
+def _store_blind_map(log_path, pick_id, mapping):
+    path = _blind_map_path(log_path)
+    maps = _load_blind_maps(path)
+    maps[str(pick_id)] = mapping
+    _save_blind_maps(path, maps)
 
 
 def cmd_attach_findings():
@@ -5503,6 +5679,11 @@ def cmd_attach_findings():
         print("no review pick", file=sys.stderr)
         raise SystemExit(2)
     fresh = _parse_findings(text, reviewer)
+    for item in fresh:
+        # Attaching never grades. A grade in the file is not copied.
+        item["grade"] = ""
+        for key in ("grader", "graded_at", "grade_status", "chair_grade_suspect"):
+            item.pop(key, None)
     existing = rows[index].get("findings") or []
     if not isinstance(existing, list):
         existing = []
@@ -5525,9 +5706,78 @@ def cmd_attach_findings():
     print(f"attached {len(fresh)}")
 
 
-def cmd_grade_findings():
+def cmd_blind_findings():
+    """Print redacted findings. The letter map goes to the sidecar, not stdout."""
     argv = sys.argv[1:]
     pick = _opt(argv, "--pick") if "--pick" in argv else "latest"
+    out_path = _opt(argv, "--out") if "--out" in argv else None
+    log_path = review_log_path()
+    if out_path and os.path.abspath(out_path) == os.path.abspath(log_path):
+        print("--out must not be the review log", file=sys.stderr)
+        raise SystemExit(2)
+    rows = _read_review_log(log_path)
+    index = _pick_index(rows, pick)
+    if index is None:
+        print("no review pick", file=sys.stderr)
+        raise SystemExit(2)
+    text, mapping = _blind_text(rows[index])
+    pick_id = str(rows[index].get("id") or "")
+    try:
+        _store_blind_map(log_path, pick_id, mapping)
+    except Exception as exc:
+        print(f"cannot write blind map: {exc.__class__.__name__}", file=sys.stderr)
+        raise SystemExit(2)
+    if out_path:
+        try:
+            parent = os.path.dirname(out_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(out_path, "w") as handle:
+                handle.write(text)
+        except Exception as exc:
+            print(f"cannot write blind output: {exc.__class__.__name__}", file=sys.stderr)
+            raise SystemExit(2)
+    sys.stdout.write(text)
+
+
+def _finding_is_graded(item):
+    """True when an allowed grader has recorded real or false.
+
+    suspect, suspect-self-graded, a blank grade, and a grade with no
+    allowed grader are not graded. The router must use this through
+    graded_findings_for_learning and must not reimplement it.
+    """
+    if not isinstance(item, dict):
+        return False
+    if item.get("grade_status") != "graded":
+        return False
+    if item.get("grader") not in _ALLOWED_GRADERS:
+        return False
+    if item.get("grade") not in ("real", "false"):
+        return False
+    return True
+
+
+def graded_findings_for_learning(rows):
+    """The only sanctioned read of review grades for router learning.
+
+    The scorer does not call this. Review picks stay out of routing until
+    a later change calls this helper and meets the sample threshold in
+    the README. Ungraded findings and suspect findings are omitted.
+    """
+    found = []
+    if not isinstance(rows, list):
+        return found
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for item in row.get("findings") or []:
+            if _finding_is_graded(item):
+                found.append(item)
+    return found
+
+
+def _parse_grade_pairs(argv):
     grades = []
     i = 0
     while i < len(argv):
@@ -5539,12 +5789,6 @@ def cmd_grade_findings():
             i += 2
             continue
         i += 1
-    log_path = review_log_path()
-    rows = _read_review_log(log_path)
-    index = _pick_index(rows, pick)
-    if index is None:
-        print("no review pick", file=sys.stderr)
-        raise SystemExit(2)
     parsed = []
     for item in grades:
         if "=" not in item:
@@ -5556,24 +5800,195 @@ def cmd_grade_findings():
             print("--grade needs id=real or id=false", file=sys.stderr)
             raise SystemExit(2)
         parsed.append((fid.strip(), grade))
-    if parsed:
-        known = {item.get("id") for item in rows[index].get("findings") or [] if isinstance(item, dict)}
-        for fid, _grade in parsed:
-            if fid not in known:
-                print(f"unknown finding {fid}", file=sys.stderr)
-                raise SystemExit(2)
-        wanted = dict(parsed)
-        for item in rows[index]["findings"]:
-            if isinstance(item, dict) and item.get("id") in wanted:
-                item["grade"] = wanted[item["id"]]
-        try:
-            _write_review_log(log_path, rows)
-        except Exception as exc:
-            print(f"cannot write review log: {exc.__class__.__name__}", file=sys.stderr)
+    return parsed
+
+
+def cmd_grade_findings():
+    """Record grades. Does not print the letter map. A chair writes nothing."""
+    argv = sys.argv[1:]
+    reason = _chair_block_reason()
+    if reason:
+        print(f"chair cannot grade ({reason})", file=sys.stderr)
+        raise SystemExit(1)
+    grader = _resolve_grader(argv)
+    if grader is None:
+        print("--grade-findings needs --grader ryan or --grader blind-grader", file=sys.stderr)
+        raise SystemExit(2)
+    pick = _opt(argv, "--pick") if "--pick" in argv else "latest"
+    parsed = _parse_grade_pairs(argv)
+    if not parsed:
+        print("--grade-findings needs --grade id=real or id=false", file=sys.stderr)
+        raise SystemExit(2)
+    log_path = review_log_path()
+    rows = _read_review_log(log_path)
+    index = _pick_index(rows, pick)
+    if index is None:
+        print("no review pick", file=sys.stderr)
+        raise SystemExit(2)
+    known = {item.get("id") for item in rows[index].get("findings") or [] if isinstance(item, dict)}
+    for fid, _grade in parsed:
+        if fid not in known:
+            print(f"unknown finding {fid}", file=sys.stderr)
             raise SystemExit(2)
-    _print_grade(rows[index])
-    if parsed:
-        print("recorded " + " ".join(f"{fid}={grade}" for fid, grade in parsed))
+    wanted = dict(parsed)
+    stamped = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    findings = rows[index].get("findings")
+    if not isinstance(findings, list):
+        print("no review pick", file=sys.stderr)
+        raise SystemExit(2)
+    for item in findings:
+        if isinstance(item, dict) and item.get("id") in wanted:
+            item["grade"] = wanted[item["id"]]
+            item["grader"] = grader
+            item["graded_at"] = stamped
+            item["grade_status"] = "graded"
+    try:
+        _write_review_log(log_path, rows)
+    except Exception as exc:
+        print(f"cannot write review log: {exc.__class__.__name__}", file=sys.stderr)
+        raise SystemExit(2)
+    print("recorded " + " ".join(f"{fid}={grade}" for fid, grade in parsed))
+
+
+def _stored_blind_map(log_path, pick_id):
+    stored = _load_blind_maps(_blind_map_path(log_path)).get(str(pick_id))
+    return stored if isinstance(stored, dict) else None
+
+
+def cmd_unblind():
+    """Print letter -> model/vendor once every finding has an allowed grade."""
+    argv = sys.argv[1:]
+    pick = _opt(argv, "--pick") if "--pick" in argv else "latest"
+    log_path = review_log_path()
+    rows = _read_review_log(log_path)
+    index = _pick_index(rows, pick)
+    if index is None:
+        print("no review pick", file=sys.stderr)
+        raise SystemExit(2)
+    row = rows[index]
+    findings = [item for item in (row.get("findings") or []) if isinstance(item, dict)]
+    if not findings or not all(_finding_is_graded(item) for item in findings):
+        print("unblind refused: not every finding is graded by ryan or blind-grader", file=sys.stderr)
+        raise SystemExit(1)
+    _labels, fresh = _blind_letters(row)
+    mapping = _stored_blind_map(log_path, row.get("id") or "") or fresh
+    for letter, ident in fresh.items():
+        if letter not in mapping or not isinstance(mapping.get(letter), dict):
+            mapping[letter] = ident
+    for letter in sorted(fresh):
+        ident = mapping[letter]
+        print(
+            f"{letter} model={ident.get('model') or '-'} vendor={ident.get('vendor') or '-'} "
+            f"seat={ident.get('seat') or '-'} family={ident.get('family') or '-'} "
+            f"reviewer={ident.get('reviewer') or '-'}"
+        )
+
+
+def _sha256_bytes(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def _mark_backup_dir():
+    override = os.environ.get("SEAT_USAGE_REVIEW_BACKUP_DIR")
+    if override:
+        return override
+    return _MARK_BACKUP_DIR
+
+
+def cmd_mark_self_graded():
+    """Back up the log, then mark grades that lack an allowed grader.
+
+    The backup is review-picks.jsonl.<UTC timestamp> under
+    /workspace/conclave/tmp/council/blind-grading/backup
+    (SEAT_USAGE_REVIEW_BACKUP_DIR overrides that directory). cmp and sha256
+    must match before any rewrite. A non-empty grade without ryan or
+    blind-grader provenance moves to chair_grade_suspect, grade becomes
+    blank, and grade_status becomes suspect-self-graded. Rows and findings
+    stay. Other keys stay. Untouched lines stay byte for byte.
+    """
+    path = review_log_path()
+    try:
+        with open(path, "rb") as handle:
+            original = handle.read()
+    except FileNotFoundError:
+        print("no review log", file=sys.stderr)
+        raise SystemExit(2)
+    try:
+        text = original.decode("utf-8")
+    except UnicodeDecodeError:
+        print("review log is not utf-8; not rewriting", file=sys.stderr)
+        raise SystemExit(1)
+    dest_dir = _mark_backup_dir()
+    os.makedirs(dest_dir, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = os.path.join(dest_dir, f"review-picks.jsonl.{stamp}")
+    if os.path.exists(backup):
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = os.path.join(dest_dir, f"review-picks.jsonl.{stamp}")
+    with open(backup, "wb") as handle:
+        handle.write(original)
+        handle.flush()
+        os.fsync(handle.fileno())
+    with open(backup, "rb") as handle:
+        backed = handle.read()
+    if backed != original or _sha256_bytes(backed) != _sha256_bytes(original):
+        print("backup mismatch; not rewriting", file=sys.stderr)
+        raise SystemExit(1)
+    compared = subprocess.run(["cmp", "-s", path, backup])
+    if compared.returncode != 0:
+        print("backup mismatch; not rewriting", file=sys.stderr)
+        raise SystemExit(1)
+    count = 0
+    pieces = []
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        if not stripped:
+            pieces.append(line)
+            continue
+        try:
+            row = json.loads(stripped)
+        except json.JSONDecodeError:
+            pieces.append(line)
+            continue
+        if not isinstance(row, dict):
+            pieces.append(line)
+            continue
+        findings = row.get("findings")
+        touched = False
+        if isinstance(findings, list):
+            for item in findings:
+                if not isinstance(item, dict):
+                    continue
+                raw_grade = item.get("grade")
+                if raw_grade is None:
+                    continue
+                if isinstance(raw_grade, str) and not raw_grade.strip():
+                    continue
+                if _finding_is_graded(item):
+                    continue
+                item["chair_grade_suspect"] = raw_grade
+                item["grade"] = ""
+                item["grade_status"] = "suspect-self-graded"
+                count += 1
+                touched = True
+        if touched:
+            ending = "\n" if line.endswith("\n") else ""
+            pieces.append(json.dumps(row) + ending)
+        else:
+            pieces.append(line)
+    if count:
+        payload = "".join(pieces).encode("utf-8")
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    print(f"marked {count}")
+    print(f"backup {backup}")
+    print(f"sha256 {_sha256_bytes(original)}")
+
 
 
 def cmd_record_failure():
@@ -5602,6 +6017,12 @@ def main():
         cmd_record_failure()
         if "--route" not in sys.argv:
             return
+    if "--mark-self-graded" in sys.argv:
+        return cmd_mark_self_graded()
+    if "--blind-findings" in sys.argv:
+        return cmd_blind_findings()
+    if "--unblind" in sys.argv:
+        return cmd_unblind()
     if "--grade-findings" in sys.argv:
         return cmd_grade_findings()
     if "--review-findings" in sys.argv:

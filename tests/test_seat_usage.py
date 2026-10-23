@@ -2,8 +2,10 @@
 """Route and hook tests for seat-usage. No network."""
 import contextlib
 import fcntl
+import hashlib
 import importlib.machinery
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -4271,6 +4273,8 @@ def review_grade_hides_model_vendor_and_seat_names():
         env["HOME"] = home
         env["SEAT_USAGE_REVIEW_LOG"] = log_path
         env["QUARTERMASTER_NO_UPDATE"] = "1"
+        for key in ("SEAT_USAGE_ROLE", "CONCLAVE_CHAIR", "COUNCIL_CHAIR", "SEAT_USAGE_GRADER"):
+            env.pop(key, None)
         record = {
             "ts": 10, "id": "10.000000", "repo": "rymiwe/example", "pr": None, "ballot": "b1",
             "builder_vendor": "xai", "route": "lineup",
@@ -4303,25 +4307,41 @@ def review_grade_hides_model_vendor_and_seat_names():
             capture_output=True, text=True, env=env, timeout=15,
         )
         assert attach_b.returncode == 0, attach_b.stderr
+        before_blind = open(log_path, "rb").read()
         shown = subprocess.run(
-            [sys.executable, str(BIN), "--grade-findings", "--pick", "latest",
-             "--grade", "f1=real", "--grade", "f2=false"],
+            [sys.executable, str(BIN), "--blind-findings", "--pick", "latest"],
             capture_output=True, text=True, env=env, timeout=15,
         )
         assert shown.returncode == 0, shown.stderr
+        assert open(log_path, "rb").read() == before_blind
         out = shown.stdout
         assert "Reviewer A" in out and "Reviewer B" in out, out
-        assert "recorded f1=real" in out and "f2=false" in out, out
-        banned = ("fable", "astra", "grok", "claude", "cursor", "chatgpt", "anthropic", "openai",
-                  "xai", "google", "muse", "wonder", "argon", "gemini", "gpt-6-astra", "codex",
-                  "opus", "spark", "contributor", "meta", "agy")
+        assert "recorded" not in out, out
+        banned = list(su._GRADE_REDACTIONS)
+        with open(log_path) as handle:
+            picked = json.loads(handle.read().strip().splitlines()[-1])
+        for rev in picked["reviewers"]:
+            for key in ("model", "vendor", "seat", "family"):
+                banned.append(rev[key])
+        for item in picked["findings"]:
+            banned.append(item["reviewer"])
         for word in banned:
-            assert word not in out.lower(), (word, out)
+            assert word.lower() not in out.lower(), (word, out)
+        graded = subprocess.run(
+            [sys.executable, str(BIN), "--grade-findings", "--pick", "latest",
+             "--grader", "blind-grader", "--grade", "f1=real", "--grade", "f2=false"],
+            capture_output=True, text=True, env=env, timeout=15,
+        )
+        assert graded.returncode == 0, graded.stderr
+        assert "recorded f1=real" in graded.stdout and "f2=false" in graded.stdout, graded.stdout
+        assert "Reviewer A" not in graded.stdout, graded.stdout
         with open(log_path) as handle:
             saved = json.loads(handle.read().strip().splitlines()[-1])
-        grades = {item["id"]: item["grade"] for item in saved["findings"]}
-        assert grades["f1"] == "real" and grades["f2"] == "false", saved
-        # The second reviewer's finding is still blank.
+        by_id = {item["id"]: item for item in saved["findings"]}
+        assert by_id["f1"]["grade"] == "real" and by_id["f2"]["grade"] == "false", saved
+        assert by_id["f1"]["grader"] == "blind-grader" and by_id["f1"]["grade_status"] == "graded", by_id["f1"]
+        assert by_id["f1"]["graded_at"], by_id["f1"]
+        # The second reviewer's finding is still blank, and attaching did not grade it.
         assert any(item["grade"] == "" for item in saved["findings"]), saved
 
 
@@ -4532,6 +4552,236 @@ def review_blocked_fable_falls_through_and_an_ask_is_not_graded():
         {"reviewers": [{"family": "argon"}], "id": "settled"},
         {"reviewers": [], "id": "ask"},
     ], "latest") == 0
+
+
+def _grade_env(tmp, log_path):
+    env = os.environ.copy()
+    env["HOME"] = tmp
+    env["SEAT_USAGE_REVIEW_LOG"] = log_path
+    env["QUARTERMASTER_NO_UPDATE"] = "1"
+    for key in ("SEAT_USAGE_ROLE", "CONCLAVE_CHAIR", "COUNCIL_CHAIR", "SEAT_USAGE_GRADER",
+                "SEAT_USAGE_REVIEW_BACKUP_DIR"):
+        env.pop(key, None)
+    return env
+
+
+def _run_seat(env, args):
+    return subprocess.run(
+        [sys.executable, str(BIN), *args],
+        capture_output=True, text=True, env=env, timeout=20,
+    )
+
+
+@test
+def chair_cannot_write_a_grade():
+    with tempfile.TemporaryDirectory() as d:
+        log_path = os.path.join(d, "picks.jsonl")
+        record = {
+            "ts": 10, "id": "10.000000", "repo": "rymiwe/example", "pr": "1", "ballot": None,
+            "builder_vendor": "xai", "route": "review",
+            "reviewers": [{"seat": "seat-alpha", "family": "family-alpha", "model": "model-alpha",
+                           "vendor": "vendor-alpha", "pace": "pace-alpha", "headroom": "headroom-alpha",
+                           "used_pct": "used-alpha", "effort": "effort-alpha"}],
+            "why": "model-alpha", "findings": [
+                {"id": "f1", "reviewer": "seat-alpha", "text": "model-alpha is wrong", "grade": ""},
+            ],
+        }
+        with open(log_path, "w") as handle:
+            handle.write(json.dumps(record) + "\n")
+        original = open(log_path, "rb").read()
+        env = _grade_env(d, log_path)
+        markers = (
+            {"SEAT_USAGE_ROLE": "chair"},
+            {"CONCLAVE_CHAIR": "1"},
+            {"COUNCIL_CHAIR": "true"},
+        )
+        for marker in markers:
+            child = dict(env)
+            child.update(marker)
+            result = _run_seat(child, ["--grade-findings", "--pick", "10.000000",
+                                       "--grader", "ryan", "--grade", "f1=real"])
+            assert result.returncode != 0, (marker, result.returncode, result.stderr)
+            assert open(log_path, "rb").read() == original, marker
+            assert "model-alpha" not in result.stdout, (marker, result.stdout)
+        # The same call without a chair marker records provenance.
+        ok = _run_seat(env, ["--grade-findings", "--pick", "latest",
+                             "--grader", "ryan", "--grade", "f1=false"])
+        assert ok.returncode == 0, ok.stderr
+        saved = json.loads(open(log_path).read())
+        item = saved["findings"][0]
+        assert item["grade"] == "false" and item["grader"] == "ryan", item
+        assert item["grade_status"] == "graded" and item["graded_at"], item
+
+
+@test
+def blind_findings_hide_every_reviewer_value_and_unblind_waits():
+    with tempfile.TemporaryDirectory() as d:
+        log_path = os.path.join(d, "review-picks.jsonl")
+        out_path = os.path.join(d, "blind.txt")
+        reviewers = [
+            {"seat": "seat-alpha", "family": "family-alpha", "model": "model-alpha",
+             "vendor": "vendor-alpha", "pace": "pace-alpha", "headroom": "headroom-alpha",
+             "used_pct": "used-alpha", "effort": "effort-alpha"},
+            {"seat": "seat-beta", "family": "family-beta", "model": "model-beta",
+             "vendor": "vendor-beta", "pace": "pace-beta", "headroom": "headroom-beta",
+             "used_pct": "used-beta", "effort": "effort-beta"},
+        ]
+        record = {
+            "ts": 11, "id": "11.000000", "repo": "rymiwe/example", "pr": "2", "ballot": "b",
+            "builder_vendor": "xai", "route": "lineup", "reviewers": reviewers,
+            "why": "model-alpha then model-beta", "findings": [],
+        }
+        with open(log_path, "w") as handle:
+            handle.write(json.dumps(record) + "\n")
+        env = _grade_env(d, log_path)
+        names = [value for rev in reviewers for value in rev.values()]
+        names.extend(su._GRADE_REDACTIONS)
+        first = os.path.join(d, "a.json")
+        second = os.path.join(d, "b.json")
+        with open(first, "w") as handle:
+            json.dump([{
+                "id": "keep-me", "reviewer": "not-the-flag",
+                "text": "grade this " + " ".join(names),
+                "grade": "real", "grader": "ryan", "grade_status": "graded",
+                "graded_at": "1999-01-01T00:00:00Z",
+            }], handle)
+        with open(second, "w") as handle:
+            handle.write("1. " + " ".join(str(v) for v in reviewers[1].values()) + "\n")
+        attached = _run_seat(env, ["--review-findings", "--pick", "latest",
+                                   "--reviewer", "seat-alpha", "--file", first])
+        assert attached.returncode == 0, attached.stderr
+        attached_b = _run_seat(env, ["--review-findings", "--pick", "11.000000",
+                                     "--reviewer", "seat-beta", "--file", second])
+        assert attached_b.returncode == 0, attached_b.stderr
+        saved = json.loads(open(log_path).read())
+        assert saved["findings"][0]["grade"] == "", saved["findings"]
+        assert "grader" not in saved["findings"][0] and "grade_status" not in saved["findings"][0], saved
+        assert saved["findings"][0]["reviewer"] == "seat-alpha", saved
+        before = open(log_path, "rb").read()
+        shown = _run_seat(env, ["--blind-findings", "--pick", "latest", "--out", out_path])
+        assert shown.returncode == 0, shown.stderr
+        assert open(log_path, "rb").read() == before
+        blind = shown.stdout
+        assert open(out_path).read() == blind
+        assert "Reviewer A" in blind and "Reviewer B" in blind, blind
+        for word in names:
+            assert str(word).lower() not in blind.lower(), (word, blind)
+        sidecar = os.path.join(d, "review-picks.blindmap.json")
+        mapped = json.loads(open(sidecar).read())["11.000000"]
+        assert mapped["A"]["model"] == "model-alpha" and mapped["A"]["reviewer"] == "seat-alpha", mapped
+        assert mapped["B"]["vendor"] == "vendor-beta" and mapped["B"]["seat"] == "seat-beta", mapped
+        assert "model-alpha" not in blind and sidecar not in blind
+        early = _run_seat(env, ["--unblind", "--pick", "latest"])
+        assert early.returncode != 0, early.stdout
+        assert "model-alpha" not in early.stdout and "vendor-beta" not in early.stdout, early.stdout
+        assert open(log_path, "rb").read() == before
+        one = _run_seat(env, ["--grade-findings", "--pick", "latest",
+                              "--grader", "blind-grader", "--grade", "f1=real"])
+        assert one.returncode == 0, one.stderr
+        still = _run_seat(env, ["--unblind", "--pick", "11.000000"])
+        assert still.returncode != 0 and "model-alpha" not in still.stdout, still.stdout
+        two = _run_seat(env, ["--grade-findings", "--pick", "latest",
+                              "--grader", "blind-grader", "--grade", "f2=false"])
+        assert two.returncode == 0, two.stderr
+        revealed = _run_seat(env, ["--unblind", "--pick", "latest"])
+        assert revealed.returncode == 0, revealed.stderr
+        lines = {line.split()[0]: line for line in revealed.stdout.splitlines()}
+        assert lines["A"] == (
+            "A model=model-alpha vendor=vendor-alpha seat=seat-alpha "
+            "family=family-alpha reviewer=seat-alpha"
+        ), revealed.stdout
+        assert lines["B"] == (
+            "B model=model-beta vendor=vendor-beta seat=seat-beta "
+            "family=family-beta reviewer=seat-beta"
+        ), revealed.stdout
+        # Unblind does not rewrite the log's grades.
+        final = json.loads(open(log_path).read())
+        assert final["findings"][0]["grade"] == "real" and final["findings"][1]["grade"] == "false", final
+        assert all(item["grade_status"] == "graded" and item["grader"] == "blind-grader"
+                   for item in final["findings"]), final
+
+
+@test
+def mark_self_graded_backs_up_and_leaves_clean_rows():
+    with tempfile.TemporaryDirectory() as d:
+        log_path = os.path.join(d, "review-picks.jsonl")
+        backup_dir = os.path.join(d, "backup")
+        untouched = json.dumps({
+            "ts": 1, "id": "1.000000", "repo": "rymiwe/example", "pr": "1",
+            "findings": [{"id": "f1", "reviewer": "seat-alpha", "text": "plain", "grade": ""}],
+            "note": "leave-this",
+        })
+        graded = {
+            "ts": 2, "id": "2.000000", "repo": "rymiwe/example", "pr": "2", "note": "keep-note",
+            "findings": [
+                {"id": "f1", "reviewer": "seat-alpha", "text": "old chair grade", "grade": "false",
+                 "extra": "stay"},
+                {"id": "f2", "reviewer": "seat-beta", "text": "already graded", "grade": "real",
+                 "grader": "ryan", "graded_at": "2020-01-01T00:00:00Z", "grade_status": "graded"},
+                {"id": "f3", "reviewer": "seat-beta", "text": "blank", "grade": ""},
+            ],
+        }
+        original = untouched + "\n" + json.dumps(graded) + "\n"
+        with open(log_path, "w") as handle:
+            handle.write(original)
+        env = _grade_env(d, log_path)
+        env["SEAT_USAGE_REVIEW_BACKUP_DIR"] = backup_dir
+        result = _run_seat(env, ["--mark-self-graded"])
+        assert result.returncode == 0, result.stderr
+        assert "marked 1" in result.stdout, result.stdout
+        backups = list(Path(backup_dir).glob("review-picks.jsonl.*"))
+        assert len(backups) == 1, backups
+        assert backups[0].read_bytes() == original.encode()
+        original_copy = os.path.join(d, "original.jsonl")
+        with open(original_copy, "wb") as handle:
+            handle.write(original.encode())
+        compared = subprocess.run(["cmp", "-s", str(backups[0]), original_copy])
+        assert compared.returncode == 0, compared.returncode
+        assert hashlib.sha256(backups[0].read_bytes()).hexdigest() == hashlib.sha256(original.encode()).hexdigest()
+        rewritten = open(log_path).read().splitlines()
+        assert rewritten[0] == untouched, rewritten[0]
+        row = json.loads(rewritten[1])
+        first, second, third = row["findings"]
+        assert first["chair_grade_suspect"] == "false", first
+        assert first["grade"] == "" and first["grade_status"] == "suspect-self-graded", first
+        assert first["text"] == "old chair grade" and first["extra"] == "stay" and first["id"] == "f1", first
+        assert second["grade"] == "real" and second["grader"] == "ryan" and "chair_grade_suspect" not in second, second
+        assert third["grade"] == "" and "chair_grade_suspect" not in third and "grade_status" not in third, third
+        assert row["note"] == "keep-note" and row["id"] == "2.000000", row
+        assert len(rewritten) == 2
+        # A second run migrates nothing and still backs up.
+        again = _run_seat(env, ["--mark-self-graded"])
+        assert again.returncode == 0 and "marked 0" in again.stdout, again.stdout
+        assert open(log_path).read().splitlines()[0] == untouched
+
+
+@test
+def learning_helper_ignores_ungraded_and_suspect():
+    rows = [
+        {"id": "1", "findings": [
+            {"id": "f1", "grade": "real", "grade_status": "graded", "grader": "ryan"},
+            {"id": "f2", "grade": "false", "grade_status": "graded", "grader": "blind-grader"},
+            {"id": "f3", "grade": "real"},
+            {"id": "f4", "grade": "", "grade_status": "suspect-self-graded",
+             "chair_grade_suspect": "false"},
+            {"id": "f5", "grade": "suspect", "grade_status": "suspect", "grader": "ryan"},
+            {"id": "f6", "grade": "real", "grade_status": "graded", "grader": "chair"},
+            {"id": "f7", "grade": "real", "grade_status": "graded", "grader": "ryan",
+             "chair_grade_suspect": "false"},
+        ]},
+        {"id": "2", "findings": [
+            {"id": "f8", "grade": "false", "grade_status": "suspect-self-graded", "grader": "ryan"},
+        ]},
+        "not-a-row",
+    ]
+    got = [item["id"] for item in su.graded_findings_for_learning(rows)]
+    assert got == ["f1", "f2", "f7"], got
+    assert su.graded_findings_for_learning(None) == []
+    source = Path(su.__file__).read_text()
+    assert source.count("def graded_findings_for_learning(") == 1
+    # Routing writes picks. It does not filter or read them back for a score.
+    assert "_read_review_log" not in inspect.getsource(su.cmd_route)
+    assert "graded_findings_for_learning" not in inspect.getsource(su.cmd_route)
 
 
 def main():
