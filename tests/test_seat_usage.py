@@ -2258,11 +2258,15 @@ def review_without_author_or_builder_excludes_nobody():
     assert plain["lineup"]["builder"]["family"] == "grok", plain
     ahead = check(snap(cursor_auto_pct=80, grok_pct=80))
     assert ahead["lineup"]["builder"]["family"] == "opus", ahead
-    # Mixed still defaults the author to whoever won the builder slot.
+    # Mixed follows the same rule: whoever won the builder slot is not the author.
     mixed = su.route_lineup(snap(), NOW, kind="mixed")
-    assert mixed["excluded"]["vendor"] == "xai" and mixed["author"] == "grok", mixed
+    assert mixed["lineup"]["builder"]["family"] == "grok", mixed
+    assert mixed["excluded"]["vendor"] is None and mixed["author"] is None, mixed
+    assert "grok" in _voter_families(mixed), mixed
     mixed_ahead = su.route_lineup(snap(cursor_auto_pct=80, grok_pct=80), NOW, kind="mixed")
-    assert mixed_ahead["excluded"]["vendor"] == "anthropic" and mixed_ahead["author"] == "opus", mixed_ahead
+    assert mixed_ahead["lineup"]["builder"]["family"] == "opus", mixed_ahead
+    assert mixed_ahead["excluded"]["vendor"] is None and mixed_ahead["author"] is None, mixed_ahead
+    assert "fable" in _voter_families(mixed_ahead), mixed_ahead
 
 
 @test
@@ -2288,8 +2292,8 @@ def review_author_human_and_none_exclude_nobody():
     assert forced["mode"] != "ask" and forced["excluded"]["vendor"] == "xai", forced
     assert any(item.get("family") == "grok" and item.get("code") == "builder_vendor"
                for item in forced["skipped"]), forced
-    # Other kinds do not treat human or none as "exclude nobody".
-    for kind in ("mixed", "audit", "design"):
+    # Audit and design do not treat human or none as "exclude nobody".
+    for kind in ("audit", "design"):
         for author in ("human", "none"):
             asked = su.route_lineup(snap(), NOW, kind=kind, author=author)
             assert asked["mode"] == "ask" and "no vendor" in asked["reason"], (kind, author, asked)
@@ -2313,6 +2317,69 @@ def review_author_human_and_none_exclude_nobody():
             assert row["mode"] != "ask" and row["author"] == author, row
             assert row["excluded"]["vendor"] is None, row
             assert not any(item.get("code") == "builder_vendor" for item in row.get("skipped") or []), row
+
+
+@test
+def mixed_without_author_or_builder_excludes_nobody():
+    for s, builder_family in ((snap(), "grok"), (snap(cursor_auto_pct=80, grok_pct=80), "opus")):
+        for author, why in ((None, "mixed author unknown"), ("human", "human author"),
+                            ("none", "author none")):
+            row = su.route_lineup(s, NOW, kind="mixed", author=author)
+            assert row["mode"] != "ask", (author, row)
+            assert row["kind"] == "mixed" and row["author"] == author, row
+            assert row["lineup"]["builder"]["family"] == builder_family, row
+            excl = row["excluded"]
+            assert excl == {"vendor": None, "name": None, "family": None, "why": why}, excl
+            assert _voter_families(row) == ["fable", "astra", "grok", "wonder-full"], row
+            assert row["rule"].startswith("mixed excludes nobody:"), row["rule"]
+            assert f"excluded: none | {why}" in su.format_lineup(row), su.format_lineup(row)
+    # A caller-passed builder is still excluded when no author is named.
+    built = su.route_lineup(snap(), NOW, builder=grok_builder(), kind="mixed")
+    assert built["excluded"]["vendor"] == "xai" and built["author"] == "grok", built
+    assert "grok" not in _voter_families(built), built
+    # A named family still sits out. human and none win over a caller builder.
+    named = su.route_lineup(snap(), NOW, kind="mixed", author="fable")
+    assert named["excluded"]["vendor"] == "anthropic", named
+    for author in ("human", "none"):
+        over = su.route_lineup(snap(), NOW, builder=grok_builder(), kind="mixed", author=author)
+        assert over["mode"] != "ask" and over["excluded"]["vendor"] is None, over
+        assert "grok" in _voter_families(over), over
+
+    now = time.time()
+    with tempfile.TemporaryDirectory() as d:
+        with open(os.path.join(d, "latest.json"), "w") as f:
+            json.dump(_shift_snap(now), f)
+        env = os.environ.copy()
+        env["HOME"] = d
+        env["SEAT_USAGE_CACHE_DIR"] = d
+        env["SEAT_USAGE_ASKS"] = os.path.join(d, "asks.jsonl")
+        for extra, author in (([], None), (["--author", "human"], "human"),
+                              (["--author", "none"], "none")):
+            proc = subprocess.run(
+                [sys.executable, str(BIN), "--route", "lineup", "--kind", "mixed",
+                 *extra, "--cached", "--json"],
+                capture_output=True, text=True, env=env, timeout=15,
+            )
+            assert proc.returncode == 0, (extra, proc.returncode, proc.stderr, proc.stdout)
+            row = json.loads(proc.stdout)[0]
+            assert row["mode"] != "ask" and row["kind"] == "mixed", row
+            assert row["author"] == author and row["excluded"]["vendor"] is None, row
+        proc = subprocess.run(
+            [sys.executable, str(BIN), "--route", "lineup", "--kind", "mixed",
+             "--builder-family", "grok", "--cached", "--json"],
+            capture_output=True, text=True, env=env, timeout=15,
+        )
+        assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
+        row = json.loads(proc.stdout)[0]
+        assert row["excluded"]["vendor"] == "xai", row
+        # Audit is unchanged: human still asks.
+        proc = subprocess.run(
+            [sys.executable, str(BIN), "--route", "lineup", "--kind", "audit",
+             "--author", "human", "--cached", "--json"],
+            capture_output=True, text=True, env=env, timeout=15,
+        )
+        row = json.loads(proc.stdout)[0]
+        assert row["mode"] == "ask" and "no vendor" in row["reason"], row
 
 
 def _absent_fable(cursor=10, **kw):
