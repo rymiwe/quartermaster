@@ -269,6 +269,46 @@ def pull_lands_a_refiltered_copy_and_muse_file():
 
 
 @test
+def pull_lands_an_exhausted_muse_without_inventing_a_percent():
+    import tempfile
+    saved = (sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_get)
+    with tempfile.TemporaryDirectory() as t:
+        try:
+            _with_paths(t)
+            sp.write_json(sp.CONFIG, {"id": "abc123"})
+            raw = google_cache()
+            for key in ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts"):
+                raw.pop(key)
+            raw["muse_exhausted"] = True
+            raw["muse_exhausted_reset_ts"] = NOW + 86400
+            raw["as_of"] = dict(raw["as_of"], muse=NOW - 5)
+            # An older gist has no flag. It still copies, and the new flag is absent.
+            old = sp.build_cache_copy(google_cache())
+            assert "muse_exhausted" not in old and "muse_exhausted_reset_ts" not in old, old
+            assert old["muse_week"] == 50, old
+            junk = sp.build_cache_copy(google_cache(muse_exhausted="yes", muse_exhausted_reset_ts="soon"))
+            assert "muse_exhausted" not in junk and "muse_exhausted_reset_ts" not in junk, junk
+            copy = sp.build_cache_copy(raw)
+            assert copy["muse_exhausted"] is True and copy["muse_exhausted_reset_ts"] == NOW + 86400, copy
+            assert "muse_5h" not in copy and "muse_week" not in copy, copy
+            doc = sp.muse_doc(copy)
+            assert doc["exhausted"] is True and doc["exhausted_resets_at"] == NOW + 86400, doc
+            assert "window" not in doc and "used_percent" not in json.dumps(doc), doc
+            sp.gh_get = lambda path: {"files": {sp.CACHE_FILE: {"content": json.dumps(raw)}}}
+            assert sp.pull() == 0
+            landed = json.load(open(sp.CACHE))
+            assert landed["muse_exhausted"] is True, landed
+            assert landed["muse_exhausted_reset_ts"] == NOW + 86400, landed
+            assert landed["as_of"]["muse"] == NOW - 5, landed["as_of"]
+            assert "muse_5h" not in landed and "muse_week" not in landed, landed
+            m = json.load(open(sp.MUSE_FILE))
+            assert m["exhausted"] is True and m["exhausted_resets_at"] == NOW + 86400, m
+            assert "used_percent" not in json.dumps(m), m
+        finally:
+            sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_get = saved
+
+
+@test
 def pull_without_a_pushed_copy_changes_nothing():
     import tempfile
     saved = (sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_get)
