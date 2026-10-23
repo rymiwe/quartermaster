@@ -2913,7 +2913,184 @@ REVIEW_ROSTER = (
      "contributor_mode": "off"},
 )
 _REVIEW_VENDOR_ALIAS = {"grok": "xai"}
+# --route review seats one reviewer. --route lineup --kind review seats two.
+# Both call _review_candidates. The counts stay different on purpose: changing
+# either public count would break callers. The standing rule wants two on both.
 _REVIEW_NEED = {"review": 1, "lineup": 2}
+# Seats named by --exclude-seat on this process. Not read from the cache.
+_REVIEW_FORCE_EXCLUDE = set()
+# Fixed reasons only. A free-text reason is refused and never written.
+FAILURE_REASONS = frozenset(("credits", "rate_limited", "auth", "max_turns", "nonzero"))
+FAILURE_TTL_S = 6 * 3600
+_FAILURE_SEAT_ALIAS = {
+    "claude": "claude",
+    "cursor": "cursor",
+    "fable": "claude",
+    "chatgpt": "chatgpt",
+    "codex": "chatgpt",
+    "astra": "chatgpt",
+    "grok": "grok",
+    "google": "google",
+    "argon": "google",
+    "muse": "muse",
+    "wonder": "muse",
+    "wonder-full": "muse",
+}
+
+
+def failure_log_path():
+    """Recent voter failures. Routing reads this. It does not read the pick log."""
+    override = os.environ.get("SEAT_USAGE_FAILURES")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".local", "state", "seat-usage", "failures.jsonl")
+
+
+def failure_ttl_s():
+    raw = os.environ.get("SEAT_USAGE_FAILURE_TTL_S")
+    if raw is None or str(raw).strip() == "":
+        return float(FAILURE_TTL_S)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(FAILURE_TTL_S)
+    if value < 0:
+        return float(FAILURE_TTL_S)
+    return value
+
+
+def canonical_failure_seat(seat):
+    if not isinstance(seat, str):
+        return None
+    return _FAILURE_SEAT_ALIAS.get(seat.strip().lower())
+
+
+def load_recent_failures(now):
+    """Last unexpired reason per seat. A line older than the TTL does not count.
+
+    Lines that are not the fixed shape are ignored. The file is append-only;
+    expiry is applied on read.
+    """
+    latest = {}
+    path = failure_log_path()
+    ttl = failure_ttl_s()
+    try:
+        handle = open(path)
+    except FileNotFoundError:
+        return latest
+    except Exception:
+        return latest
+    try:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(item, dict):
+                continue
+            seat = canonical_failure_seat(item.get("seat"))
+            reason = item.get("reason")
+            ts = item.get("ts")
+            if seat is None or reason not in FAILURE_REASONS or not _is_number(ts):
+                continue
+            if now - ts > ttl:
+                continue
+            latest[seat] = reason
+    finally:
+        handle.close()
+    return latest
+
+
+def record_seat_failure(seat, reason, now=None):
+    """Append one fixed-enum line. None when the seat or reason is not allowed."""
+    canonical = canonical_failure_seat(seat)
+    if canonical is None or reason not in FAILURE_REASONS:
+        return None
+    if now is None:
+        now = time.time()
+    path = failure_log_path()
+    line = json.dumps({"ts": now, "seat": canonical, "reason": reason}, separators=(",", ":"))
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a") as handle:
+            handle.write(line + "\n")
+    except Exception:
+        return None
+    return canonical
+
+
+def _review_unknown_code(why):
+    """A reading older than route_fresh_s is stale. Any other unknown stays unknown."""
+    text = why or ""
+    if isinstance(text, str) and text.startswith("reading ") and text.endswith(" old"):
+        return "stale"
+    return "unknown"
+
+
+def _review_seat_block(seat, s, failures):
+    """(code, human) when this seat must not be seated, else None.
+
+    A read_state failure code wins over a recent failure. `fresh` and a missing
+    read_state do not exclude. credits is no_credits; the other enums are
+    failed_recently:<reason>. --exclude-seat with no record is nonzero.
+    """
+    state = s.get("read_state") if isinstance(s.get("read_state"), dict) else {}
+    code = state.get(seat)
+    if code in ("token_expired", "rate_limited", "usage_failed"):
+        return f"read_state:{code}", f"{seat} read_state {code}"
+    reason = failures.get(seat)
+    if reason == "credits":
+        return "no_credits", f"{seat} out of credits"
+    if reason:
+        return f"failed_recently:{reason}", f"{seat} failed recently ({reason})"
+    if seat in _REVIEW_FORCE_EXCLUDE:
+        return "failed_recently:nonzero", f"{seat} excluded"
+    return None
+
+
+def _review_fable_block(s, failures):
+    """(seat, (code, human)) for claude, else cursor. None when neither is blocked."""
+    for seat in ("claude", "cursor"):
+        block = _review_seat_block(seat, s, failures)
+        if block:
+            return seat, block
+    return None
+
+
+def _review_fable_open(states, s, now, failures):
+    """Best frontier seat that is not blocked and has room. None when there is none."""
+    absent = _fable_slice_absent(states, s)
+    ready, _unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
+
+    def key(pid):
+        used = s.get(POOLS[pid]["used"])
+        if not _is_number(used):
+            used = 101
+        return (_PACE_ORDER.get(states[pid][0], 9), used)
+
+    for pid in sorted(ready, key=key):
+        alt = POOLS[pid]["seat"]
+        if _review_seat_block(alt, s, failures):
+            continue
+        effort, mode, reason = _voter_effort(pid, s, now, states)
+        return _voter("fable", alt, pid, s, now, effort, mode, reason)
+    return None
+
+
+def _review_fable_unblocked(payload, states, s, now, failures):
+    """The Fable row, or another frontier seat that is not blocked. None when all are."""
+    seat = payload.get("seat") or "claude"
+    if not _review_seat_block(seat, s, failures):
+        return payload
+    opened = _review_fable_open(states, s, now, failures)
+    if opened and opened.get("seat") == seat:
+        return None
+    return opened
 
 
 def _review_model_barred(model):
@@ -2975,9 +3152,9 @@ def _argon_reading(s, now):
     return code, None, used
 
 
-def _review_skip(spec, reason):
-    row = {"family": spec["family"], "seat": spec.get("seat"), "vendor": spec["vendor"],
-           "model": spec["model"], "reason": reason}
+def _review_skip(spec, reason, code):
+    row = {"family": spec.get("family"), "seat": spec.get("seat"), "vendor": spec.get("vendor"),
+           "model": spec.get("model"), "reason": reason, "code": code}
     if spec.get("contributor_mode"):
         row["contributor_mode"] = spec["contributor_mode"]
     return row
@@ -3022,42 +3199,86 @@ def _review_fable_spec(seat):
     return spec
 
 
+def _review_hold(spec, row, s, failures, eligible, skipped):
+    """Keep a ranked row, or skip it when its seat is blocked. The seat on the skip is the row's."""
+    block = _review_seat_block(row.get("seat"), s, failures)
+    if not block:
+        eligible.append(row)
+        return
+    shown = dict(spec)
+    shown["seat"] = row.get("seat")
+    skipped.append(_review_skip(shown, block[1], block[0]))
+
+
 def _review_candidates(states, s, now, excluded_vendor):
     """Eligible review seats, and every seat that was not eligible.
 
+    Before pace is considered, a seat is excluded when its read_state is a
+    failure code, it failed inside the TTL, or --exclude-seat named it.
     An unknown reading (including one older than route_fresh_s) and a capped
     seat are skipped. They do not ask by themselves. The builder's vendor is
     skipped. Spark and contributor models are skipped. Fable uses the same
     frontier as the design voter: the Claude slice, or Cursor Other Models
-    when that path is the one with room.
+    when that path is the one with room. A blocked Fable seat tries the other
+    frontier seat before the family is skipped.
     """
     eligible, skipped = [], []
+    failures = load_recent_failures(now)
     for index, spec in enumerate(REVIEW_ROSTER):
         if _review_model_barred(spec.get("model")):
-            skipped.append(_review_skip(spec, "spark and contributor models are excluded"))
+            skipped.append(_review_skip(spec, "spark and contributor models are excluded", "barred_model"))
             continue
         if excluded_vendor and spec["vendor"] == excluded_vendor:
-            skipped.append(_review_skip(spec, f"shares builder vendor {excluded_vendor}"))
+            skipped.append(_review_skip(spec, f"shares builder vendor {excluded_vendor}", "builder_vendor"))
             continue
         pick = spec["pick"]
         if pick == "fable":
             status, payload = _fable_voter(states, s, now, False)
-            if status == "ask":
-                skipped.append(_review_skip(spec, payload))
+            opened = None
+            if status == "row":
+                opened = _review_fable_unblocked(payload, states, s, now, failures)
+            elif _review_fable_block(s, failures):
+                # An ask or a full window must not hide a block, and must not
+                # skip the other frontier seat when that seat is open.
+                opened = _review_fable_open(states, s, now, failures)
+            if opened is None:
+                blocked = _review_fable_block(s, failures)
+                if blocked and status != "row":
+                    seat, block = blocked
+                    shown = dict(spec)
+                    shown["seat"] = seat
+                    skipped.append(_review_skip(shown, block[1], block[0]))
+                    continue
+                if status == "ask":
+                    text = payload if isinstance(payload, str) else "Fable unavailable"
+                    code = "stale" if ("reading " in text and " old" in text) else "unknown"
+                    skipped.append(_review_skip(spec, text, code))
+                    continue
+                if status == "downgrade":
+                    why = payload.get("reason") or "no frontier pool with room"
+                    code = "capped" if "capped" in why or "full" in why else "unknown"
+                    skipped.append(_review_skip(spec, why, code))
+                    continue
+                if status == "row":
+                    seat = payload.get("seat") or "claude"
+                    block = _review_seat_block(seat, s, failures) or ("unknown", "Fable unavailable")
+                    shown = dict(spec)
+                    shown["seat"] = seat
+                    skipped.append(_review_skip(shown, block[1], block[0]))
+                    continue
+                skipped.append(_review_skip(spec, "Fable unavailable", "unknown"))
                 continue
-            if status == "downgrade":
-                skipped.append(_review_skip(spec, payload.get("reason") or "no frontier pool with room"))
-                continue
-            if status != "row":
-                skipped.append(_review_skip(spec, "Fable unavailable"))
-                continue
+            payload = opened
             seat = payload.get("seat") or "claude"
             pool_id = "cursor_other" if seat == "cursor" else "fable"
             pace = states[pool_id][0]
             if pace in ("unknown", "capped"):
                 why = states[pool_id][1]
                 label = "Fable" if pool_id == "fable" else POOLS[pool_id]["label"]
-                skipped.append(_review_skip(spec, _unknown_text(label, why) if pace == "unknown" else f"{label} capped"))
+                if pace == "unknown":
+                    skipped.append(_review_skip(spec, _unknown_text(label, why), _review_unknown_code(why)))
+                else:
+                    skipped.append(_review_skip(spec, f"{label} capped", "capped"))
                 continue
             used = s.get(POOLS[pool_id]["used"])
             metrics = _review_metrics(pool_id, pace, used, states, s, now)
@@ -3067,15 +3288,19 @@ def _review_candidates(states, s, now, excluded_vendor):
             row["mode"] = payload.get("mode") or row["mode"]
             row["reason"] = payload.get("reason") or row["reason"]
             row["_index"] = index
-            eligible.append(row)
+            _review_hold(seated, row, s, failures, eligible, skipped)
             continue
         if pick == "argon":
+            block = _review_seat_block(spec["seat"], s, failures)
+            if block:
+                skipped.append(_review_skip(spec, block[1], block[0]))
+                continue
             pace, why, used = _argon_reading(s, now)
             if pace == "unknown":
-                skipped.append(_review_skip(spec, _unknown_text("Argon weekly", why)))
+                skipped.append(_review_skip(spec, _unknown_text("Argon weekly", why), _review_unknown_code(why)))
                 continue
             if pace == "capped":
-                skipped.append(_review_skip(spec, "Argon weekly capped"))
+                skipped.append(_review_skip(spec, "Argon weekly capped", "capped"))
                 continue
             metrics = _review_metrics("google_argon_week", pace, used, states, s, now)
             metrics["reading_age_s"] = _reading_age_seat("google", s, now)
@@ -3085,26 +3310,37 @@ def _review_candidates(states, s, now, excluded_vendor):
             eligible.append(row)
             continue
         if pick == "muse":
+            block = _review_seat_block(spec["seat"], s, failures)
+            if block:
+                skipped.append(_review_skip(spec, block[1], block[0]))
+                continue
             watched = ("muse_5h", "muse_week")
             unknown = next((pid for pid in watched if states[pid][0] == "unknown"), None)
             if unknown:
-                skipped.append(_review_skip(spec, _unknown_text(_ask_label(unknown), states[unknown][1])))
+                why = states[unknown][1]
+                skipped.append(_review_skip(spec, _unknown_text(_ask_label(unknown), why), _review_unknown_code(why)))
                 continue
             capped = next((pid for pid in watched if states[pid][0] == "capped"), None)
             if capped:
-                skipped.append(_review_skip(spec, f"{_ask_label(capped)} capped"))
+                skipped.append(_review_skip(spec, f"{_ask_label(capped)} capped", "capped"))
                 continue
             pool_id = "muse_week"
         else:
+            block = _review_seat_block(spec["seat"], s, failures)
+            if block:
+                skipped.append(_review_skip(spec, block[1], block[0]))
+                continue
             pool_id = spec["pool"]
             pace, why = states[pool_id]
             if pace == "unknown":
-                skipped.append(_review_skip(spec, _unknown_text(_FAMILY_NAME.get(spec["family"], spec["family"]), why)))
+                skipped.append(_review_skip(
+                    spec, _unknown_text(_FAMILY_NAME.get(spec["family"], spec["family"]), why),
+                    _review_unknown_code(why)))
                 continue
             if pace == "capped":
                 label = POOLS[pool_id]["label"]
                 extra = f", {why}" if isinstance(why, str) and why.startswith("resets ") else ""
-                skipped.append(_review_skip(spec, f"{label} capped{extra}"))
+                skipped.append(_review_skip(spec, f"{label} capped{extra}", "capped"))
                 continue
         pace = states[pool_id][0]
         used = s.get(POOLS[pool_id]["used"])
@@ -3147,10 +3383,10 @@ def _pick_review_seats(states, s, now, excluded_vendor, need):
     seen = set()
     for row in ranked:
         if len(chosen) >= need:
-            skipped.append(_review_skip(row, "lower pace and headroom rank"))
+            skipped.append(_review_skip(row, "lower pace and headroom rank", "lower_rank"))
             continue
         if row["vendor"] in seen:
-            skipped.append(_review_skip(row, f"vendor {row['vendor']} already seated"))
+            skipped.append(_review_skip(row, f"vendor {row['vendor']} already seated", "vendor_seated"))
             continue
         chosen.append(row)
         seen.add(row["vendor"])
@@ -3571,7 +3807,12 @@ def _fmt_headroom(value):
 
 
 def _skip_line(skip):
-    return f"  skipped: {skip.get('family') or '-'} | {skip.get('reason') or ''}"
+    family = skip.get("family") or "-"
+    reason = skip.get("reason") or ""
+    code = skip.get("code") or ""
+    if code:
+        return f"  skipped: {family} | {code} | {reason}"
+    return f"  skipped: {family} | {reason}"
 
 
 def format_lineup(row):
@@ -3648,6 +3889,22 @@ def _opt(argv, name):
     return argv[i + 1]
 
 
+def _opts(argv, name):
+    """Every value for a repeatable flag. The value is not echoed on error."""
+    found = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == name:
+            if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
+                print(f"{name} needs a value", file=sys.stderr)
+                raise SystemExit(2)
+            found.append(argv[i + 1])
+            i += 2
+            continue
+        i += 1
+    return found
+
+
 def cmd_route():
     argv = sys.argv[1:]
     as_json = "--json" in argv
@@ -3699,6 +3956,19 @@ def cmd_route():
     if role == "review" and builder_vendor is None:
         print("--route review needs --builder-vendor", file=sys.stderr)
         raise SystemExit(2)
+    global _REVIEW_FORCE_EXCLUDE
+    _REVIEW_FORCE_EXCLUDE = set()
+    if "--exclude-seat" in argv:
+        if role != "review" and not (role == "lineup" and kind == "review"):
+            print("--exclude-seat applies to --route review and --route lineup --kind review",
+                  file=sys.stderr)
+            raise SystemExit(2)
+        for raw in _opts(argv, "--exclude-seat"):
+            canonical = canonical_failure_seat(raw)
+            if canonical is None:
+                print("unknown seat", file=sys.stderr)
+                raise SystemExit(2)
+            _REVIEW_FORCE_EXCLUDE.add(canonical)
     repo = _opt(argv, "--repo") if "--repo" in argv else None
     pr = _opt(argv, "--pr") if "--pr" in argv else None
     ballot = _opt(argv, "--ballot") if "--ballot" in argv else None
@@ -5049,12 +5319,20 @@ def _reviewer_log(row):
             "used_pct": row.get("used_pct"), "effort": row.get("effort")}
 
 
-def _log_review_pick(row, repo, pr, ballot):
-    """Append one JSONL line for a settled review pick. Asks are not picks.
+def _exclusion_log(skip):
+    return {"seat": skip.get("seat"), "family": skip.get("family"), "model": skip.get("model"),
+            "vendor": skip.get("vendor"), "code": skip.get("code"), "reason": skip.get("reason")}
 
-    Nothing in the scorer reads this file. A write failure is silent.
+
+def _log_review_pick(row, repo, pr, ballot):
+    """Append one JSONL line for a review route, including every exclusion.
+
+    A settled pick lists who sat. An ask leaves reviewers empty and is still
+    logged when seats were excluded, so an exclusion is not only on stdout.
+    Grading skips a row with no reviewers. Nothing in the scorer reads this
+    file. A write failure is silent.
     """
-    if not isinstance(row, dict) or row.get("mode") == "ask":
+    if not isinstance(row, dict):
         return
     if row.get("role") == "review":
         reviewers = row.get("reviewers") or []
@@ -5068,12 +5346,14 @@ def _log_review_pick(row, repo, pr, ballot):
         why = row.get("why") or row.get("reason")
     else:
         return
-    if not reviewers:
+    exclusions = [_exclusion_log(item) for item in (row.get("skipped") or []) if isinstance(item, dict)]
+    if not reviewers and not exclusions:
         return
     ts = time.time()
     record = {"ts": ts, "id": f"{ts:.6f}", "repo": repo, "pr": pr, "ballot": ballot,
               "builder_vendor": builder, "route": route,
               "reviewers": [_reviewer_log(v) for v in reviewers],
+              "exclusions": exclusions,
               "why": why, "findings": []}
     path = review_log_path()
     try:
@@ -5121,7 +5401,11 @@ def _pick_index(rows, pick):
     if not rows:
         return None
     if pick == "latest":
-        return len(rows) - 1
+        # An ask logged only for its exclusions is not the pick to grade.
+        for index in range(len(rows) - 1, -1, -1):
+            if rows[index].get("reviewers"):
+                return index
+        return None
     for index, row in enumerate(rows):
         if str(row.get("id")) == pick or str(row.get("ts")) == pick:
             return index
@@ -5292,8 +5576,32 @@ def cmd_grade_findings():
         print("recorded " + " ".join(f"{fid}={grade}" for fid, grade in parsed))
 
 
+def cmd_record_failure():
+    """seat-usage --record-failure <seat> --reason <enum>. Append-only, no free text."""
+    argv = sys.argv[1:]
+    if "--reason" not in argv:
+        print("--record-failure needs --reason", file=sys.stderr)
+        raise SystemExit(2)
+    seat = _opt(argv, "--record-failure")
+    reason = _opt(argv, "--reason")
+    if not seat or not reason:
+        print("--record-failure needs a seat and --reason", file=sys.stderr)
+        raise SystemExit(2)
+    canonical = record_seat_failure(seat, reason)
+    if canonical is None:
+        # Do not echo the arguments. A rejected reason is not an enum, and a
+        # rejected seat is not a roster seat.
+        print("unknown seat or reason", file=sys.stderr)
+        raise SystemExit(2)
+    print(f"recorded {canonical} {reason}")
+
+
 def main():
     maybe_self_update()
+    if "--record-failure" in sys.argv:
+        cmd_record_failure()
+        if "--route" not in sys.argv:
+            return
     if "--grade-findings" in sys.argv:
         return cmd_grade_findings()
     if "--review-findings" in sys.argv:
