@@ -2843,17 +2843,33 @@ def _kind_rule(kind, excluded_vendor, voters):
     return f"{kind} excludes {shown}: {names} vote"
 
 
-def _lineup_exclusion(kind, author, builder_row):
+def _lineup_exclusion(kind, author, builder_row, caller_passed_builder=False):
     """Who sits out, and why. author is a family or None.
 
-    Review and mixed default the author to the builder. Audit does not.
-    Design excludes nobody. An unknown author family is an ask.
+    caller_passed_builder is true only when route_lineup's builder argument
+    was not None. The resolved builder row is not that signal: with no
+    caller builder the router still fills a builder from pace.
+
+    Review excludes a named author family, or that caller-passed builder
+    when no author was named. With neither, a review excludes nobody.
+    author "human" and author "none" exclude nobody on kind review.
+    Mixed still defaults the author to the builder. Audit excludes the
+    author when one is named. Design excludes nobody. An unknown author
+    family is an ask. human and none are unknown families on every kind
+    except review.
     """
     if kind == "design":
         if author and author not in FAMILY_VENDOR:
             return {"ask": f"author family {author} has no vendor: {_ASK}"}
         return {"vendor": None, "name": None, "family": None,
                 "why": "design judges a packet the chair framed", "author": author}
+    if kind == "review" and author in ("human", "none"):
+        why = "human author" if author == "human" else "author none"
+        return {"vendor": None, "name": None, "family": None,
+                "why": why, "author": author}
+    if kind == "review" and not author and not caller_passed_builder:
+        return {"vendor": None, "name": None, "family": None,
+                "why": "review author unknown", "author": None}
     if kind in ("review", "mixed"):
         family = author or builder_row.get("family")
     elif kind == "audit":
@@ -3448,12 +3464,16 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
 
     With a kind, the chair is routed on its own and may differ from the builder.
     Design excludes nobody. Mixed excludes the author, defaulting to the
-    builder. Audit excludes the author when one is named. Fable is required
-    when the excluded vendor is xAI, except on kind review.
+    builder even when the caller passed no builder. Audit excludes the author
+    when one is named. Fable is required when the excluded vendor is xAI,
+    except on kind review.
 
-    Kind review seats exactly two voters from REVIEW_ROSTER, on two vendors,
-    neither of them the builder's. `--builder-vendor` wins over `--author`
-    and over the resolved builder. An unknown or capped seat is skipped.
+    Kind review seats exactly two voters from REVIEW_ROSTER, on two vendors.
+    The excluded vendor is the author's, or the caller-passed builder's when
+    no author was named. With no author and no caller-passed builder, nobody
+    is excluded. `--author human` and `--author none` exclude nobody.
+    `--builder-vendor` wins over `--author` and over the resolved builder.
+    An unknown or capped seat is skipped.
     The lineup asks only when fewer than two eligible seats remain. Design,
     mixed, audit, and a lineup with no kind do not use that roster.
 
@@ -3515,7 +3535,7 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
                 excl = {"vendor": forced, "name": _VENDOR_NAME.get(forced, forced),
                         "family": None, "why": f"builder vendor {forced}", "author": author}
             else:
-                excl = _lineup_exclusion(kind, author, builder_row)
+                excl = _lineup_exclusion(kind, author, builder_row, builder is not None)
                 if excl.get("ask"):
                     return _lineup_ask(s, now, states, excl["ask"], [])
                 if excl.get("vendor") != forced:
@@ -3526,7 +3546,7 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
                 excl["vendor"] = forced
             excluded_vendor = forced
         else:
-            excl = _lineup_exclusion(kind, author, builder_row)
+            excl = _lineup_exclusion(kind, author, builder_row, builder is not None)
             if excl.get("ask"):
                 return _lineup_ask(s, now, states, excl["ask"], [])
             excluded_vendor = excl["vendor"]
