@@ -3464,6 +3464,34 @@ def grok_cookie_reads_seat_usage_op_ref():
 
 
 @test
+def test_record_pool_caps_history_to_its_newest_whole_lines():
+    saved = {n: getattr(su, n) for n in ("HISTORY", "HISTORY_MAX_BYTES", "HISTORY_KEEP_BYTES")}
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            su.HISTORY = os.path.join(d, "state", "history.jsonl")
+            su.HISTORY_MAX_BYTES, su.HISTORY_KEEP_BYTES = 2000, 1000
+            for i in range(40):
+                su.record_pool("codex", "chatgpt weekly", i, NOW + WEEK, WEEK, "test")
+            size = os.path.getsize(su.HISTORY)
+            assert size <= 2000 + 400, size
+            rows = [json.loads(line) for line in open(su.HISTORY)]
+            assert rows[-1]["used_pct"] == 39, rows[-1]
+            used = [r["used_pct"] for r in rows]
+            assert used == list(range(used[0], 40)), used
+            assert 0 not in used
+            assert os.listdir(os.path.dirname(su.HISTORY)) == ["history.jsonl"]
+            # Under the cap, the file is only appended to.
+            su.HISTORY_MAX_BYTES = 10 ** 6
+            before = open(su.HISTORY).read()
+            su.record_pool("codex", "chatgpt weekly", 40, NOW + WEEK, WEEK, "test")
+            after = open(su.HISTORY).read()
+            assert after.startswith(before) and json.loads(after.splitlines()[-1])["used_pct"] == 40
+    finally:
+        for n, v in saved.items():
+            setattr(su, n, v)
+
+
+@test
 def test_run_draws_diffs_history_around_a_run():
     hist = [
         {"pool": "chatgpt weekly", "used_pct": 10, "reset_ts": NOW + WEEK, "read_ts": NOW - 400},

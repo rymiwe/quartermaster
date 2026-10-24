@@ -56,6 +56,10 @@ CACHE = f"{CACHE_DIR}/latest.json"
 ANTHROPIC_PROFILE_URL = os.environ.get("SEAT_USAGE_ANTHROPIC_PROFILE") or "https://api.anthropic.com/api/oauth/profile"
 ANTHROPIC_USAGE_URL = os.environ.get("SEAT_USAGE_ANTHROPIC_USAGE") or "https://api.anthropic.com/api/oauth/usage"
 HISTORY = f"{H}/.local/state/seat-usage/history.jsonl"
+# Past HISTORY_MAX_BYTES the file is cut to its newest HISTORY_KEEP_BYTES of
+# whole lines, so it stays bounded and its recent tail stays continuous.
+HISTORY_MAX_BYTES = 4 * 1024 * 1024
+HISTORY_KEEP_BYTES = 2 * 1024 * 1024
 # Every route that ends in "ask" or "no rule", with the pool states it saw.
 # Measures how often a person is asked, before anything answers for them.
 ASKS = os.environ.get("SEAT_USAGE_ASKS") or f"{H}/.local/state/seat-usage/asks.jsonl"
@@ -653,14 +657,44 @@ def seat_age_s(s, seat, now):
         return None
     return now - (s.get("ts") or 0)
 
+def trim_history():
+    """Cut HISTORY to its newest whole lines once it passes HISTORY_MAX_BYTES.
+    The cut copy replaces the file in one rename. A line another process
+    appends between the read and the rename is lost. Failures are silent."""
+    tmp = None
+    try:
+        size = os.path.getsize(HISTORY)
+        if size <= HISTORY_MAX_BYTES:
+            return
+        with open(HISTORY, "rb") as f:
+            f.seek(max(0, size - HISTORY_KEEP_BYTES))
+            data = f.read()
+        nl = data.find(b"\n")
+        data = data[nl + 1:] if nl >= 0 else b""
+        tmp = f"{HISTORY}.{os.getpid()}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, HISTORY)
+        tmp = None
+    except Exception:
+        pass
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
 def record_pool(seat, pool, used_pct, reset_ts, window_s, source):
-    """One history line per pool. Nothing reads this file. Write failures are silent."""
+    """One history line per pool. run_draws and Orderly's quota card read it.
+    The file is size-capped (trim_history). Write failures are silent."""
     if isinstance(used_pct, bool) or not isinstance(used_pct, (int, float)):
         return
     row = {"host": socket.gethostname(), "seat": seat, "pool": pool, "used_pct": used_pct,
            "reset_ts": reset_ts, "window_s": window_s, "source": source, "read_ts": NOW}
     try:
         os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
+        trim_history()
         with open(HISTORY, "a") as f:
             f.write(json.dumps(row) + "\n")
     except Exception:
