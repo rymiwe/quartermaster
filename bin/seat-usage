@@ -821,8 +821,15 @@ def claude_renewal(status=None):
     except Exception:
         pass
 
-class RenewalsError(ValueError):
-    """A renewals.json value that cannot be used. main prints it and exits 2."""
+_RENEWALS_WARNED = set()
+RENEWALS_KEYS = ("at", "renews", "ends")
+
+
+def _renewals_warn(msg):
+    """One stderr line per distinct renewals.json problem per process. Never exits."""
+    if msg not in _RENEWALS_WARNED:
+        _RENEWALS_WARNED.add(msg)
+        print(f"seat-usage: warning: {RENEWALS_FILE}: {msg}", file=sys.stderr)
 
 
 def seat_ends():
@@ -831,25 +838,40 @@ def seat_ends():
     {"muse": {"ends": "2026-11-12"}} keeps Muse seatable through 2026-11-12 in
     this machine's zone and ends it at the next local midnight. A seat without
     "ends", "ends": null, a missing file, or a file that does not parse changes
-    nothing (the same as claude_renewal). Any other "ends" that is not a YYYY-MM-DD date raises
-    RenewalsError, so a typo cannot leave an ended seat in rotation quietly.
+    nothing (the same as claude_renewal). A bad entry never stops a run: an
+    "ends" that is not a YYYY-MM-DD date, a seat key that is not a roster seat,
+    or a key other than at/renews/ends warns once on stderr, and only that
+    seat's "ends" is ignored. The status line, push timer and hooks keep working.
     """
     try:
         with open(RENEWALS_FILE) as f:
             data = json.load(f)
     except Exception:
         return {}
+    known = {meta.get("seat") for meta in POOLS.values()}
     out = {}
     for seat, rec in (data.items() if isinstance(data, dict) else ()):
-        if not isinstance(rec, dict) or rec.get("ends") is None:
+        if seat not in known:
+            _renewals_warn(f"unknown seat {json.dumps(seat)} ignored (seats: {', '.join(sorted(known))})")
             continue
-        day = rec["ends"]
-        try:
-            if not isinstance(day, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
-                raise ValueError
-            datetime.strptime(day, "%Y-%m-%d")
-        except ValueError:
-            raise RenewalsError(f"{RENEWALS_FILE}: {seat}.ends must be a YYYY-MM-DD date, got {json.dumps(day)}") from None
+        if not isinstance(rec, dict):
+            _renewals_warn(f"{seat} must be an object, got {json.dumps(rec)}; ignored")
+            continue
+        for key in rec:
+            if key not in RENEWALS_KEYS:
+                _renewals_warn(f"unknown key {seat}.{key} ignored (keys: {', '.join(RENEWALS_KEYS)})")
+        day = rec.get("ends")
+        if day is None:
+            continue
+        ok = isinstance(day, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day)
+        if ok:
+            try:
+                datetime.strptime(day, "%Y-%m-%d")
+            except ValueError:
+                ok = False
+        if not ok:
+            _renewals_warn(f"{seat}.ends must be a YYYY-MM-DD date, got {json.dumps(day)}; ignoring it")
+            continue
         out[seat] = day
     return out
 
@@ -6511,14 +6533,6 @@ def cmd_record_failure():
 
 
 def main():
-    try:
-        _main()
-    except RenewalsError as e:
-        print(f"seat-usage: {e}", file=sys.stderr)
-        raise SystemExit(2)
-
-
-def _main():
     if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
         print(__doc__)
         return

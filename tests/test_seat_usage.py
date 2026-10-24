@@ -5517,16 +5517,35 @@ def seat_ends_missing_changes_nothing():
         assert "ended" not in outs[0]
 
 
+def _renewals_stderr(fn):
+    """(fn(), stderr) with a fresh warn-once set, so each case sees its own warnings."""
+    su._RENEWALS_WARNED.clear()
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        out = fn()
+    return out, err.getvalue()
+
+
 @test
-def seat_ends_bad_date_errors_clearly():
-    for bad in ("2026-13-01", "11/12/2026", "2026-11-12T00:00:00", "YYYY-MM-DD", "", 20261112):
-        with renewals_file({"muse": {"ends": bad}}) as path:
-            try:
-                su.pool_status("muse_week", snap(), NOW)
-            except su.RenewalsError as e:
-                assert str(e) == f"{path}: muse.ends must be a YYYY-MM-DD date, got {json.dumps(bad)}", str(e)
-            else:
-                raise AssertionError(f"no error for {bad!r}")
+def seat_ends_bad_date_warns_once_and_ignores_only_that_seat():
+    with local_tz("America/Los_Angeles"):
+        ts = datetime(2026, 11, 20, 12, 0, 0).timestamp()
+        s = _shift_snap(ts)
+        with renewals_file(None):
+            clean = {pid: su.pool_status(pid, s, ts) for pid in ("muse_week", "muse_5h")}
+        for bad in ("2026-13-01", "2026-11-31", "11/12/2026", "2026-11-12T00:00:00", "YYYY-MM-DD", "", 20261112):
+            doc = {"muse": {"ends": bad}, "grok": {"ends": "2026-01-31"}}
+            with renewals_file(doc) as path:
+                def run():
+                    return ({pid: su.pool_status(pid, s, ts) for pid in ("muse_week", "muse_5h")},
+                            su.pool_status("grok", s, ts), su.seat_ends(), su.route_lineup(s, ts, kind="design"))
+                (muse, grok, ends, design), err = _renewals_stderr(run)
+            want = f"seat-usage: warning: {path}: muse.ends must be a YYYY-MM-DD date, got {json.dumps(bad)}; ignoring it\n"
+            assert err == want, (bad, err)          # once, though seat_ends ran many times
+            assert muse == clean, (bad, muse)        # the bad seat behaves as if it had no ends
+            assert grok == ("capped", "ended 2026-01-31"), (bad, grok)   # other seats' ends still apply
+            assert ends == {"grok": "2026-01-31"}, ends
+            assert "wonder-full" in [v["family"] for v in design["lineup"]["voters"]], design
     with tempfile.TemporaryDirectory() as d:
         home = Path(d) / "home"
         cache_dir = Path(d) / "cache"
@@ -5534,13 +5553,41 @@ def seat_ends_bad_date_errors_clearly():
         cache_dir.mkdir()
         (cache_dir / "latest.json").write_text(json.dumps(_shift_snap(time.time())))
         renewals = home / ".config" / "seat-usage" / "renewals.json"
-        renewals.write_text(json.dumps({"muse": {"ends": "2026-13-01"}}))
         for args in (["--route", "lineup", "--kind", "design", "--cached", "--json"],
                      ["--route", "review", "--builder-vendor", "xai", "--cached"], ["--cached"]):
+            if renewals.exists():
+                renewals.unlink()
+            base = _run_bin(home, cache_dir, args)
+            renewals.write_text(json.dumps({"muse": {"ends": "2026-13-01"}}))
             proc = _run_bin(home, cache_dir, args)
-            assert proc.returncode == 2, (args, proc.returncode, proc.stdout, proc.stderr)
-            assert proc.stderr.strip() == f'seat-usage: {renewals}: muse.ends must be a YYYY-MM-DD date, got "2026-13-01"', proc.stderr
-            assert "Traceback" not in proc.stderr
+            assert proc.returncode == 0 == base.returncode, (args, proc.returncode, proc.stderr)
+            age = lambda t: re.sub(r'("(?:reading|usage)_age_s": )[0-9.e-]+', r"\1X", t)
+            assert age(proc.stdout) == age(base.stdout), (args, proc.stdout, base.stdout)
+            assert proc.stderr == f'seat-usage: warning: {renewals}: muse.ends must be a YYYY-MM-DD date, got "2026-13-01"; ignoring it\n', proc.stderr
+
+
+@test
+def seat_ends_warns_on_unknown_seats_and_keys():
+    cases = (
+        ({"msue": {"ends": "2026-11-12"}}, ['unknown seat "msue" ignored']),
+        ({"wonder": {"ends": "2026-11-12"}}, ['unknown seat "wonder" ignored']),
+        ({"muse": {"end": "2026-11-12"}}, ["unknown key muse.end ignored (keys: at, renews, ends)"]),
+        ({"muse": "2026-11-12"}, ['muse must be an object, got "2026-11-12"; ignored']),
+    )
+    for doc, wants in cases:
+        with renewals_file(doc):
+            (ends, status), err = _renewals_stderr(lambda: (su.seat_ends(), su.pool_status("muse_week", snap(), NOW)))
+        assert ends == {}, (doc, ends)
+        assert status[0] != "capped", (doc, status)
+        lines = err.splitlines()
+        assert len(lines) == len(wants), (doc, err)
+        for line, want in zip(lines, wants):
+            assert line.startswith("seat-usage: warning: ") and want in line, (doc, line)
+    # The shipped example and a real-looking file stay silent.
+    for doc in ({"claude": {"at": "YYYY-MM-DD", "renews": None}, "muse": {"ends": None}}, MUSE_ENDS):
+        with renewals_file(doc):
+            _, err = _renewals_stderr(su.seat_ends)
+        assert err == "", (doc, err)
 
 
 @test

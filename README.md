@@ -79,7 +79,14 @@ If `~/.config/seat-usage/renewals.json` is missing, the script prints a hint tha
 `seat-usage` reads `~/.config/seat-usage/renewals.json` (`SEAT_USAGE_RENEWALS` overrides the path). Each top-level key is a seat name from `config/pools.json` (`claude`, `chatgpt`, `cursor`, `grokbot`, `grok`, `google`, `muse`). A missing file, or one that does not parse, changes nothing.
 
 - `claude.at` and `claude.renews`: the hand-kept Claude term end (`YYYY-MM-DD`, or an ISO time) and whether it renews (`true`, `false`, or `null` for not known).
-- `<seat>.ends` (optional, any seat): the last day the subscription can be used, as `YYYY-MM-DD` in this machine's time zone. Through that day nothing changes. From the next local midnight the seat is ended: every route (design, mixed, audit, review, a lineup with no kind, and ask) drops it, a skipped row has code `ended` and reason `ended <day>`, its pools show state `ended` in a route's `usage`, the Muse status line reads `muse | ended <day>`, its status-line bar is `off`, and it gets no burn line. An ended seat with no reading does not make a route ask. `null` or no `ends` means no end date. Any other value that is not a `YYYY-MM-DD` date stops the command with exit 2 and `seat-usage: <path>: <seat>.ends must be a YYYY-MM-DD date, got <value>` on stderr.
+- `<seat>.ends` (optional, any seat): the last day the subscription can be used, as `YYYY-MM-DD` in this machine's time zone. Through that day nothing changes. From the next local midnight the seat is ended: every route (design, mixed, audit, review, a lineup with no kind, and ask) drops it, a skipped row has code `ended` and reason `ended <day>`, its pools show state `ended` in a route's `usage`, and it gets no burn line. An ended seat with no reading does not make a route ask. Only Muse has an ended status line: it reads `muse | ended <day>` and its status-line bar is `off`. Other seats' status lines are unchanged. `null` or no `ends` means no end date.
+
+A bad entry never stops a run, so the status line, the push timer, and the hook keep working. Each problem prints one line per run on stderr, `seat-usage: warning: <path>: <problem>`, and only that entry is ignored:
+
+- an `ends` that is not a `YYYY-MM-DD` date (`<seat>.ends must be a YYYY-MM-DD date, got <value>; ignoring it`); that seat keeps routing as if it had no end date
+- a top-level key that is not one of the seats above (`unknown seat "<key>" ignored`)
+- a key inside a seat other than `at`, `renews`, or `ends` (`unknown key <seat>.<key> ignored`)
+- a seat whose value is not an object
 
 A canceled Muse plan that is paid through 2026-11-12 adds this key beside the ones already in the file:
 
