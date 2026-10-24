@@ -821,6 +821,48 @@ def claude_renewal(status=None):
     except Exception:
         pass
 
+class RenewalsError(ValueError):
+    """A renewals.json value that cannot be used. main prints it and exits 2."""
+
+
+def seat_ends():
+    """{seat: last active day} from the optional per-seat "ends" in RENEWALS_FILE.
+
+    {"muse": {"ends": "2026-11-12"}} keeps Muse seatable through 2026-11-12 in
+    this machine's zone and ends it at the next local midnight. A seat without
+    "ends", "ends": null, a missing file, or a file that does not parse changes
+    nothing (the same as claude_renewal). Any other "ends" that is not a YYYY-MM-DD date raises
+    RenewalsError, so a typo cannot leave an ended seat in rotation quietly.
+    """
+    try:
+        with open(RENEWALS_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    out = {}
+    for seat, rec in (data.items() if isinstance(data, dict) else ()):
+        if not isinstance(rec, dict) or rec.get("ends") is None:
+            continue
+        day = rec["ends"]
+        try:
+            if not isinstance(day, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", day):
+                raise ValueError
+            datetime.strptime(day, "%Y-%m-%d")
+        except ValueError:
+            raise RenewalsError(f"{RENEWALS_FILE}: {seat}.ends must be a YYYY-MM-DD date, got {json.dumps(day)}") from None
+        out[seat] = day
+    return out
+
+
+def seat_ended(seat, now):
+    """"ended <day>" once the seat's "ends" day is over in this machine's zone, else None."""
+    day = seat_ends().get(seat)
+    if day is None:
+        return None
+    start = datetime.strptime(day, "%Y-%m-%d")
+    over = datetime.fromordinal(start.toordinal() + 1).timestamp()   # naive: local midnight after it
+    return f"ended {day}" if now >= over else None
+
 def codex_renewal(hdr):
     """ChatGPT's own billing call. active_until is the paid-through time; will_renew
     is false once the plan is cancelled."""
@@ -1223,6 +1265,8 @@ def burn_entries(s, now):
         if not meta.get("lose_it"):
             continue
         seat = meta["seat"]
+        if seat_ended(seat, now):
+            continue
         used = s.get(meta["used"])
         reset = effective_end(s, seat, s.get(meta["reset"]))
         wk = meta["window"]
@@ -1923,8 +1967,15 @@ def pool_status(pool_id, s, now):
     A 5h pool (facts.window 5h) is open when the plan has no session keys, or
     when a used% under 100 has no reset still in the future. At 100% with a
     future reset it is capped. Otherwise it follows pace, and it never burns.
+    A seat past its renewals.json "ends" day is capped with why "ended <day>",
+    ahead of every other rule.
     """
     meta = POOLS[pool_id]
+    # A seat past its renewals.json "ends" day. Capped, so every route drops it
+    # the way it drops a spent pool; the reason says ended, and output shows it.
+    ended = seat_ended(meta["seat"], now)
+    if ended:
+        return "capped", ended
     quota = _muse_quota_capped(meta, s, now)
     if quota:
         return quota
@@ -2412,7 +2463,10 @@ def _join_open(a, b):
 def _usage_snapshot(states, s):
     out = {}
     for pid, meta in POOLS.items():
-        out[pid] = {"state": states[pid][0], "used_pct": s.get(meta["used"])}
+        state, why = states[pid]
+        if state == "capped" and isinstance(why, str) and why.startswith("ended "):
+            state = "ended"
+        out[pid] = {"state": state, "used_pct": s.get(meta["used"])}
     return out
 
 
@@ -2483,7 +2537,7 @@ def _capped_skip_text(label, why):
     `capped`, the same word used for a spent pool (grok_exhausted, used at
     100). `no_credits` is the failure-log reason `credits`, not this window.
     """
-    if isinstance(why, str) and why.startswith("Muse quota exhausted"):
+    if isinstance(why, str) and (why.startswith("Muse quota exhausted") or why.startswith("ended ")):
         return why
     extra = f", {why}" if isinstance(why, str) and why.startswith("resets ") else ""
     return f"{label} capped{extra}"
@@ -3225,6 +3279,9 @@ def _review_headroom(pace, pool_id, states):
 
 def _argon_reading(s, now):
     """Pace of the Argon weekly cache fields. Same freshness rule as a pool."""
+    ended = seat_ended("google", now)
+    if ended:
+        return "capped", ended, None
     as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
     stamp = as_of.get("google")
     if not stamp:
@@ -3251,6 +3308,8 @@ def _argon_reading(s, now):
 
 
 def _review_skip(spec, reason, code):
+    if code == "capped" and isinstance(reason, str) and reason.startswith("ended "):
+        code = "ended"   # pool_status caps an ended seat; the skip says which
     row = {"family": spec.get("family"), "seat": spec.get("seat"), "vendor": spec.get("vendor"),
            "model": spec.get("model"), "reason": reason, "code": code}
     if spec.get("contributor_mode"):
@@ -3399,7 +3458,7 @@ def _review_candidates(states, s, now, excluded_vendor):
                 skipped.append(_review_skip(spec, _unknown_text("Argon weekly", why), _review_unknown_code(why)))
                 continue
             if pace == "capped":
-                skipped.append(_review_skip(spec, "Argon weekly capped", "capped"))
+                skipped.append(_review_skip(spec, _capped_skip_text("Argon weekly", why), "capped"))
                 continue
             metrics = _review_metrics("google_argon_week", pace, used, states, s, now)
             metrics["reading_age_s"] = _reading_age_seat("google", s, now)
@@ -4512,9 +4571,14 @@ def format_muse_line(data, now):
     return line
 
 def muse_line(now=None, path=None):
-    """Read-only Muse line. Missing or unparseable input says 'no data yet'."""
+    """Read-only Muse line. Missing or unparseable input says 'no data yet'.
+
+    Past its renewals.json "ends" day the line is "ended <day>" and the file is not read."""
     if now is None:
         now = time.time()
+    ended = seat_ended("muse", now)
+    if ended:
+        return f"{'muse':9}| {ended}"
     if path is None:
         path = muse_usage_path()
     try:
@@ -5409,7 +5473,9 @@ def seat_rows(s, now=None):
 
     mu = groups["mu"]
     quota_reset = num("muse_exhausted_reset_ts")
-    if not ok("muse"):
+    if seat_ended("muse", now):
+        mu["bars"].append({"kind": "off", "name": "mu", "seat": "muse"})
+    elif not ok("muse"):
         mu["bars"].append({"kind": "failed", "name": "mu", "seat": "muse"})
     elif s.get("muse_exhausted") is True and quota_reset is not None and quota_reset > now:
         # Same empty bar grok_exhausted uses. The reset is the quota reset.
@@ -6445,6 +6511,14 @@ def cmd_record_failure():
 
 
 def main():
+    try:
+        _main()
+    except RenewalsError as e:
+        print(f"seat-usage: {e}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+def _main():
     if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
         print(__doc__)
         return

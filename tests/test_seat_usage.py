@@ -5415,6 +5415,161 @@ def muse_exhausted_routes_capped_until_the_reset_and_names_a_missing_source():
         assert rev_item["code"] == "capped" and rev_item["reason"].startswith("Muse quota exhausted, resets "), rev_item
 
 
+@contextlib.contextmanager
+def renewals_file(doc):
+    """Point su.RENEWALS_FILE at a temp renewals.json holding doc, or at no file when doc is None."""
+    old = su.RENEWALS_FILE
+    with tempfile.TemporaryDirectory() as d:
+        path = Path(d) / "renewals.json"
+        if doc is not None:
+            path.write_text(json.dumps(doc))
+        su.RENEWALS_FILE = str(path)
+        try:
+            yield path
+        finally:
+            su.RENEWALS_FILE = old
+
+
+MUSE_ENDS = {"claude": {"at": "2099-10-14", "renews": None}, "muse": {"ends": "2026-11-12"}}
+
+
+def _muse_routes(ts):
+    """Design, review (both forms), mixed, and ask at local time ts, on readings taken at ts."""
+    s = _shift_snap(ts)
+    return s, {
+        "design": su.route_lineup(s, ts, kind="design"),
+        "review": su.route_review(s, ts, "xai"),
+        "review_lineup": su.route_lineup(s, ts, kind="review", author="grok"),
+        "mixed": su.route_lineup(s, ts, kind="mixed", author="grok"),
+        "ask": su.route_ask(s, ts),
+        "no_kind": su.route_lineup(s, ts),
+    }
+
+
+def _skip(row, family):
+    return next((x for x in row.get("skipped") or () if x["family"] == family), None)
+
+
+@test
+def seat_ends_excludes_muse_from_every_route_once_the_day_is_over():
+    with local_tz("America/Los_Angeles"), renewals_file(MUSE_ENDS):
+        after = datetime(2026, 11, 13, 0, 0, 0).timestamp()
+        s, r = _muse_routes(after)
+        for pid in ("muse_5h", "muse_week"):
+            assert su.pool_status(pid, s, after) == ("capped", "ended 2026-11-12"), su.pool_status(pid, s, after)
+        assert "wonder-full" not in [v["family"] for v in r["design"]["lineup"]["voters"]], r["design"]
+        assert r["design"]["usage"]["muse_week"]["state"] == "ended", r["design"]["usage"]
+        assert r["design"]["usage"]["muse_5h"]["state"] == "ended", r["design"]["usage"]
+        assert "wonder" not in [v["family"] for v in r["review"]["reviewers"]], r["review"]
+        for key, family in (("review", "wonder"), ("review_lineup", "wonder"), ("mixed", "wonder-full")):
+            item = _skip(r[key], family)
+            assert item and item["code"] == "ended" and item["reason"] == "ended 2026-11-12", (key, item)
+        assert "wonder-full" not in [v["family"] for v in r["mixed"]["lineup"]["voters"]], r["mixed"]
+        assert "skipped: wonder-full | ended | ended 2026-11-12" in su.format_lineup(r["mixed"])
+        assert "skipped: wonder | ended | ended 2026-11-12" in su.format_review(r["review"])
+        assert "wonder-full" not in [c["family"] for c in r["ask"]["candidates"]], r["ask"]
+        assert "wonder-full" not in [v["family"] for v in r["no_kind"]["lineup"]["voters"]], r["no_kind"]
+        # Status: the Muse line, the status-line row, and no burn nudge for it.
+        assert su.muse_line(after, "/nonexistent/muse-usage.json") == "muse     | ended 2026-11-12"
+        mu = next(g for g in su.seat_rows(s, after) if g["id"] == "mu")
+        assert mu["bars"] == [{"kind": "off", "name": "mu", "seat": "muse"}], mu
+        assert all(e["seat"] != "muse" for e in su.burn_entries(s, after))
+        # Once it ends there is no Muse reading either. That must not make design ask.
+        gone = without_as_of(_drop_muse_percents(_shift_snap(after)), "muse")
+        design = su.route_lineup(gone, after, kind="design")
+        assert design["mode"] != "ask", design
+        assert su.pool_status("muse_week", gone, after) == ("capped", "ended 2026-11-12")
+
+
+@test
+def seat_ends_keeps_muse_eligible_through_its_last_day():
+    with local_tz("America/Los_Angeles"), renewals_file(MUSE_ENDS):
+        for ts in (datetime(2026, 11, 11, 12, 0, 0).timestamp(), datetime(2026, 11, 12, 23, 59, 59).timestamp()):
+            s, r = _muse_routes(ts)
+            assert su.pool_status("muse_week", s, ts)[0] not in ("capped", "unknown"), su.pool_status("muse_week", s, ts)
+            assert "wonder-full" in [v["family"] for v in r["design"]["lineup"]["voters"]], r["design"]
+            assert "wonder-full" in [v["family"] for v in r["mixed"]["lineup"]["voters"]], r["mixed"]
+            assert "wonder-full" in [v["family"] for v in r["no_kind"]["lineup"]["voters"]], r["no_kind"]
+            assert "wonder-full" in [c["family"] for c in r["ask"]["candidates"]], r["ask"]
+            for key, family in (("review", "wonder"), ("review_lineup", "wonder"), ("mixed", "wonder-full")):
+                item = _skip(r[key], family)
+                assert item is None or item["code"] != "ended", (key, item)
+            assert "ended" not in json.dumps(r["design"]["usage"]), r["design"]["usage"]
+            assert su.muse_line(ts, "/nonexistent/muse-usage.json") == "muse     | no data yet"
+            mu = next(g for g in su.seat_rows(s, ts) if g["id"] == "mu")
+            assert [b["kind"] for b in mu["bars"]] == ["seat", "seat"], mu
+
+
+@test
+def seat_ends_missing_changes_nothing():
+    with local_tz("America/Los_Angeles"):
+        ts = datetime(2026, 11, 13, 12, 0, 0).timestamp()
+        outs = []
+        for doc in (None, {"claude": {"at": "2099-10-14", "renews": None}}, {"muse": {}},
+                    {"claude": {"at": "YYYY-MM-DD", "renews": None}, "muse": {"ends": None}}):
+            with renewals_file(doc):
+                assert su.seat_ends() == {}, doc
+                s, r = _muse_routes(ts)
+                outs.append(json.dumps({"routes": r, "rows": su.seat_rows(s, ts), "burn": su.burn_entries(s, ts),
+                                        "states": {pid: su.pool_status(pid, s, ts) for pid in su.POOLS}},
+                                       sort_keys=True, default=str))
+        assert outs[0] == outs[1] == outs[2] == outs[3]
+        assert "ended" not in outs[0]
+
+
+@test
+def seat_ends_bad_date_errors_clearly():
+    for bad in ("2026-13-01", "11/12/2026", "2026-11-12T00:00:00", "YYYY-MM-DD", "", 20261112):
+        with renewals_file({"muse": {"ends": bad}}) as path:
+            try:
+                su.pool_status("muse_week", snap(), NOW)
+            except su.RenewalsError as e:
+                assert str(e) == f"{path}: muse.ends must be a YYYY-MM-DD date, got {json.dumps(bad)}", str(e)
+            else:
+                raise AssertionError(f"no error for {bad!r}")
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d) / "home"
+        cache_dir = Path(d) / "cache"
+        (home / ".config" / "seat-usage").mkdir(parents=True)
+        cache_dir.mkdir()
+        (cache_dir / "latest.json").write_text(json.dumps(_shift_snap(time.time())))
+        renewals = home / ".config" / "seat-usage" / "renewals.json"
+        renewals.write_text(json.dumps({"muse": {"ends": "2026-13-01"}}))
+        for args in (["--route", "lineup", "--kind", "design", "--cached", "--json"],
+                     ["--route", "review", "--builder-vendor", "xai", "--cached"], ["--cached"]):
+            proc = _run_bin(home, cache_dir, args)
+            assert proc.returncode == 2, (args, proc.returncode, proc.stdout, proc.stderr)
+            assert proc.stderr.strip() == f'seat-usage: {renewals}: muse.ends must be a YYYY-MM-DD date, got "2026-13-01"', proc.stderr
+            assert "Traceback" not in proc.stderr
+
+
+@test
+def seat_ends_cli_shows_ended_in_status_and_routes():
+    with tempfile.TemporaryDirectory() as d:
+        home = Path(d) / "home"
+        cache_dir = Path(d) / "cache"
+        (home / ".config" / "seat-usage").mkdir(parents=True)
+        cache_dir.mkdir()
+        (cache_dir / "latest.json").write_text(json.dumps(_shift_snap(time.time())))
+        renewals = home / ".config" / "seat-usage" / "renewals.json"
+        renewals.write_text(json.dumps({"muse": {"ends": "2026-01-31"}}))
+        status = _run_bin(home, cache_dir, ["--cached"])
+        assert status.returncode == 0, status.stderr
+        assert "  muse     | ended 2026-01-31" in status.stdout.splitlines(), status.stdout
+        rev = _run_bin(home, cache_dir, ["--route", "review", "--builder-vendor", "xai", "--cached", "--json"])
+        assert rev.returncode == 0, rev.stderr
+        item = _skip(json.loads(rev.stdout)[0], "wonder")
+        assert item["code"] == "ended" and item["reason"] == "ended 2026-01-31", item
+        design = _run_bin(home, cache_dir, ["--route", "lineup", "--kind", "design", "--cached", "--json"])
+        row = json.loads(design.stdout)[0]
+        assert "wonder-full" not in [v["family"] for v in row["lineup"]["voters"]], row
+        assert row["usage"]["muse_week"]["state"] == "ended", row["usage"]
+        renewals.write_text(json.dumps({"muse": {"ends": "2099-01-31"}}))
+        design = _run_bin(home, cache_dir, ["--route", "lineup", "--kind", "design", "--cached", "--json"])
+        row = json.loads(design.stdout)[0]
+        assert "wonder-full" in [v["family"] for v in row["lineup"]["voters"]], row
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:
