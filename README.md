@@ -28,7 +28,7 @@ The command name stays `seat-usage`; council hardcodes it. Install locations are
 - `~/.claude/hooks/seat-route-hook`
 - `~/.cache/seat-usage/latest.json`
 - `~/.config/seat-usage/renewals.json` (real file is private; see `renewals.example.json`)
-- `~/.local/state/seat-usage/asks.jsonl` and `history.jsonl`
+- `~/.local/state/seat-usage/asks.jsonl` and `history.jsonl` (`history.jsonl` is cut to its newest 2 MiB of whole lines once it passes 4 MiB)
 - `~/.local/state/seat-usage/failures.jsonl` (`seat-usage --record-failure <seat> --reason credits|rate_limited|auth|max_turns|nonzero`; a line older than six hours does not exclude). Override with `SEAT_USAGE_FAILURES`.
 - `~/.local/state/seat-usage/outcomes.jsonl` (optional extra track record; `SEAT_USAGE_OUTCOMES`)
 - `~/.local/state/seat-usage/runs.jsonl` is council's run log. This command reads it and does not write it. Override with `SEAT_USAGE_RUNS`.
