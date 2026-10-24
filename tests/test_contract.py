@@ -497,9 +497,10 @@ def voter_route_exits_2():
 def example_renewals_schema_sets_the_term_and_a_placeholder_date_does_not():
     example_path = HERE.parents[0] / "renewals.example.json"
     example = json.loads(example_path.read_text())
-    assert set(example) == {"claude"}, example
+    assert set(example) == {"claude", "muse"}, example
     assert example["claude"]["at"] == "YYYY-MM-DD", example["claude"]
     assert example["claude"]["renews"] is None, example["claude"]
+    assert example["muse"] == {"ends": None}, example["muse"]   # no end date: Muse stays seatable
     with tempfile.TemporaryDirectory() as home, loopback_anthropic() as (profile, usage):
         write_credentials(home)
         cache_path = Path(home) / ".cache" / "seat-usage" / "latest.json"
