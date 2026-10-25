@@ -3049,7 +3049,7 @@ def muse_cache_stores_a_parsed_snapshot_even_after_the_window_reset():
 
 
 @test
-def muse_snapshot_is_appended_to_history_and_a_missing_or_exhausted_file_is_not():
+def muse_snapshot_is_appended_to_history_and_a_missing_file_is_not():
     saved = su.HISTORY
     try:
         with tempfile.TemporaryDirectory() as d:
@@ -3067,6 +3067,7 @@ def muse_snapshot_is_appended_to_history_and_a_missing_or_exhausted_file_is_not(
             assert captured != su.NOW, (captured, su.NOW)
             assert by["muse weekly"]["used_pct"] == 18.5 and by["muse weekly"]["window_s"] == 7 * 86400
             assert by["muse weekly"]["reset_ts"] == summary["muse_week_reset_ts"]
+            assert "exhausted" not in by["muse 5h"] and "exhausted" not in by["muse weekly"]
             once = open(su.HISTORY).read()
             su.apply_muse({"v": 1, "as_of": {}, "errors": {}}, NOW, path=str(MUSE_FIXTURES / "fresh.json"))
             assert open(su.HISTORY).read() == once, "the same captured_at was appended twice"
@@ -3107,18 +3108,74 @@ def muse_snapshot_is_appended_to_history_and_a_missing_or_exhausted_file_is_not(
             carried = {"v": 1, "as_of": {"muse": NOW}, "muse_week": 4, "muse_5h": 1}
             su.apply_muse(carried, NOW, path=str(MUSE_FIXTURES / "no-such.json"))
             assert open(su.HISTORY).read() == again, "a missing file restamped history"
-            os.remove(su.HISTORY)
+            su._record_muse_history({"muse_5h": 42, "muse_5h_reset_ts": 1, "muse_week": 18, "muse_week_reset_ts": 2},
+                                    {"window": {"used_percent": 42}, "weekly": {"used_percent": 18}})
+            assert open(su.HISTORY).read() == again, "a snapshot with no captured_at wrote history"
+    finally:
+        su.HISTORY = saved
+
+
+@test
+def muse_exhausted_reading_appends_one_history_row_and_a_repeat_does_not():
+    saved = su.HISTORY
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            su.HISTORY = os.path.join(d, "history.jsonl")
             exhausted = os.path.join(d, "exhausted.json")
+            captured = "2026-10-25T17:52:50Z"
+            reset = 1792972800
             with open(exhausted, "w") as handle:
-                json.dump({"captured_at": "2026-10-25T17:52:50Z", "exhausted": True,
-                           "exhausted_resets_at": 1792972800}, handle)
+                json.dump({"captured_at": captured, "exhausted": True,
+                           "exhausted_resets_at": reset}, handle)
             blank = {"v": 1, "as_of": {}, "muse_5h": 9, "muse_week": 9}
             su.apply_muse(blank, NOW, path=exhausted)
             assert "muse_5h" not in blank and "muse_week" not in blank, blank
-            assert not os.path.exists(su.HISTORY), "an exhausted file with no percent wrote history"
-            su._record_muse_history({"muse_5h": 42, "muse_5h_reset_ts": 1, "muse_week": 18, "muse_week_reset_ts": 2},
-                                    {"window": {"used_percent": 42}, "weekly": {"used_percent": 18}})
-            assert not os.path.exists(su.HISTORY), "a snapshot with no captured_at wrote history"
+            assert blank["muse_exhausted"] is True and blank["muse_exhausted_reset_ts"] == reset, blank
+            rows = [json.loads(line) for line in open(su.HISTORY)]
+            assert len(rows) == 1, rows
+            row = rows[0]
+            assert row["seat"] == "muse" and row["pool"] == "muse weekly" and row["source"] == "snapshot", row
+            assert row["exhausted"] is True and row["reset_ts"] == reset, row
+            assert "used_pct" not in row, row
+            assert row["window_s"] is None and row["read_ts"] == su._muse_epoch(captured), row
+            once = open(su.HISTORY).read()
+            su.apply_muse({"v": 1, "as_of": {}, "errors": {}}, NOW, path=exhausted)
+            assert open(su.HISTORY).read() == once, "the same exhausted captured_at was appended twice"
+            saved_tail = su.HISTORY_TAIL_BYTES
+            su.HISTORY_TAIL_BYTES = 48
+            try:
+                su.record_pool("chatgpt", "chatgpt weekly", 11, NOW + WEEK, WEEK, "live")
+                su.apply_muse({"v": 1, "as_of": {}, "errors": {}}, NOW, path=exhausted)
+                muse_rows = [json.loads(line) for line in open(su.HISTORY)
+                             if json.loads(line)["pool"].startswith("muse")]
+                assert muse_rows == [row], muse_rows
+            finally:
+                su.HISTORY_TAIL_BYTES = saved_tail
+            older = os.path.join(d, "older-exhausted.json")
+            with open(older, "w") as handle:
+                json.dump({"captured_at": "2026-10-24T17:52:50Z", "exhausted": True,
+                           "exhausted_resets_at": reset}, handle)
+            before_older = open(su.HISTORY).read()
+            su.apply_muse({"v": 1, "as_of": {}, "errors": {}}, NOW, path=older)
+            assert open(su.HISTORY).read() == before_older, "an older exhausted captured_at was appended"
+            fresh = os.path.join(d, "fresh-percent.json")
+            with open(fresh, "w") as handle:
+                json.dump({"captured_at": "2026-10-26T17:52:50Z",
+                           "window": {"used_percent": 42, "window_duration_mins": 300,
+                                      "resets_at": "2099-01-01T00:00:00Z"},
+                           "weekly": {"used_percent": 18.5, "resets_at": "2099-01-08T00:00:00Z"}}, handle)
+            su.apply_muse({"v": 1, "as_of": {}, "errors": {}}, NOW, path=fresh)
+            got = [json.loads(line) for line in open(su.HISTORY) if json.loads(line)["pool"].startswith("muse")]
+            assert [r["pool"] for r in got] == ["muse weekly", "muse 5h", "muse weekly"], got
+            assert got[0]["exhausted"] is True and "used_pct" not in got[0], got[0]
+            assert got[1]["used_pct"] == 42 and "exhausted" not in got[1], got[1]
+            assert got[2]["used_pct"] == 18.5 and "exhausted" not in got[2], got[2]
+            no_clock = os.path.join(d, "no-clock.json")
+            with open(no_clock, "w") as handle:
+                json.dump({"exhausted": True, "exhausted_resets_at": reset}, handle)
+            before_clock = open(su.HISTORY).read()
+            su.apply_muse({"v": 1, "as_of": {}, "errors": {}}, NOW, path=no_clock)
+            assert open(su.HISTORY).read() == before_clock, "an exhausted file with no captured_at wrote history"
     finally:
         su.HISTORY = saved
 
