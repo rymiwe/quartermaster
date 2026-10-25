@@ -19,13 +19,16 @@ The widget is quartermaster's android/ and reads the gist through api.github.com
 
 The same gist also carries CACHE_FILE, a copy of latest.json cut to
 CACHE_NUMBERS (numbers only), CACHE_FLAGS (true/false only), as_of stamps
-for known seats, and read_state (a fixed per-seat code: fresh, token_expired,
+for known seats, read_state (a fixed per-seat code: fresh, token_expired,
 rate_limited, usage_failed) plus rate_limited_until (an epoch, only for
-rate_limited). No other string is copied: no plan, status, lines, errors,
-cookie flag, or burn text. One machine (BLD) does every reading and
+rate_limited), and four plan codes from a fixed vocabulary: claude_tier,
+codex_plan, cursor_plan, grok_tier. Any other string is dropped, including
+an unknown plan code, status text, lines, errors, a cookie flag, or burn
+text. Google and Muse have no code in that vocabulary (their plans are not
+read). One machine (BLD) does every reading and
 pushes; a reader (the shared VM) runs --pull and draws meters from that copy
 without any vendor login. --pull filters again, so a gist edited by hand
-still cannot put a string into the reader's cache. It also writes Muse's
+still cannot put an unknown string into the reader's cache. It also writes Muse's
 muse-usage.json from the muse_* numbers, or from muse_exhausted and
 muse_exhausted_reset_ts when those are the only Muse fields, so a reader
 can show Muse capped. No used percent is invented.
@@ -108,6 +111,24 @@ CACHE_FLAGS = frozenset(["bot_exhausted", "grok_exhausted", "muse_exhausted", "c
 AS_OF_SEATS = frozenset(["claude", "chatgpt", "cursor", "grokbot", "grok", "muse", "google"])
 # The only strings that may leave the machine. Anything else is dropped.
 READ_STATES = frozenset(("fresh", "token_expired", "rate_limited", "usage_failed"))
+# Plan codes already stored by seat-usage from the vendor reading. A string
+# outside its set is dropped, on push and again on --pull. Google and Muse
+# are not here: those plans are a label, not a reading.
+CLAUDE_TIERS = frozenset((
+    "claude_ai", "claude_pro",
+    "max", "claude_max", "claude_max_5x", "claude_max_20x",
+))
+CODEX_PLANS = frozenset(("free", "plus", "prolite", "pro"))
+CURSOR_PLANS = frozenset(("free", "pro", "pro+", "ultra"))
+GROK_TIERS = frozenset(("SuperGrok",))
+# Copy field, then the live-cache keys tried in order. The first key that is
+# present wins, so a bad claude_tier does not fall through to claude_plan.
+_PLAN_FIELDS = (
+    ("claude_tier", ("claude_tier", "claude_plan"), CLAUDE_TIERS),
+    ("codex_plan", ("codex_plan",), CODEX_PLANS),
+    ("cursor_plan", ("cursor_plan", "cursor"), CURSOR_PLANS),
+    ("grok_tier", ("grok_tier", "grok"), GROK_TIERS),
+)
 
 
 def _finite(v):
@@ -115,11 +136,61 @@ def _finite(v):
             and v == v and v not in (float("inf"), float("-inf")))
 
 
+def _plan_code(raw, allowed, kind):
+    """One fixed plan code, or None. Unknown text is not copied."""
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not text or text == "?":
+        return None
+    if kind == "claude":
+        text = text.lower().replace("default_", "")
+    elif kind == "cursor":
+        text = text.lower().replace("pro_plus", "pro+")
+    elif kind == "grok":
+        if text == "SUBSCRIPTION_TIER_GROK_PRO":
+            text = "SuperGrok"
+    else:
+        text = text.lower()
+    return text if text in allowed else None
+
+
+def _copy_plan_codes(cache, out):
+    """claude_tier, codex_plan, cursor_plan, grok_tier, when the code is known."""
+    kinds = ("claude", "codex", "cursor", "grok")
+    for (dest, sources, allowed), kind in zip(_PLAN_FIELDS, kinds):
+        for src in sources:
+            if src not in cache:
+                continue
+            code = _plan_code(cache.get(src), allowed, kind)
+            if code:
+                out[dest] = code
+            break
+
+
+def _claude_not_max(cache):
+    """True when the cache names a non-Max Claude plan, or only the false flag.
+
+    A plan string is read first (the same rule as seat-meters). No string and
+    no false flag is unknown, which is not this.
+    """
+    for key in ("claude_tier", "claude_plan"):
+        if key not in cache:
+            continue
+        raw = cache.get(key)
+        if isinstance(raw, str) and raw.strip() and raw.strip() != "?":
+            name = raw.strip().lower().replace("default_", "")
+            return "max" not in name
+        break
+    return cache.get("claude_max") is False
+
+
 def build_cache_copy(cache):
     """latest.json cut to the allowlist. Pure.
 
-    Strings do not survive, except read_state's fixed codes. A backoff epoch
-    is a number and only travels with rate_limited.
+    Strings do not survive, except read_state's fixed codes and the four plan
+    codes in _PLAN_FIELDS. A backoff epoch is a number and only travels with
+    rate_limited. An unknown plan string is dropped.
     """
     cache = cache if isinstance(cache, dict) else {}
     out = {k: cache[k] for k in CACHE_NUMBERS if _finite(cache.get(k))}
@@ -135,6 +206,7 @@ def build_cache_copy(cache):
              if k in state and state[k] == "rate_limited" and _finite(v)}
     if until:
         out["rate_limited_until"] = until
+    _copy_plan_codes(cache, out)
     out["v"] = 1
     return out
 
@@ -181,6 +253,8 @@ def build_payload(cache):
         for sp in specs:
             pct = num(cache.get(sp["pct"]))
             exhausted = bool(sp.get("exhausted") and cache.get(sp["exhausted"]) is True)
+            if sp["id"] == "claude_fable" and _claude_not_max(cache):
+                continue   # no Fable slice off Max; the number stays in the cache copy
             if pct is None and not exhausted and sp.get("optional"):
                 continue   # the status line drops these rather than showing "?"
             w = sp["window"]

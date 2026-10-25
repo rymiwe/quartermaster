@@ -2652,7 +2652,11 @@ def host_short_window_ahead_drops_max_and_keeps_default_effort():
 def host_ask_names_the_binding_window_and_leans():
     r = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34), NOW)
     assert r["mode"] == "ask" and r["suggestion"] is None, r
-    assert r["reason"] == "Bot over pace, Max 5h full", r
+    assert r["reason"] == "Bot over pace, Claude 5h full", r
+    pro = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34, claude_max=False), NOW)
+    assert pro["reason"] == "Bot over pace, Pro 5h full", pro
+    mx = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34, claude_tier="claude_max_5x"), NOW)
+    assert mx["reason"] == "Bot over pace, Max 5h full", mx
     assert r["lean"] == ["cursor_models", "grok"], r
     assert r["hosts"][1]["binding"] == "claude_5h" and r["hosts"][1]["used_pct"] == 100, r
     assert r["hosts"][1]["windows"]["claude_week"] == 34, r

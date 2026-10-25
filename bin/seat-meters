@@ -225,12 +225,33 @@ def reset_label(t):  # orderly resetLabel: a time within 24h, a weekday within 7
 CPLAN = {"plus": "Plus", "pro": "Pro"}.get(str(d.get("codex_plan") or ""), str(d.get("codex_plan") or "").title())
 # Is the Claude plan Max? seat-usage's claude_max (bool) first, the plan name second;
 # None when the cache can't say. Same rule as seat-usage's claude_max().
-PLAN = d.get("claude_plan") if isinstance(d.get("claude_plan"), str) else ""
+# The pulled copy names the tier as claude_tier; a live cache still has claude_plan.
+def _plan_raw():
+    for key in ("claude_tier", "claude_plan"):
+        v = d.get(key)
+        if isinstance(v, str) and v.strip() and v.strip() != "?":
+            return v.strip()
+    return ""
+PLAN = _plan_raw()
 if "claude_max" in d:
     CLAUDE_MAX = d["claude_max"] if isinstance(d["claude_max"], bool) else None
 else:
-    tier = PLAN.strip().lower().replace("default_", "")
+    tier = PLAN.lower().replace("default_", "")
     CLAUDE_MAX = True if "max" in tier else False if tier in ("claude_ai", "claude_pro") else None
+# The word on host lines. A tier code wins; the flag fills in when there is no code.
+# Missing both says Claude, so the picture does not call an unknown plan Max.
+def _tier_word():
+    code = PLAN.lower().replace("default_", "") if PLAN else ""
+    if code:
+        if code in ("claude_ai", "claude_pro"): return "Pro"
+        if "max" in code: return "Max"
+        return "Claude"
+    if CLAUDE_MAX is True: return "Max"
+    if CLAUDE_MAX is False: return "Pro"
+    return "Claude"
+TIER_WORD = _tier_word()
+# "on Max" / "the Max weekly pool" only when the tier itself is Max.
+ON_MAX = TIER_WORD == "Max"
 # Subscription each card belongs to: (paid-through key, will-renew key), as orderly's quota_renewal.
 SUBS = {"claude": ("claude_renews_ts", "claude_renews"), "codex": ("codex_renews_ts", "codex_renews"),
         "cursor": ("cursor_reset_ts", "cursor_renews"), "grok": ("grok_renews_ts", "grok_renews")}
@@ -283,28 +304,32 @@ POOL = {"Claude": ("claude_weekly", "claude", "Claude \u00b7 weekly", "claude"),
         "Muse": ("muse", "muse", "Muse \u00b7 weekly", None)}
 RESET_KEY = {"Claude": "claude_week_reset_ts", "ChatGPT": "codex_reset_ts", "Cursor models": "cursor_reset_ts",
              "Cursor other": "cursor_reset_ts", "Grok Bot": "bot_reset_ts", "SuperGrok": "grok_reset_ts"}
-# The Fable slice row is always drawn, as orderly's quota_claude_fable (server.rb:2031-2047):
+# The Fable slice row, as orderly's quota_claude_fable, except it is not drawn when the
+# plan is known not to be Max (a tier/plan string without "max", or no string and
+# claude_max false). A plan string wins over the flag, as orderly reads the name.
 #   live    the cache has a fable percent;
-#   absent  the plan is known not to be Max and the Claude read finished (fable_absent?,
-#           server.rb:2005-2011): "not on <plan title>", or "not on this plan" with no title;
-#   unknown otherwise: "unknown · seat-usage has no value" (unknown_quota_seat, server.rb:1934).
-# orderly reads the plan name (claude_plan), and so does this when the cache has one. The
-# numbers-only pulled copy has only the claude_max bit: with no plan name, a false claude_max
-# counts as a known non-Max plan with no title.
+#   absent  kept for a row that is drawn and known not to be Max (no longer reached:
+#           that plan collapses the row instead);
+#   unknown otherwise: "unknown · seat-usage has no value".
+# Off Max, Fable's only chip is Cursor Other Models: claude_weekly drops it.
 def _isnum(v): return isinstance(v, (int, float)) and not isinstance(v, bool)
 as_of = d.get("as_of") if isinstance(d.get("as_of"), dict) else {}
 _plan = PLAN if PLAN and PLAN != "?" else None
 if _plan is not None: _not_max = "max" not in _plan.lower()
 else: _not_max = d.get("claude_max") is False
-# claude_plan_title (server.rb:1989): Max, Pro for claude_ai, else the tier name as read
-_title = None if not _plan else "Max" if "max" in _plan.lower() else {"claude_ai": "Pro"}.get(_plan, _plan)
+if _not_max:
+    FAMILIES = [("Fable", ["cursor_other"])] + FAMILIES[1:]
+# claude_plan_title (server.rb:1989): the tier word, else the name as read
+_title = None if not _plan else TIER_WORD if _plan.lower().replace("default_", "") in (
+    "claude_ai", "claude_pro") or "max" in _plan.lower() else _plan
 FABLE_PCT = d.get("fable") if _isnum(d.get("fable")) else None
 FABLE_STATE = ("live" if FABLE_PCT is not None else
                "absent" if _not_max and _isnum(as_of.get("claude")) else "unknown")
 FABLE_TEXT = (f"not on {_title}" if _title else "not on this plan") if FABLE_STATE == "absent" else None
-rows.append(("Fable", seat(FABLE_PCT, d.get("fable_reset_ts"), WK) if FABLE_PCT is not None else None, None))
-POOL["Fable"] = ("claude_fable", "claude", "Claude \u00b7 Fable slice", "claude")
-RESET_KEY["Fable"] = "fable_reset_ts"
+if not _not_max:
+    rows.append(("Fable", seat(FABLE_PCT, d.get("fable_reset_ts"), WK) if FABLE_PCT is not None else None, None))
+    POOL["Fable"] = ("claude_fable", "claude", "Claude \u00b7 Fable slice", "claude")
+    RESET_KEY["Fable"] = "fable_reset_ts"
 # An ended subscription, as orderly's subEnded (extension/newtab.js:773-775, termPast 744-747):
 # set not to renew (renews false) and its paid-through stamp is now or past. Same keys as
 # renewal() above (server.rb:1749-1754, quota_renewal 1770-1796). orderly's date-only Claude term
@@ -479,8 +504,8 @@ def host_lines(s):
     if sid == "grokbot": label = "Grok Bot"
     elif sid == "opus":
         eff = s.get("effort") if s.get("effort") not in (None, "", "-") else ""
-        # orderly says "on Max"; only a Max plan in the cache says so here
-        label = "Opus" + (f" {eff}" if eff else "") + (" on Max" if CLAUDE_MAX is True else "")
+        # "on Max" only when the tier word is Max
+        label = "Opus" + (f" {eff}" if eff else "") + (" on Max" if ON_MAX else "")
     elif sid: label = str(s.get("family") or sid)
     reason = str(s.get("reason") or "")
     lean_names = [{"cursor_models": "Cursor Models", "grok": "SuperGrok"}.get(i, str(i)) for i in (s.get("lean") or [])]
@@ -489,10 +514,10 @@ def host_lines(s):
         text = "Next host: ask" + (f" ({reason})" if reason else "") + (f" \u00b7 {lean}" if lean else "")
     elif label: text = f"Next host: {label}" + (f" ({reason})" if reason else "")
     else: text = "Next host:" + (f" {reason}" if reason else "")
-    names = {"grokbot": "Grok Bot", "opus": "Opus on Max" if CLAUDE_MAX is True else "Opus"}
+    names = {"grokbot": "Grok Bot", "opus": "Opus on Max" if ON_MAX else "Opus"}
     wins = {"grokbot": "its weekly allowance",
-            "claude_week": "the Max weekly pool" if CLAUDE_MAX is True else "the Claude weekly pool",
-            "claude_5h": "the Max 5h window" if CLAUDE_MAX is True else "the Claude 5h window"}
+            "claude_week": "the Max weekly pool" if ON_MAX else "the Claude weekly pool",
+            "claude_5h": "the Max 5h window" if ON_MAX else "the Claude 5h window"}
     why = []
     hosts = s.get("hosts") if isinstance(s.get("hosts"), list) else []
     for h in hosts:

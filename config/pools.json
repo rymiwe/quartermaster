@@ -74,7 +74,7 @@
       "enabled": true,
       "seat": "claude",
       "label": "claude 5h",
-      "ask_label": "Max 5h",
+      "ask_label": "{tier} 5h",
       "family": "opus",
       "models": ["opus"],
       "serves": ["opus", "fable"],
@@ -90,13 +90,13 @@
         "window_s": 18000,
         "as_of": "claude"
       },
-      "facts": {"context": 200000, "limits": "Max session window", "window": "5h"}
+      "facts": {"context": 200000, "limits": "{tier} session window", "window": "5h"}
     },
     "claude_week": {
       "enabled": true,
       "seat": "claude",
       "label": "claude weekly all",
-      "ask_label": "Max weekly",
+      "ask_label": "{tier} weekly",
       "family": "opus",
       "models": ["opus"],
       "serves": ["opus", "fable"],
@@ -117,7 +117,7 @@
         "window_s": 604800,
         "as_of": "claude"
       },
-      "facts": {"context": 200000, "limits": "Max weekly, all models", "window": "7d"},
+      "facts": {"context": 200000, "limits": "{tier} weekly, all models", "window": "7d"},
       "strengths": {
         "bounded-question": {"provider": 0.62, "prior": 0.62},
         "builder": {"provider": 0.40, "prior": 0.40},
@@ -147,7 +147,7 @@
         "window_s": 604800,
         "as_of": "claude"
       },
-      "facts": {"context": 200000, "limits": "Max weekly Fable slice", "window": "7d"},
+      "facts": {"context": 200000, "limits": "{tier} weekly Fable slice", "window": "7d"},
       "strengths": {
         "bounded-question": {"provider": 0.90, "prior": 0.90}
       }
