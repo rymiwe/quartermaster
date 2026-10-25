@@ -13,7 +13,12 @@ current window. That ask is one short reply. It passes --contributor-mode
 off and does not pin a model, so the host's configured model is used. A
 parsed snapshot is copied into this cache (muse_5h, muse_week, and their
 resets, stamped as_of["muse"]), including one whose 5h window has already
-reset. That stamp is a routing input: wonder-full votes on those pools.
+reset. That same read appends `muse 5h` and `muse weekly` to history.jsonl
+with read_ts set to the snapshot's captured_at. A pool that already has a row
+at or after that captured_at is not appended again. No captured_at appends
+nothing. An exhausted record with no used percent appends nothing, and a
+missing file does not restamp a number already in the cache. That stamp is a routing
+input: wonder-full votes on those pools.
 A turn/completed whose error.quota is present records muse_exhausted and
 muse_exhausted_reset_ts, stamps as_of["muse"], and does not invent a used
 percent. Any other turn failure leaves the file unchanged. A missing or
@@ -60,6 +65,9 @@ HISTORY = f"{H}/.local/state/seat-usage/history.jsonl"
 # whole lines, so it stays bounded and its recent tail stays continuous.
 HISTORY_MAX_BYTES = 4 * 1024 * 1024
 HISTORY_KEEP_BYTES = 2 * 1024 * 1024
+# Chunk size when a Muse append looks backward for that pool's last row.
+# Same width as Orderly's history tail (server.rb HISTORY_TAIL_BYTES).
+HISTORY_TAIL_BYTES = 128 * 1024
 # Every route that ends in "ask" or "no rule", with the pool states it saw.
 # Measures how often a person is asked, before anything answers for them.
 ASKS = os.environ.get("SEAT_USAGE_ASKS") or f"{H}/.local/state/seat-usage/asks.jsonl"
@@ -685,13 +693,16 @@ def trim_history():
             except OSError:
                 pass
 
-def record_pool(seat, pool, used_pct, reset_ts, window_s, source):
+def record_pool(seat, pool, used_pct, reset_ts, window_s, source, read_ts=None):
     """One history line per pool. run_draws and Orderly's quota card read it.
-    The file is size-capped (trim_history). Write failures are silent."""
+    read_ts defaults to this process's clock. Muse passes the snapshot's
+    captured_at. The file is size-capped (trim_history). Write failures are silent."""
     if isinstance(used_pct, bool) or not isinstance(used_pct, (int, float)):
         return
+    if read_ts is None:
+        read_ts = NOW
     row = {"host": socket.gethostname(), "seat": seat, "pool": pool, "used_pct": used_pct,
-           "reset_ts": reset_ts, "window_s": window_s, "source": source, "read_ts": NOW}
+           "reset_ts": reset_ts, "window_s": window_s, "source": source, "read_ts": read_ts}
     try:
         os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
         trim_history()
@@ -1017,6 +1028,7 @@ def codex_line(plan, source, windows, age_h):
             record_pool("chatgpt", "chatgpt weekly", used, reset, secs, src)
         elif 0 < secs <= 6 * 3600:
             SUMMARY["codex_5h"] = used; SUMMARY["codex_5h_reset_ts"] = reset
+            record_pool("chatgpt", "chatgpt 5h", used, reset, secs, src)
     SUMMARY["codex_plan"] = plan; SUMMARY["codex_age_h"] = round(age_h, 1)
     SUMMARY["codex_source"] = src
     return f"chatgpt  | {plan} ({source}) | " + " | ".join(parts)
@@ -5015,6 +5027,85 @@ def _muse_file_exhausted(data):
     return {"reset": reset, "captured": _muse_epoch(data.get("captured_at"))}
 
 
+def _history_newest_read_ts(pool):
+    """read_ts of the last history line for pool, or None.
+
+    Reads backward in HISTORY_TAIL_BYTES chunks and stops at that pool's last
+    line. Rows for a pool stay in read_ts order, so that line is the newest.
+    Orderly sorts each pool by read_ts and uses the last row (quota_history,
+    then pool_burn's rows.last); this keeps the file in that same order.
+    """
+    try:
+        size = os.path.getsize(HISTORY)
+    except OSError:
+        return None
+    if size <= 0:
+        return None
+    chunk = HISTORY_TAIL_BYTES if HISTORY_TAIL_BYTES > 0 else 128 * 1024
+    try:
+        with open(HISTORY, "rb") as f:
+            pos = size
+            carry = b""
+            while pos > 0:
+                take = min(chunk, pos)
+                pos -= take
+                f.seek(pos)
+                data = f.read(take) + carry
+                lines = data.split(b"\n")
+                if pos > 0:
+                    carry = lines[0]
+                    lines = lines[1:]
+                else:
+                    carry = b""
+                for line in reversed(lines):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(row, dict) or row.get("pool") != pool:
+                        continue
+                    ts = row.get("read_ts")
+                    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+                        continue
+                    return ts
+    except OSError:
+        return None
+    return None
+
+
+def _record_muse_history(summary, raw):
+    """One history line per Muse percent this read actually parsed.
+
+    read_ts is the snapshot's captured_at, not the process clock. A pool
+    that already has a row at or after that time is skipped, so its rows
+    stay in read_ts order. No captured_at appends nothing. The 5h window is
+    the file's minutes, or five hours when that field is missing. The weekly
+    window is seven days. record_pool drops a value that is not a number, so
+    an exhausted file with no percent writes nothing.
+    """
+    captured = _muse_epoch(raw.get("captured_at")) if isinstance(raw, dict) else None
+    if captured is None:
+        return
+    five_s = 5 * 3600
+    window = raw.get("window") if isinstance(raw, dict) else None
+    if isinstance(window, dict):
+        minutes = window.get("window_duration_mins")
+        if _muse_number(minutes) and minutes > 0:
+            five_s = float(minutes) * 60
+    pools = (
+        ("muse 5h", summary.get("muse_5h"), summary.get("muse_5h_reset_ts"), five_s),
+        ("muse weekly", summary.get("muse_week"), summary.get("muse_week_reset_ts"), 7 * 86400),
+    )
+    for pool, pct, reset, window_s in pools:
+        newest = _history_newest_read_ts(pool)
+        if newest is not None and newest >= captured:
+            continue
+        record_pool("muse", pool, pct, reset, window_s, "snapshot", read_ts=captured)
+
+
 def apply_muse(summary, now, path=None):
     """Copy a parsed Muse snapshot into summary.
 
@@ -5026,7 +5117,12 @@ def apply_muse(summary, now, path=None):
     as_of["muse"], and drops used percents it does not carry. A normal
     snapshot clears that flag. A missing file or a shape that does not match
     drops as_of["muse"], records errors["muse"], and leaves numbers already
-    in summary alone.
+    in summary alone. A parsed snapshot, including percents carried on an
+    exhausted file, is appended to history.jsonl with read_ts set to that
+    snapshot's captured_at. The same captured_at is not written again for a
+    pool that already has a row at or after it. No captured_at appends
+    nothing. A missing file is not appended, so an older percent is not
+    restamped.
     """
     if not isinstance(summary, dict):
         return summary
@@ -5054,6 +5150,7 @@ def apply_muse(summary, now, path=None):
             summary["muse_5h_reset_ts"] = carried["window_reset"]
             summary["muse_week"] = carried["weekly"]
             summary["muse_week_reset_ts"] = carried["weekly_reset"]
+            _record_muse_history(summary, raw)
         else:
             for key in ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts"):
                 summary.pop(key, None)
@@ -5067,6 +5164,7 @@ def apply_muse(summary, now, path=None):
         summary["muse_5h_reset_ts"] = snap["window_reset"]
         summary["muse_week"] = snap["weekly"]
         summary["muse_week_reset_ts"] = snap["weekly_reset"]
+        _record_muse_history(summary, raw)
         as_of["muse"] = snap["captured"]
         summary.pop("muse_exhausted", None)
         summary.pop("muse_exhausted_reset_ts", None)
