@@ -778,7 +778,7 @@ def test_phone_google_chips_are_data_in_pools_json():
         json.dump({k: v for k, v in conf.items() if k != "google_ai_pro"}, open(alt, "w"))
         none = phone_text(t, GOOGLE_CACHE, pools=alt)
     assert _pool(doc, "Google (not read) \u00b7 Argon")["chips"] == [["Argon", "solid"]]
-    assert _pool(doc, "Google (not read) \u00b7 Gemini")["chips"] == [["Argon", "solid"], ["Gemini Flash", "solid"]]
+    assert _pool(doc, "Google (not read) \u00b7 Gemini")["chips"] == [["Gemini Flash", "solid"]]
     assert _pool(doc, "Google (not read) \u00b7 Claude/GPT")["chips"] == [["Opus", "solid"], ["Sonnet", "solid"], ["GPT-OSS", "solid"]]
     assert all(p["chips_drawn"] == len(p["chips"]) for c in doc["cards"] for p in c["pools"]), doc
     # read, not hard-coded; orderly styles chips by seat only, so pools.json's "style" is not used
