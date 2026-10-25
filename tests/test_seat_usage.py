@@ -5932,6 +5932,37 @@ def fable_routing_does_not_move_to_google():
     assert off["family"] == "fable" and off["seat"] == "cursor", off
 
 
+@test
+def google_opus_unknown_and_claude_capped_stays_unknown():
+    """A missing Google reading is not answered by a capped Claude seat."""
+    s = without_as_of(snap(bot_pct=100, claude_week=100), "google")
+    states = {pid: su.pool_status(pid, s, NOW) for pid in su.POOLS}
+    assert su._family_seat_choice("opus", states) == ("unknown", "google_opus_week"), states
+    reason = (
+        "Google Claude/GPT weekly reading unknown; Google Claude/GPT 5h reading unknown: "
+        "fix the failed reading, then ask Ryan"
+    )
+    built = su._constrained_worker("opus", "builder", s, NOW, states)
+    assert built["mode"] == "ask" and built["reason"] == reason, built
+    # An ask row keeps the role's default family. It must not come back as a
+    # seated Grok builder, which is what a None from the constraint used to do.
+    resolved = su._resolve_builder("opus", s, NOW, states)
+    assert resolved["mode"] == "ask" and resolved["reason"] == reason, resolved
+    chair = su._opus_row("chair", s, NOW, states, "chair matches opus builder")
+    assert chair["mode"] == "ask" and chair["reason"] == f"chair matches opus builder: {reason}", chair
+    lined = su.route_lineup(s, NOW, builder=opus_builder())
+    assert lined["mode"] == "ask" and lined["reason"] == reason, lined
+    host = su.route_host(s, NOW)
+    assert host["mode"] == "ask" and host["hosts"][1]["state"] == "unknown", host
+    assert host["hosts"][1]["seat"] == "google", host
+    assert host["reason"] == reason, host
+    stale = snap(bot_pct=100, claude_week=100)
+    stale["as_of"] = dict(stale["as_of"], google=NOW - 11 * 60)
+    aged = su.route_host(stale, NOW)
+    assert aged["hosts"][1]["state"] == "unknown" and aged["hosts"][1]["seat"] == "google", aged
+    assert "reading 11m old" in aged["reason"] and "capped" not in aged["reason"], aged
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:

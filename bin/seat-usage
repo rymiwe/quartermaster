@@ -2024,12 +2024,14 @@ def _seat_join(pids, states):
 
 
 def _family_seat_choice(family, states):
-    """('use', spend) when a preferred seat can take the family, else the last seat's failure.
+    """('use', spend) when a preferred seat can take the family, else why not.
 
     Order is seat_preference in config. A seat is skipped when any pool that
     serves the family is unknown or capped, or the spend pool's gate is.
     Those are the same rules _score_parts and _join_open already use.
-    None when this family has no preference.
+    An unknown seat stays unknown when a later seat is only capped: a missing
+    reading is not proof the family is capped. None when this family has no
+    preference.
     """
     order = SEAT_PREFERENCE.get(family) or ()
     if not order:
@@ -2051,7 +2053,9 @@ def _family_seat_choice(family, states):
             if joined in ("unknown", "capped"):
                 kind = joined
         if kind:
-            fallback = (kind, spend)
+            # unknown wins over a later cap, the same way _join_open does.
+            if fallback is None or fallback[0] != "unknown" or kind == "unknown":
+                fallback = (kind, spend)
             continue
         return ("use", spend)
     return fallback
@@ -2875,9 +2879,32 @@ def _opus_phrase(role, effort, s):
     return f"Opus on {word} at {effort}"
 
 
+def _opus_unknown_labels(states, s):
+    """Ask labels for a preferred Opus seat whose reading failed, spend pool first.
+
+    Used when Claude's own windows are readable, so the ask names the seat
+    that is actually unknown. Labels come from each pool's ask_label.
+    """
+    labels = []
+    for seat in SEAT_PREFERENCE.get("opus") or ():
+        if seat == "claude":
+            continue
+        pids = _serving_on_seat("opus", seat)
+        if not pids or not any(states[pid][0] == "unknown" for pid in pids):
+            continue
+        spend = _spend_pid(pids)
+        ordered = [spend] + [pid for pid in pids if pid != spend]
+        labels.extend((pid, _ask_label(pid, s)) for pid in ordered)
+    return tuple(labels)
+
+
 def _max_unknown_reason(states, s):
     word = _claude_tier_word(s)
     labels = (("claude_week", f"{word} weekly"), ("claude_5h", f"{word} 5h"))
+    if all(states[pid][0] != "unknown" for pid, _label in labels):
+        other = _opus_unknown_labels(states, s)
+        if other:
+            labels = other
     parts, failed = [], False
     for pid, label in labels:
         if states[pid][0] != "unknown":
@@ -2919,7 +2946,9 @@ def _opus_row(role, s, now, states, prefix):
     """Opus chair at high, Opus builder at low, unless that pool is burning or ahead.
 
     seat_preference picks the seat. Claude is the fallback when every earlier
-    seat is capped, unread, or blocked by a gate.
+    seat is capped or blocked by a gate. An unread earlier seat falls through
+    only when a later seat can take the work; if the later seat is capped too,
+    the unread seat stays an ask.
     """
     choice = _family_seat_choice("opus", states)
     if choice and choice[0] == "use":
@@ -4282,8 +4311,9 @@ def route_host(s, now):
     """
     states = {pid: pool_status(pid, s, now) for pid in POOLS}
     bot_state, bot_why = states["grokbot"]
-    # Opus host follows seat_preference. A capped or unread Google seat falls
-    # through to Claude, which is what the row describes when nothing is open.
+    # Opus host follows seat_preference. A capped Google seat falls through to
+    # Claude. An unread Google seat falls through only when Claude can take
+    # the work; a capped Claude seat leaves the host unknown.
     choice = _family_seat_choice("opus", states)
     if choice:
         opus_spend = choice[1]

@@ -858,12 +858,18 @@ def test_phone_caps_wording_comes_from_the_cached_projection():
         assert "caps" not in _pool(doc, title)["stats"], _pool(doc, title)
 
 def _plan_fixture(now, **over):
-    """Both windows full enough that the host line names the Claude tier."""
+    """Both Claude windows full enough that the host line names the Claude tier.
+
+    Google's weekly pool is a known cap, so the Opus host falls through to
+    Claude. A stamped Google seat with no Opus percent would be an unknown
+    reading, and that ask would hide the tier word this fixture is checking.
+    """
     cache = {
         "ts": now,
         "as_of": {k: now for k in ("claude", "chatgpt", "cursor", "grokbot", "grok", "google")},
         "claude_5h": 100, "claude_5h_reset_ts": now + 3600,
         "claude_week": 34, "claude_week_reset_ts": now + 4 * 86400,
+        "google_claudegpt_week": 100, "google_claudegpt_week_reset_ts": now + 4 * 86400,
         "codex": 10, "codex_plan": "plus", "codex_reset_ts": now + 5 * 86400, "codex_window_s": 7 * 86400,
         "cursor_auto_pct": 5, "cursor_api_pct": 20, "cursor_plan": "pro+",
         "cursor_reset_ts": now + 20 * 86400, "cursor_window_s": 31 * 86400,
