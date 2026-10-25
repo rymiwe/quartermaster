@@ -820,13 +820,20 @@ def _plan_is_max(plan):
     return None
 
 def claude_max(s):
-    """The cached claude_max flag, or the plan name on a cache written before it. None when unknown."""
-    flag = s.get("claude_max")
-    if isinstance(flag, bool):
-        return flag
-    if "claude_max" in s:
-        return None
-    return _plan_is_max(s.get("claude_plan"))
+    """True on Max, False on Pro, None when the cache cannot say.
+
+    claude_tier, then claude_plan, is read first. A value is a plan only when
+    it is a non-empty string other than "?": strip, drop "default_", "max"
+    in the name is Max, NON_MAX_TIERS is not, and any other name is unknown.
+    The claude_max bool is used only when neither key names a plan.
+    """
+    s = s if isinstance(s, dict) else {}
+    for key in ("claude_tier", "claude_plan"):
+        raw = s.get(key)
+        if isinstance(raw, str) and raw.strip() and raw.strip() != "?":
+            return _plan_is_max(raw)
+    v = s.get("claude_max")
+    return v if isinstance(v, bool) else None
 
 def claude_renewal(status=None):
     """Neither the OAuth profile nor usage endpoint carries a billing date (checked
@@ -1837,11 +1844,53 @@ def _scored_reason(meta, parts):
         f"cost {parts['cost']}, lose-it {parts['lose_it']:.2f})"
     )
 
-def _ask_label(pid):
-    meta = POOLS[pid]
-    return meta.get("ask_label") or meta["label"]
+def _claude_tier_word(s):
+    """The Claude plan's word for ask labels and the host line.
 
-def _cohort_unknown_ask(role, states, track):
+    The tier code wins (claude_tier, else claude_plan). Pro codes and a false
+    claude_max say Pro. A code with "max", or a true claude_max, says Max.
+    Anything else says Claude, so a missing plan is not called Max.
+    "{tier}" in pools.json ask_label and facts.limits is this word.
+    """
+    s = s if isinstance(s, dict) else {}
+    code = None
+    for key in ("claude_tier", "claude_plan"):
+        raw = s.get(key)
+        if isinstance(raw, str) and raw.strip() and raw.strip() != "?":
+            code = raw.strip().lower().replace("default_", "")
+            break
+    if code:
+        if code in NON_MAX_TIERS:
+            return "Pro"
+        if "max" in code:
+            return "Max"
+        return "Claude"
+    if s.get("claude_max") is True:
+        return "Max"
+    if s.get("claude_max") is False:
+        return "Pro"
+    return "Claude"
+
+
+def _fill_tier(text, s):
+    if not isinstance(text, str) or "{tier}" not in text:
+        return text
+    return text.replace("{tier}", _claude_tier_word(s))
+
+
+def _pool_facts(pid, s=None):
+    """Pool facts with {tier} in limits filled from the cache. window is unchanged."""
+    facts = dict((POOLS.get(pid) or {}).get("facts") or {})
+    if "limits" in facts:
+        facts["limits"] = _fill_tier(facts["limits"], s)
+    return facts
+
+
+def _ask_label(pid, s=None):
+    meta = POOLS[pid]
+    return _fill_tier(meta.get("ask_label") or meta["label"], s)
+
+def _cohort_unknown_ask(role, states, track, s=None):
     """Ask when a cohort has a missing reading and nothing in it is ready to spend.
 
     An ahead or capped sibling does not excuse the missing one, and a fallback
@@ -1861,7 +1910,7 @@ def _cohort_unknown_ask(role, states, track):
         unknown = [(pid, why) for pid, st, why in rows if st == "unknown"]
         if unknown:
             pid, why = unknown[0]
-            return _unknown_reason(_ask_label(pid), why)
+            return _unknown_reason(_ask_label(pid, s), why)
     return None
 
 def _unknown_reason(label, why):
@@ -1870,8 +1919,8 @@ def _unknown_reason(label, why):
         return f"{label} {why}: {_ASK}"
     return f"{label} reading unknown: {_FIX_ASK}"
 
-def _capped_reason(pid, why):
-    reason = f"{_ask_label(pid)} capped: {_ASK}"
+def _capped_reason(pid, why, s=None):
+    reason = f"{_ask_label(pid, s)} capped: {_ASK}"
     if isinstance(why, str) and why.startswith("resets "):
         reason = f"{reason}, {why}"
     return reason
@@ -1910,7 +1959,7 @@ def _hold_unknown(role, s, now, states):
     label = POOLS[primary]["label"]
     return _row(role, s, now, "default", f"{label}: {why or 'unknown'}")
 
-def _explain_none(ranked, states):
+def _explain_none(ranked, states, s=None):
     last = None
     for _fit, _index, pid in ranked:
         st, why = states[pid]
@@ -1923,12 +1972,12 @@ def _explain_none(ranked, states):
                 last = (pid, why)
             continue
         if st == "unknown":
-            return _unknown_reason(_ask_label(pid), why)
+            return _unknown_reason(_ask_label(pid, s), why)
         if block and block[0] == "unknown":
-            return _unknown_reason(_ask_label(block[1]), block[2])
+            return _unknown_reason(_ask_label(block[1], s), block[2])
         last = (pid, why)
     if last:
-        return _capped_reason(last[0], last[1])
+        return _capped_reason(last[0], last[1], s)
     return "ask Ryan"
 
 def score_route(role, s, now, states=None):
@@ -1943,7 +1992,7 @@ def score_route(role, s, now, states=None):
     if held is not None:
         return held
     track = read_track()
-    missing = None if off_max else _cohort_unknown_ask(role, states, track)
+    missing = None if off_max else _cohort_unknown_ask(role, states, track, s)
     if missing:
         return _row(role, s, now, "ask", missing)
     ranked = _ranked(role, track)
@@ -1962,7 +2011,7 @@ def score_route(role, s, now, states=None):
             best = parts
             best_pid = pid
     if best is None:
-        return _row(role, s, now, "ask", _explain_none(ranked, states))
+        return _row(role, s, now, "ask", _explain_none(ranked, states, s))
     meta = POOLS[best_pid]
     family = _family_for(meta, best["pace"])
     effort = _effort_for_score(meta, role, best["pace"], best["burning"])
@@ -2051,7 +2100,7 @@ def pool_status(pool_id, s, now):
     if age > route_fresh_s(s):
         return "unknown", f"reading {int(age // 60)}m old"
     used = s.get(meta["used"])
-    short = (meta.get("facts") or {}).get("window") == "5h"
+    short = _pool_facts(pool_id, s).get("window") == "5h"
     if not _is_number(used):
         # A quota whose reset already passed left no measured percent. That is
         # not the "this plan has no session window" open state.
@@ -2702,14 +2751,16 @@ def _grok_row(role, pid, s, now, states):
     return row
 
 
-def _opus_phrase(role, effort):
+def _opus_phrase(role, effort, s):
+    word = _claude_tier_word(s)
     if role == "builder" and effort == "low":
-        return "Opus at low on Max"
-    return f"Opus on Max at {effort}"
+        return f"Opus at low on {word}"
+    return f"Opus on {word} at {effort}"
 
 
-def _max_unknown_reason(states):
-    labels = (("claude_week", "Max weekly"), ("claude_5h", "Max 5h"))
+def _max_unknown_reason(states, s):
+    word = _claude_tier_word(s)
+    labels = (("claude_week", f"{word} weekly"), ("claude_5h", f"{word} 5h"))
     parts, failed = [], False
     for pid, label in labels:
         if states[pid][0] != "unknown":
@@ -2720,7 +2771,7 @@ def _max_unknown_reason(states):
         else:
             failed = True
             parts.append(f"{label} reading unknown")
-    body = "; ".join(parts) or "Max reading unknown"
+    body = "; ".join(parts) or f"{word} reading unknown"
     return f"{body}: {_FIX_ASK if failed else _ASK}"
 
 
@@ -2728,14 +2779,14 @@ def _opus_row(role, s, now, states, prefix):
     """Opus chair at high, Opus builder at low, unless that pool is burning or ahead."""
     state = _join_open(states["claude_week"][0], states["claude_5h"][0])
     if state == "unknown":
-        return _ask_row(role, s, now, f"{prefix}: {_max_unknown_reason(states)}")
+        return _ask_row(role, s, now, f"{prefix}: {_max_unknown_reason(states, s)}")
     if state == "capped":
-        return _ask_row(role, s, now, f"{prefix} and Max capped: {_ASK}")
+        return _ask_row(role, s, now, f"{prefix} and {_claude_tier_word(s)} capped: {_ASK}")
     default = "low" if role == "builder" else "high"
     effort, mode = _effort_for("claude_week", s, now, states, default=default)
     if mode == "default":
         mode = "suggest"
-    reason = f"{prefix}: {_opus_phrase(role, effort)}"
+    reason = f"{prefix}: {_opus_phrase(role, effort, s)}"
     row = _row(role, s, now, mode, reason, seat="claude", family="opus", effort=effort, variant="-")
     row["reading_age_s"] = _reading_age("claude_week", s, now)
     return row
@@ -2785,7 +2836,7 @@ def _constrained_worker(family, role, s, now, states, keep_ahead=False):
     if family == "opus":
         state = _join_open(states["claude_week"][0], states["claude_5h"][0])
         if state == "unknown":
-            return _ask_row(role, s, now, _max_unknown_reason(states))
+            return _ask_row(role, s, now, _max_unknown_reason(states, s))
         if state == "capped":
             return None
         return _opus_row(role, s, now, states, "builder family opus")
@@ -2962,7 +3013,7 @@ def _muse_voter(states, s, now, skip_ahead=True):
     watched = ("muse_5h", "muse_week")
     if any(states[pid][0] == "unknown" for pid in watched):
         pid = next(pid for pid in watched if states[pid][0] == "unknown")
-        return "ask", _unknown_text(_ask_label(pid), states[pid][1])
+        return "ask", _unknown_text(_ask_label(pid, s), states[pid][1])
     if any(states[pid][0] == "capped" for pid in watched):
         return "skip", None
     if skip_ahead and any(states[pid][0] == "ahead" for pid in watched):
@@ -3535,12 +3586,12 @@ def _review_candidates(states, s, now, excluded_vendor):
             unknown = next((pid for pid in watched if states[pid][0] == "unknown"), None)
             if unknown:
                 why = states[unknown][1]
-                skipped.append(_review_skip(spec, _unknown_text(_ask_label(unknown), why), _review_unknown_code(why)))
+                skipped.append(_review_skip(spec, _unknown_text(_ask_label(unknown, s), why), _review_unknown_code(why)))
                 continue
             capped = next((pid for pid in watched if states[pid][0] == "capped"), None)
             if capped:
                 skipped.append(_review_skip(
-                    spec, _capped_skip_text(_ask_label(capped), states[capped][1]), "capped"))
+                    spec, _capped_skip_text(_ask_label(capped, s), states[capped][1]), "capped"))
                 continue
             pool_id = "muse_week"
         else:
@@ -3703,11 +3754,11 @@ def _fable_unknown_pool(states, s):
     return None, None
 
 
-def _mixed_unknown_label(family, pid):
+def _mixed_unknown_label(family, pid, s=None):
     if family == "fable":
         return "Fable" if pid == "fable" else POOLS[pid]["label"]
     if family == "wonder-full":
-        return _ask_label(pid)
+        return _ask_label(pid, s)
     return _FAMILY_NAME.get(family, family)
 
 
@@ -3814,7 +3865,7 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
                 skipped.append(_mixed_skip(family, seat, block[1], block[0]))
                 continue
             if pid in POOLS and why is not None:
-                reason = _unknown_text(_mixed_unknown_label(family, pid), why)
+                reason = _unknown_text(_mixed_unknown_label(family, pid, s), why)
                 code = _review_unknown_code(why)
             else:
                 reason = payload if isinstance(payload, str) else "reading unknown"
@@ -3823,7 +3874,7 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
             continue
         if status == "skip":
             seat = POOLS[pid]["seat"] if pid in POOLS else spec["seat"]
-            label = _ask_label(pid) if pid in POOLS else family
+            label = _ask_label(pid, s) if pid in POOLS else family
             why_c = states[pid][1] if pid in states else None
             skipped.append(_mixed_skip(family, seat, _capped_skip_text(label, why_c), "capped"))
     return _mixed_finish(voters, skipped, downgrade, excluded_vendor)
@@ -4022,15 +4073,24 @@ def _host_binding(pool_id, states):
     return states[pool_id][0], pool_id
 
 
-_HOST_NAME = {"grokbot": "Bot", "claude_week": "Max", "claude_5h": "Max 5h"}
+def _host_name(pool_id, s):
+    """Host-line names. Claude's word comes from the tier, not a fixed Max."""
+    word = _claude_tier_word(s)
+    if pool_id == "grokbot":
+        return "Bot"
+    if pool_id == "claude_week":
+        return word
+    if pool_id == "claude_5h":
+        return f"{word} 5h"
+    return _ask_label(pool_id, s)
 
 
-def _host_phrase(pool_id, state):
+def _host_phrase(pool_id, state, s):
     """Ask vocabulary. A short window says full; a long one says capped."""
-    name = _HOST_NAME.get(pool_id) or POOLS[pool_id].get("ask_label") or POOLS[pool_id]["label"]
+    name = _host_name(pool_id, s)
     if state == "ahead":
         return f"{name} over pace"
-    if state == "capped" and (POOLS[pool_id].get("facts") or {}).get("window") == "5h":
+    if state == "capped" and _pool_facts(pool_id, s).get("window") == "5h":
         return f"{name} full"
     if state == "capped":
         return f"{name} capped"
@@ -4118,8 +4178,8 @@ def route_host(s, now):
         reason = "over pace" if bot_state == "ahead" else ""
         return finish("suggest", "grokbot", reason, bot)
     if opus_state == "unknown":
-        return finish("ask", None, _max_unknown_reason(states), bot)
-    parts = [p for p in (_host_phrase("grokbot", bot_state), _host_phrase(opus_binding, opus_state)) if p]
+        return finish("ask", None, _max_unknown_reason(states, s), bot)
+    parts = [p for p in (_host_phrase("grokbot", bot_state, s), _host_phrase(opus_binding, opus_state, s)) if p]
     return finish("ask", None, ", ".join(parts) if parts else "no open host", bot)
 
 

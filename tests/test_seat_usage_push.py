@@ -149,19 +149,24 @@ def google_cache(**over):
 @test
 def cache_copy_is_an_allowlist_of_numbers_and_flags():
     c = sp.build_cache_copy(google_cache())
-    assert strings_in(c) == [], strings_in(c)
-    allowed = sp.CACHE_NUMBERS | sp.CACHE_FLAGS | {"as_of"}
+    # google_cache's codex_plan "pro" and cursor "pro+" are known codes. Its
+    # claude_plan "max_5x" is not, so it does not become claude_tier.
+    assert strings_in(c) == ["$.codex_plan", "$.cursor_plan"], strings_in(c)
+    assert c["codex_plan"] == "pro" and c["cursor_plan"] == "pro+" and "claude_tier" not in c, c
+    allowed = sp.CACHE_NUMBERS | sp.CACHE_FLAGS | {"as_of", "codex_plan", "cursor_plan", "claude_tier", "grok_tier"}
     assert set(c) <= allowed, sorted(set(c) - allowed)
     for k, v in c.items():
         if k == "as_of":
             continue
         if k in sp.CACHE_FLAGS:
             assert isinstance(v, bool), (k, v)
+        elif k in ("claude_tier", "codex_plan", "cursor_plan", "grok_tier"):
+            assert isinstance(v, str), (k, v)
         else:
             assert isinstance(v, (int, float)) and not isinstance(v, bool), (k, v)
     body = json.dumps(c)
-    for leaked in ("SECRET", "example.com", "max_5x", "active", "pro+", "cookie", "token", "email", "lines",
-                   "errors", "burn", "codex_plan", "grok_cookie_ok", "_pace", "not signed in", "session"):
+    for leaked in ("SECRET", "example.com", "max_5x", "active", "cookie", "token", "email", "lines",
+                   "errors", "burn", "grok_cookie_ok", "_pace", "not signed in", "session"):
         assert leaked not in body, leaked
 
 
@@ -199,6 +204,72 @@ def cache_copy_drops_wrong_types():
     for k in ("claude_week", "codex", "grok_pct", "bot_exhausted", "cursor_api_pct"):
         assert k not in c, (k, c.get(k))
     assert sp.build_cache_copy("not a dict") == {"as_of": {}, "v": 1}
+
+
+@test
+def cache_copy_keeps_known_plan_codes_and_drops_unknown_ones():
+    """Fixed vocabulary only. --pull filters again, so a hand-edited gist cannot widen it.
+    Google and Muse stay unread: a plan string under those names does not survive."""
+    raw = google_cache(
+        claude_tier="claude_ai", codex_plan="Plus", cursor_plan="pro_plus", grok_tier="SuperGrok",
+        google_plan="AI Pro", muse_plan="not read", claude_status="active",
+    )
+    raw["claude_plan"] = "enterprise-secret"
+    copy = sp.build_cache_copy(raw)
+    assert copy["claude_tier"] == "claude_ai", copy.get("claude_tier")
+    assert copy["codex_plan"] == "plus" and copy["cursor_plan"] == "pro+" and copy["grok_tier"] == "SuperGrok", copy
+    blob = json.dumps(copy)
+    for leaked in ("enterprise-secret", "AI Pro", "active", "google_plan", "muse_plan", "not read"):
+        assert leaked not in blob, leaked
+    # The live cache's own keys, normalized. default_ is stripped; pro_plus becomes pro+.
+    live = google_cache(claude_plan="default_claude_max_5x", codex_plan="free", cursor="ultra", grok="SuperGrok")
+    live.pop("claude_tier", None)
+    mapped = sp.build_cache_copy(live)
+    assert mapped["claude_tier"] == "claude_max_5x" and mapped["codex_plan"] == "free", mapped
+    assert mapped["cursor_plan"] == "ultra" and mapped["grok_tier"] == "SuperGrok", mapped
+    # A present-but-unknown code does not fall through to the older key.
+    bad = google_cache(claude_tier="team-secret", claude_plan="claude_ai", codex_plan="business",
+                       cursor_plan="hobby", grok_tier="Heavy", cursor="pro+")
+    dropped = sp.build_cache_copy(bad)
+    for key in ("claude_tier", "codex_plan", "cursor_plan", "grok_tier"):
+        assert key not in dropped, (key, dropped.get(key))
+    assert "team-secret" not in json.dumps(dropped) and "hobby" not in json.dumps(dropped)
+    # The raw subscription code the reader rewrites is accepted as SuperGrok.
+    grok = sp.build_cache_copy(google_cache(grok="SUBSCRIPTION_TIER_GROK_PRO"))
+    assert grok["grok_tier"] == "SuperGrok", grok.get("grok_tier")
+    import tempfile
+    saved = (sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_get)
+    with tempfile.TemporaryDirectory() as t:
+        try:
+            _with_paths(t)
+            sp.write_json(sp.CONFIG, {"id": "abc123"})
+            sp.gh_get = lambda path: {"files": {sp.CACHE_FILE: {"content": json.dumps(bad)}}}
+            assert sp.pull() == 0
+            landed = json.load(open(sp.CACHE))
+            for key in ("claude_tier", "codex_plan", "cursor_plan", "grok_tier"):
+                assert key not in landed, (key, landed.get(key))
+            assert "team-secret" not in json.dumps(landed) and "hobby" not in json.dumps(landed)
+            sp.gh_get = lambda path: {"files": {sp.CACHE_FILE: {"content": json.dumps(raw)}}}
+            assert sp.pull() == 0
+            again = json.load(open(sp.CACHE))
+            assert again["claude_tier"] == "claude_ai" and again["codex_plan"] == "plus", again
+            assert again["cursor_plan"] == "pro+" and again["grok_tier"] == "SuperGrok", again
+            assert "enterprise-secret" not in json.dumps(again)
+        finally:
+            sp.CACHE, sp.MUSE_FILE, sp.CONFIG, sp.STATE, sp.gh_get = saved
+
+
+@test
+def widget_payload_drops_the_fable_slice_when_the_plan_is_not_max():
+    assert seat(sp.build_payload(full_cache()), "claude_fable") is not None
+    assert seat(sp.build_payload(full_cache(claude_max=False)), "claude_fable") is None
+    assert seat(sp.build_payload(full_cache(claude_plan="claude_ai")), "claude_fable") is None
+    assert seat(sp.build_payload(full_cache(claude_max=True, claude_tier="claude_max_5x")), "claude_fable") is not None
+
+
+@test
+def claude_not_max_treats_an_empty_tier_as_absent():
+    assert sp._claude_not_max({"claude_tier": None, "claude_plan": "claude_ai"}) is True
 
 
 @test
@@ -253,7 +324,7 @@ def pull_lands_a_refiltered_copy_and_muse_file():
             assert sp.pull() == 0
             assert calls == ["gists/abc123"], calls
             landed = json.load(open(sp.CACHE))
-            assert strings_in(landed) == [], strings_in(landed)
+            assert strings_in(landed) == ["$.codex_plan", "$.cursor_plan"], strings_in(landed)
             pulled = landed.pop("pulled_ts")
             assert isinstance(pulled, float) and abs(pulled - time.time()) < 60, pulled
             assert landed == sp.build_cache_copy(hand_edited)

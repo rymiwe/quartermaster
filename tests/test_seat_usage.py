@@ -2444,7 +2444,7 @@ def claude_max_flag_from_plan_and_fable_slice():
     assert f("?", False) is None and f(None, False) is None and f("", False) is None
     assert f("claude_team", False) is None and f("claude_enterprise", False) is None   # not a known tier
     assert su.claude_max(snap(claude_plan="claude_team")) is None
-    assert su.claude_max(snap(claude_max=False, claude_plan="claude_max_5x")) is False   # flag first
+    assert su.claude_max(snap(claude_max=False, claude_plan="claude_max_5x")) is True   # plan name wins
     assert su.claude_max(snap(claude_plan="claude_ai")) is False
     assert su.claude_max(snap(claude_plan="?")) is None and su.claude_max(snap()) is None
     assert su.claude_max(snap(claude_max=1)) is None    # flags are booleans only
@@ -2453,6 +2453,14 @@ def claude_max_flag_from_plan_and_fable_slice():
     lineup = su.route_lineup(absent, NOW, kind="design")   # a pulled copy: flag, no plan name
     fable = next(v for v in lineup["lineup"]["voters"] if v["family"] == "fable")
     assert fable["seat"] == "cursor", fable
+
+
+@test
+def claude_max_reads_tier_then_plan_before_the_flag():
+    """A tier or plan name decides. The bool is only the fallback."""
+    assert su.claude_max({"claude_tier": "claude_ai"}) is False
+    named = {"claude_plan": "default_claude_max_5x", "claude_max": False}
+    assert su.claude_max(named) is True and su._claude_tier_word(named) == "Max"
 
 
 @test
@@ -2652,7 +2660,17 @@ def host_short_window_ahead_drops_max_and_keeps_default_effort():
 def host_ask_names_the_binding_window_and_leans():
     r = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34), NOW)
     assert r["mode"] == "ask" and r["suggestion"] is None, r
-    assert r["reason"] == "Bot over pace, Max 5h full", r
+    assert su._pool_facts("claude_5h", snap(claude_tier="claude_ai"))["limits"] == "Pro session window"
+    assert su._pool_facts("claude_week", snap(claude_max=True))["limits"] == "Max weekly, all models"
+    assert su._pool_facts("fable", snap())["limits"] == "Claude weekly Fable slice"
+    assert "{tier}" not in su._pool_facts("claude_5h", snap())["limits"]
+    assert su._opus_phrase("builder", "low", snap(claude_max=False)) == "Opus at low on Pro"
+    assert su._opus_phrase("chair", "high", snap(claude_tier="claude_max_5x")) == "Opus on Max at high"
+    assert r["reason"] == "Bot over pace, Claude 5h full", r
+    pro = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34, claude_max=False), NOW)
+    assert pro["reason"] == "Bot over pace, Pro 5h full", pro
+    mx = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34, claude_tier="claude_max_5x"), NOW)
+    assert mx["reason"] == "Bot over pace, Max 5h full", mx
     assert r["lean"] == ["cursor_models", "grok"], r
     assert r["hosts"][1]["binding"] == "claude_5h" and r["hosts"][1]["used_pct"] == 100, r
     assert r["hosts"][1]["windows"]["claude_week"] == 34, r
