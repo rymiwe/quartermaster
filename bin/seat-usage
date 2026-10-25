@@ -16,8 +16,10 @@ resets, stamped as_of["muse"]), including one whose 5h window has already
 reset. That same read appends `muse 5h` and `muse weekly` to history.jsonl
 with read_ts set to the snapshot's captured_at. A pool that already has a row
 at or after that captured_at is not appended again. No captured_at appends
-nothing. An exhausted record with no used percent appends nothing, and a
-missing file does not restamp a number already in the cache. That stamp is a routing
+nothing. An exhausted record with no used percent appends one `muse weekly`
+line with exhausted true, the quota reset, and no used percent. The same
+captured_at is not appended again. A missing file does not restamp a number
+already in the cache. That stamp is a routing
 input: wonder-full votes on those pools.
 A turn/completed whose error.quota is present records muse_exhausted and
 muse_exhausted_reset_ts, stamps as_of["muse"], and does not invent a used
@@ -703,6 +705,10 @@ def record_pool(seat, pool, used_pct, reset_ts, window_s, source, read_ts=None):
         read_ts = NOW
     row = {"host": socket.gethostname(), "seat": seat, "pool": pool, "used_pct": used_pct,
            "reset_ts": reset_ts, "window_s": window_s, "source": source, "read_ts": read_ts}
+    _append_history(row)
+
+def _append_history(row):
+    """Append one history line. The file is size-capped. Write failures are silent."""
     try:
         os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
         trim_history()
@@ -5083,8 +5089,8 @@ def _record_muse_history(summary, raw):
     that already has a row at or after that time is skipped, so its rows
     stay in read_ts order. No captured_at appends nothing. The 5h window is
     the file's minutes, or five hours when that field is missing. The weekly
-    window is seven days. record_pool drops a value that is not a number, so
-    an exhausted file with no percent writes nothing.
+    window is seven days. record_pool drops a value that is not a number.
+    An exhausted file with no percent is _record_muse_exhausted, not this.
     """
     captured = _muse_epoch(raw.get("captured_at")) if isinstance(raw, dict) else None
     if captured is None:
@@ -5106,6 +5112,28 @@ def _record_muse_history(summary, raw):
         record_pool("muse", pool, pct, reset, window_s, "snapshot", read_ts=captured)
 
 
+def _record_muse_exhausted(raw, reset):
+    """One muse weekly line when the read is quota-exhausted and has no used percent.
+
+    used_pct is omitted. Orderly's quota_history keeps a row only when used_pct
+    is a number, and run_draws skips a row without one, so a 100 here would be
+    read as a real rise and would inflate burn_pph. exhausted and reset_ts are
+    the fact. A muse weekly row already at or after this captured_at is not
+    written again. No captured_at writes nothing.
+    """
+    captured = _muse_epoch(raw.get("captured_at")) if isinstance(raw, dict) else None
+    if captured is None:
+        return
+    newest = _history_newest_read_ts("muse weekly")
+    if newest is not None and newest >= captured:
+        return
+    _append_history({
+        "host": socket.gethostname(), "seat": "muse", "pool": "muse weekly",
+        "exhausted": True, "reset_ts": reset if _is_number(reset) else None,
+        "window_s": None, "source": "snapshot", "read_ts": captured,
+    })
+
+
 def apply_muse(summary, now, path=None):
     """Copy a parsed Muse snapshot into summary.
 
@@ -5121,8 +5149,10 @@ def apply_muse(summary, now, path=None):
     exhausted file, is appended to history.jsonl with read_ts set to that
     snapshot's captured_at. The same captured_at is not written again for a
     pool that already has a row at or after it. No captured_at appends
-    nothing. A missing file is not appended, so an older percent is not
-    restamped.
+    nothing. An exhausted file with no percent appends one muse weekly line
+    with exhausted true, the quota reset, and no used percent, under that
+    same captured_at dedupe. A missing file is not appended, so an older
+    percent is not restamped.
     """
     if not isinstance(summary, dict):
         return summary
@@ -5154,6 +5184,7 @@ def apply_muse(summary, now, path=None):
         else:
             for key in ("muse_5h", "muse_5h_reset_ts", "muse_week", "muse_week_reset_ts"):
                 summary.pop(key, None)
+            _record_muse_exhausted(raw, exhausted.get("reset"))
         if _is_number(exhausted.get("captured")):
             as_of["muse"] = exhausted["captured"]
         else:
