@@ -39,6 +39,9 @@
     "wonder-full": "Wonder full",
     "wonder": "Wonder"
   },
+  "seat_preference": {
+    "opus": ["google", "claude"]
+  },
   "roles": {
     "bounded-question": {
       "seats": ["claude", "cursor"],

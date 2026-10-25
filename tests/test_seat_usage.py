@@ -248,9 +248,9 @@ def builder_cursor_capped_uses_supergrok_until_that_pool_is_capped_too():
     assert native["mode"] == "default" and native["seat"] == "grok" and native["family"] == "grok", native
     assert native["effort"] == "high" and native["variant"] == "-", native
     ok = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_week=10, claude_5h=10), NOW)
-    assert ok["mode"] == "suggest" and ok["seat"] == "claude" and ok["family"] == "opus", ok
+    assert ok["mode"] == "suggest" and ok["seat"] == "google" and ok["family"] == "opus", ok
     assert ok["effort"] == "low" and ok["variant"] == "-", ok
-    assert ok["reason"] == "claude weekly all under pace: score 0.36 (fit 0.40, headroom 1.00, cost 4, lose-it 0.00)", ok
+    assert ok["reason"] == "google claude/gpt weekly under pace: score 0.32 (fit 0.38, headroom 1.00, cost 2, lose-it 0.00)", ok
     agy = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_week=100, claude_5h=10), NOW)
     assert (agy["mode"], agy["seat"], agy["family"], agy["effort"]) == ("suggest", "google", "opus", "low"), agy
     blocked = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_week=100, claude_5h=10,
@@ -508,9 +508,9 @@ def f3_chair_asks_when_the_grok_reading_is_missing():
     assert r["mode"] == "ask" and r["seat"] == "cursor" and r["family"] == "grok", r
     assert r["reason"] == "grok reading unknown: fix the failed reading, then ask Ryan", r
     capped = su.route("chair", snap(cursor_auto_pct=100, grok_pct=100, claude_week=10, claude_5h=10), NOW)
-    assert capped["mode"] == "suggest" and capped["seat"] == "claude" and capped["family"] == "opus", capped
+    assert capped["mode"] == "suggest" and capped["seat"] == "google" and capped["family"] == "opus", capped
     assert capped["effort"] == "high", capped
-    assert capped["reason"] == "claude weekly all under pace: score 0.36 (fit 0.40, headroom 1.00, cost 4, lose-it 0.00)", capped
+    assert capped["reason"] == "google claude/gpt weekly under pace: score 0.29 (fit 0.35, headroom 1.00, cost 2, lose-it 0.00)", capped
     same = su.route_lineup(snap(cursor_auto_pct=100, grok_pct=100, claude_week=10, claude_5h=10), NOW)
     assert same["lineup"]["chair"]["effort"] == capped["effort"] == "high", same
     assert same["lineup"]["builder"]["effort"] == "low", same
@@ -518,11 +518,17 @@ def f3_chair_asks_when_the_grok_reading_is_missing():
 
 @test
 def f4_zero_5h_without_reset_is_open():
-    # Both Grok pools are capped, so the builder is Opus and the 5h state matters.
+    # Both Grok pools are capped. Google still has headroom, so Claude's 5h
+    # clock does not decide the seat.
     r = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_5h=0, claude_5h_reset_ts=None), NOW)
     assert r["mode"] == "suggest", r
-    assert r["seat"] == "claude" and r["family"] == "opus" and r["effort"] == "low", r
-    assert r["reason"] == "claude weekly all under pace: score 0.36 (fit 0.40, headroom 1.00, cost 4, lose-it 0.00)", r
+    assert r["seat"] == "google" and r["family"] == "opus" and r["effort"] == "low", r
+    # Google capped: a Claude 5h at 0% with no clock stays open and does not block the week.
+    held = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_5h=0, claude_5h_reset_ts=None,
+                                    google_claudegpt_week=100), NOW)
+    assert held["mode"] == "suggest", held
+    assert held["seat"] == "claude" and held["family"] == "opus" and held["effort"] == "low", held
+    assert held["reason"] == "claude weekly all under pace: score 0.36 (fit 0.40, headroom 1.00, cost 4, lose-it 0.00)", held
     # A passed 5h clock, or a used% under 100 with no clock, does not block Max.
     past = su.route("builder", snap(cursor_auto_pct=100, grok_pct=100, claude_5h=0, claude_5h_reset_ts=NOW - 1), NOW)
     assert past["mode"] == "suggest" and past["family"] == "opus", past
@@ -1707,7 +1713,7 @@ def lineup_opus_builder_uses_opus_chair_and_grok_voter():
     r = su.route_lineup(snap(), NOW, builder=opus_builder())
     assert r["mode"] != "ask", r
     assert r["lineup"]["chair"]["family"] == "opus" and r["lineup"]["chair"]["effort"] == "high", r
-    assert r["lineup"]["chair"]["seat"] == "claude" and r["lineup"]["chair"]["vendor"] == "anthropic", r
+    assert r["lineup"]["chair"]["seat"] == "google" and r["lineup"]["chair"]["vendor"] == "anthropic", r
     assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "grok", "wonder-full"], r
     grok = r["lineup"]["voters"][1]
     assert grok["effort"] == "high" and grok["seat"] == "grok" and grok["vendor"] == "xai", grok
@@ -1793,7 +1799,7 @@ def host_suggests_bot_then_opus_and_does_not_select():
     assert [h["id"] for h in r["hosts"]] == ["grokbot", "opus"], r
     assert r["hosts"][0]["available"] is True and r["hosts"][1]["available"] is True, r
     assert r["hosts"][1]["family"] == "opus" and r["hosts"][1]["effort"] == "high", r
-    assert r["hosts"][1]["seat"] == "claude", r
+    assert r["hosts"][1]["seat"] == "google", r
     assert r["seat"] == "grokbot" and r["effort"] == "-", r
 
 
@@ -1801,7 +1807,7 @@ def host_suggests_bot_then_opus_and_does_not_select():
 def host_bot_capped_suggests_opus_and_keeps_bot_state():
     r = su.route_host(snap(bot_pct=100), NOW)
     assert r["suggestion"] == "opus" and r["mode"] == "suggest", r
-    assert r["seat"] == "claude" and r["family"] == "opus" and r["effort"] == "high", r
+    assert r["seat"] == "google" and r["family"] == "opus" and r["effort"] == "high", r
     assert r["hosts"][0]["id"] == "grokbot" and r["hosts"][0]["available"] is False, r
     assert r["hosts"][1]["available"] is True, r
     assert r["selects"] is False, r
@@ -1819,14 +1825,15 @@ def host_unknown_bot_asks_and_still_reports_opus():
 
 @test
 def host_unknown_opus_does_not_hide_an_open_bot():
-    r = su.route_host(without_as_of(snap(), "claude"), NOW)
+    # Both Opus seats unread. An open Bot is still the suggestion.
+    r = su.route_host(without_as_of(without_as_of(snap(), "claude"), "google"), NOW)
     assert r["suggestion"] == "grokbot" and r["mode"] == "suggest", r
     assert r["hosts"][1]["state"] == "unknown" and r["hosts"][1]["available"] is False, r
 
 
 @test
 def host_unknown_max_does_not_hide_an_ahead_bot():
-    r = su.route_host(without_as_of(snap(bot_pct=93), "claude"), NOW)
+    r = su.route_host(without_as_of(without_as_of(snap(bot_pct=93), "claude"), "google"), NOW)
     assert r["suggestion"] == "grokbot" and r["mode"] == "suggest", r
     assert r["reason"] == "over pace", r
     assert "reading unknown" not in r["reason"], r
@@ -1837,7 +1844,9 @@ def host_unknown_max_does_not_hide_an_ahead_bot():
 @test
 def host_burn_spends_opus_before_the_bot():
     soon = NOW + 12 * 3600
-    r = su.route_host(snap(claude_week=5, claude_week_reset_ts=soon, fable=5, fable_reset_ts=soon), NOW)
+    # Google is capped, so the burning Claude weekly pool is the Opus host.
+    r = su.route_host(snap(claude_week=5, claude_week_reset_ts=soon, fable=5, fable_reset_ts=soon,
+                           google_claudegpt_week=100), NOW)
     assert r["suggestion"] == "opus" and r["mode"] == "burn", r
     assert r["hosts"][1]["effort"] == "xhigh", r
     assert r["effort"] == "xhigh", r
@@ -1853,7 +1862,7 @@ def host_exhausted_bot_is_not_the_suggestion():
 
 @test
 def host_both_capped_asks():
-    r = su.route_host(snap(bot_pct=100, claude_week=100), NOW)
+    r = su.route_host(snap(bot_pct=100, claude_week=100, google_claudegpt_week=100), NOW)
     assert r["mode"] == "ask" and r["suggestion"] is None, r
     assert [h["id"] for h in r["hosts"]] == ["grokbot", "opus"], r
     assert "grok-build" not in json.dumps(r["hosts"]), r
@@ -2160,7 +2169,7 @@ def lineup_kind_excludes_the_author_not_the_chair():
     ahead = snap(cursor_auto_pct=80, grok_pct=80)
     review = su.route_lineup(ahead, NOW, builder=grok_builder(), kind="review")
     assert review["mode"] != "ask" and review["lineup"] is not None, review
-    assert review["lineup"]["chair"]["seat"] == "claude", review["lineup"]["chair"]
+    assert review["lineup"]["chair"]["seat"] == "google", review["lineup"]["chair"]
     assert review["lineup"]["chair"]["family"] == "opus", review["lineup"]["chair"]
     assert review["lineup"]["builder"]["family"] == "grok", review["lineup"]["builder"]
     assert review["lineup"]["builder"]["effort"] == "low", review["lineup"]["builder"]
@@ -2625,7 +2634,7 @@ def _assert_host_reason(r):
 
 @test
 def host_both_ahead_suggests_the_bot_and_names_over_pace():
-    r = su.route_host(snap(bot_pct=80, claude_week=80), NOW)
+    r = su.route_host(snap(bot_pct=80, claude_week=80, google_claudegpt_week=80), NOW)
     assert r["mode"] == "suggest" and r["suggestion"] == "grokbot", r
     assert r["reason"] == "both over pace", r
     assert r["selects"] is False and "never" not in r, r
@@ -2636,7 +2645,8 @@ def host_both_ahead_suggests_the_bot_and_names_over_pace():
 @test
 def host_burn_reason_names_the_pool_and_not_the_host():
     soon = NOW + 12 * 3600
-    r = su.route_host(snap(claude_week=5, claude_week_reset_ts=soon, fable=5, fable_reset_ts=soon), NOW)
+    r = su.route_host(snap(claude_week=5, claude_week_reset_ts=soon, fable=5, fable_reset_ts=soon,
+                           google_claudegpt_week=100), NOW)
     assert r["suggestion"] == "opus" and r["mode"] == "burn", r
     assert r["reason"] == "weekly all-models pool burning", r
     assert r["hosts"][1]["binding"] == "claude_week" and r["hosts"][1]["used_pct"] == 5, r
@@ -2648,6 +2658,7 @@ def host_short_window_ahead_drops_max_and_keeps_default_effort():
     soon = NOW + 12 * 3600
     r = su.route_host(snap(
         claude_5h=91, claude_week=5, claude_week_reset_ts=soon, fable=5, fable_reset_ts=soon,
+        google_claudegpt_week=100,
     ), NOW)
     assert r["suggestion"] == "grokbot" and r["mode"] == "suggest", r
     assert r["hosts"][1]["state"] == "ahead" and r["hosts"][1]["binding"] == "claude_5h", r
@@ -2658,7 +2669,7 @@ def host_short_window_ahead_drops_max_and_keeps_default_effort():
 
 @test
 def host_ask_names_the_binding_window_and_leans():
-    r = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34), NOW)
+    r = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34, google_claudegpt_week=100), NOW)
     assert r["mode"] == "ask" and r["suggestion"] is None, r
     assert su._pool_facts("claude_5h", snap(claude_tier="claude_ai"))["limits"] == "Pro session window"
     assert su._pool_facts("claude_week", snap(claude_max=True))["limits"] == "Max weekly, all models"
@@ -2667,9 +2678,11 @@ def host_ask_names_the_binding_window_and_leans():
     assert su._opus_phrase("builder", "low", snap(claude_max=False)) == "Opus at low on Pro"
     assert su._opus_phrase("chair", "high", snap(claude_tier="claude_max_5x")) == "Opus on Max at high"
     assert r["reason"] == "Bot over pace, Claude 5h full", r
-    pro = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34, claude_max=False), NOW)
+    pro = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34, claude_max=False,
+                             google_claudegpt_week=100), NOW)
     assert pro["reason"] == "Bot over pace, Pro 5h full", pro
-    mx = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34, claude_tier="claude_max_5x"), NOW)
+    mx = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34, claude_tier="claude_max_5x",
+                            google_claudegpt_week=100), NOW)
     assert mx["reason"] == "Bot over pace, Max 5h full", mx
     assert r["lean"] == ["cursor_models", "grok"], r
     assert r["hosts"][1]["binding"] == "claude_5h" and r["hosts"][1]["used_pct"] == 100, r
@@ -4708,6 +4721,7 @@ def review_grade_hides_model_vendor_and_seat_names():
 
 @test
 def google_opus_pool_wins_only_when_the_pools_ahead_of_it_cannot():
+    # Cursor still outranks both Opus seats. The 5h gate still blocks Google's week.
     s = snap()
     assert su.route("builder", s, NOW)["seat"] != "google"
     capped = dict(s, grok_exhausted=True, cursor_auto_pct=100, claude_week=99)
@@ -5824,6 +5838,129 @@ def seat_ends_cli_shows_ended_in_status_and_routes():
         design = _run_bin(home, cache_dir, ["--route", "lineup", "--kind", "design", "--cached", "--json"])
         row = json.loads(design.stdout)[0]
         assert "wonder-full" in [v["family"] for v in row["lineup"]["voters"]], row
+
+
+def _opus_when_grok_cannot(**kw):
+    """Cursor and SuperGrok capped, so the scored family is Opus."""
+    return snap(cursor_auto_pct=100, grok_pct=100, grok_exhausted=True, **kw)
+
+
+@test
+def google_opus_is_preferred_when_it_has_headroom():
+    built = su.route("builder", _opus_when_grok_cannot(), NOW)
+    assert (built["seat"], built["family"], built["effort"]) == ("google", "opus", "low"), built
+    assert built["reason"].startswith("google claude/gpt weekly under pace:"), built
+    chair = su.route("chair", _opus_when_grok_cannot(), NOW)
+    assert (chair["seat"], chair["family"], chair["effort"]) == ("google", "opus", "high"), chair
+    # An explicit Opus builder uses the same seat. Vendor stays Anthropic,
+    # so Fable still sits out of the no-kind lineup.
+    lined = su.route_lineup(_opus_when_grok_cannot(), NOW, builder=opus_builder())
+    assert lined["lineup"]["builder"]["seat"] == "google", lined["lineup"]["builder"]
+    assert lined["lineup"]["chair"]["seat"] == "google", lined["lineup"]["chair"]
+    assert lined["lineup"]["chair"]["vendor"] == "anthropic", lined["lineup"]["chair"]
+    assert lined["lineup"]["builder"]["vendor"] == "anthropic", lined["lineup"]["builder"]
+    assert "fable" not in [v["family"] for v in lined["lineup"]["voters"]], lined
+    # Design's chair follows the same preference once Grok cannot take it.
+    design = su.route_lineup(_opus_when_grok_cannot(), NOW, kind="design")
+    assert design["lineup"]["chair"]["seat"] == "google", design["lineup"]["chair"]
+    assert design["lineup"]["chair"]["vendor"] == "anthropic", design["lineup"]["chair"]
+    # Review still has no Opus seat. Argon on Google is a different family.
+    review = su.route_review(_opus_when_grok_cannot(), NOW, "xai")
+    assert all(v.get("family") != "opus" for v in review.get("reviewers") or []), review
+    host = su.route_host(snap(), NOW)
+    assert host["hosts"][1]["seat"] == "google" and host["hosts"][1]["binding"] == "google_opus_week", host
+    assert host["suggestion"] == "grokbot", host
+    # The order is config. Dropping it puts Opus back on Claude while Google has room.
+    with tempfile.TemporaryDirectory() as d:
+        src = json.loads(Path(su.pools_file()).read_text())
+        del src["seat_preference"]
+        path = os.path.join(d, "pools.json")
+        Path(path).write_text(json.dumps(src))
+        try:
+            su.load_config(pools_path=path)
+            plain = su.route("builder", _opus_when_grok_cannot(), NOW)
+            assert (plain["seat"], plain["family"]) == ("claude", "opus"), plain
+        finally:
+            su.load_config()
+
+
+@test
+def google_opus_capped_falls_back_to_claude():
+    week = su.route("builder", _opus_when_grok_cannot(google_claudegpt_week=100), NOW)
+    assert (week["seat"], week["family"]) == ("claude", "opus"), week
+    five = su.route("builder", _opus_when_grok_cannot(google_claudegpt_5h=100), NOW)
+    assert (five["seat"], five["family"]) == ("claude", "opus"), five
+    assert "5h" not in five["reason"] or five["seat"] == "claude", five
+    host = su.route_host(snap(google_claudegpt_5h=100), NOW)
+    assert host["hosts"][1]["seat"] == "claude", host
+    both = su.route("builder", _opus_when_grok_cannot(
+        google_claudegpt_week=100, claude_week=100, claude_5h=100), NOW)
+    assert both["mode"] == "ask", both
+
+
+@test
+def google_opus_stale_or_unread_falls_back_to_claude():
+    stale = _opus_when_grok_cannot()
+    stale["as_of"] = dict(stale["as_of"], google=NOW - 11 * 60)
+    aged = su.route("builder", stale, NOW)
+    assert (aged["seat"], aged["family"]) == ("claude", "opus"), aged
+    unread = without_as_of(_opus_when_grok_cannot(), "google")
+    missing = su.route("builder", unread, NOW)
+    assert (missing["seat"], missing["family"]) == ("claude", "opus"), missing
+    host = su.route_host(without_as_of(snap(), "google"), NOW)
+    assert host["hosts"][1]["seat"] == "claude" and host["hosts"][1]["available"] is True, host
+    # Claude unread as well: the Opus host is unknown, and an open Bot still wins.
+    both = su.route_host(without_as_of(unread, "claude"), NOW)
+    assert both["hosts"][1]["state"] == "unknown", both
+
+
+@test
+def fable_routing_does_not_move_to_google():
+    under = su.route("bounded-question", snap(fable=10), NOW)
+    assert (under["seat"], under["family"]) == ("claude", "fable"), under
+    ahead = su.route("bounded-question", snap(fable=80), NOW)
+    assert (ahead["seat"], ahead["family"]) == ("claude", "opus"), ahead
+    capped = su.route("bounded-question", snap(fable=100, claude_week=10, claude_5h=10), NOW)
+    assert (capped["seat"], capped["family"]) == ("claude", "opus"), capped
+    other = su.route("bounded-question", snap(fable=100, claude_week=100, claude_5h=10, cursor_api_pct=10), NOW)
+    assert (other["seat"], other["family"]) == ("cursor", "fable"), other
+    design = su.route_lineup(snap(), NOW, kind="design")
+    fable = next(v for v in design["lineup"]["voters"] if v["family"] == "fable")
+    assert fable["seat"] == "claude" and fable["vendor"] == "anthropic", fable
+    # Off Max, Fable's frontier is Other Models, still not Google.
+    off = su.route("bounded-question", snap(claude_max=False), NOW)
+    assert off["family"] == "fable" and off["seat"] == "cursor", off
+
+
+@test
+def google_opus_unknown_and_claude_capped_stays_unknown():
+    """A missing Google reading is not answered by a capped Claude seat."""
+    s = without_as_of(snap(bot_pct=100, claude_week=100), "google")
+    states = {pid: su.pool_status(pid, s, NOW) for pid in su.POOLS}
+    assert su._family_seat_choice("opus", states) == ("unknown", "google_opus_week"), states
+    reason = (
+        "Google Claude/GPT weekly reading unknown; Google Claude/GPT 5h reading unknown: "
+        "fix the failed reading, then ask Ryan"
+    )
+    built = su._constrained_worker("opus", "builder", s, NOW, states)
+    assert built["mode"] == "ask" and built["reason"] == reason, built
+    # An ask row keeps the role's default family. It must not come back as a
+    # seated Grok builder, which is what a None from the constraint used to do.
+    resolved = su._resolve_builder("opus", s, NOW, states)
+    assert resolved["mode"] == "ask" and resolved["reason"] == reason, resolved
+    chair = su._opus_row("chair", s, NOW, states, "chair matches opus builder")
+    assert chair["mode"] == "ask" and chair["reason"] == f"chair matches opus builder: {reason}", chair
+    lined = su.route_lineup(s, NOW, builder=opus_builder())
+    assert lined["mode"] == "ask" and lined["reason"] == reason, lined
+    host = su.route_host(s, NOW)
+    assert host["mode"] == "ask" and host["hosts"][1]["state"] == "unknown", host
+    assert host["hosts"][1]["seat"] == "google", host
+    assert host["reason"] == reason, host
+    stale = snap(bot_pct=100, claude_week=100)
+    stale["as_of"] = dict(stale["as_of"], google=NOW - 11 * 60)
+    aged = su.route_host(stale, NOW)
+    assert aged["hosts"][1]["state"] == "unknown" and aged["hosts"][1]["seat"] == "google", aged
+    assert "reading 11m old" in aged["reason"] and "capped" not in aged["reason"], aged
 
 
 def main():
