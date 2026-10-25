@@ -171,17 +171,15 @@ def _copy_plan_codes(cache, out):
 def _claude_not_max(cache):
     """True when the cache names a non-Max Claude plan, or only the false flag.
 
-    A plan string is read first (the same rule as seat-meters). No string and
-    no false flag is unknown, which is not this.
+    A plan string is read first (the same rule as seat-meters). Empty, None,
+    and "?" are not a plan, so the next key is read. No string and no false
+    flag is unknown, which is not this.
     """
     for key in ("claude_tier", "claude_plan"):
-        if key not in cache:
-            continue
         raw = cache.get(key)
         if isinstance(raw, str) and raw.strip() and raw.strip() != "?":
             name = raw.strip().lower().replace("default_", "")
             return "max" not in name
-        break
     return cache.get("claude_max") is False
 
 

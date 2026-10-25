@@ -820,13 +820,20 @@ def _plan_is_max(plan):
     return None
 
 def claude_max(s):
-    """The cached claude_max flag, or the plan name on a cache written before it. None when unknown."""
-    flag = s.get("claude_max")
-    if isinstance(flag, bool):
-        return flag
-    if "claude_max" in s:
-        return None
-    return _plan_is_max(s.get("claude_plan"))
+    """True on Max, False on Pro, None when the cache cannot say.
+
+    claude_tier, then claude_plan, is read first. A value is a plan only when
+    it is a non-empty string other than "?": strip, drop "default_", "max"
+    in the name is Max, NON_MAX_TIERS is not, and any other name is unknown.
+    The claude_max bool is used only when neither key names a plan.
+    """
+    s = s if isinstance(s, dict) else {}
+    for key in ("claude_tier", "claude_plan"):
+        raw = s.get(key)
+        if isinstance(raw, str) and raw.strip() and raw.strip() != "?":
+            return _plan_is_max(raw)
+    v = s.get("claude_max")
+    return v if isinstance(v, bool) else None
 
 def claude_renewal(status=None):
     """Neither the OAuth profile nor usage endpoint carries a billing date (checked

@@ -268,6 +268,11 @@ def widget_payload_drops_the_fable_slice_when_the_plan_is_not_max():
 
 
 @test
+def claude_not_max_treats_an_empty_tier_as_absent():
+    assert sp._claude_not_max({"claude_tier": None, "claude_plan": "claude_ai"}) is True
+
+
+@test
 def cache_copy_round_trips_read_state_and_drops_anything_else():
     until = NOW + 540
     raw = google_cache(

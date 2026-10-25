@@ -2444,7 +2444,7 @@ def claude_max_flag_from_plan_and_fable_slice():
     assert f("?", False) is None and f(None, False) is None and f("", False) is None
     assert f("claude_team", False) is None and f("claude_enterprise", False) is None   # not a known tier
     assert su.claude_max(snap(claude_plan="claude_team")) is None
-    assert su.claude_max(snap(claude_max=False, claude_plan="claude_max_5x")) is False   # flag first
+    assert su.claude_max(snap(claude_max=False, claude_plan="claude_max_5x")) is True   # plan name wins
     assert su.claude_max(snap(claude_plan="claude_ai")) is False
     assert su.claude_max(snap(claude_plan="?")) is None and su.claude_max(snap()) is None
     assert su.claude_max(snap(claude_max=1)) is None    # flags are booleans only
@@ -2453,6 +2453,14 @@ def claude_max_flag_from_plan_and_fable_slice():
     lineup = su.route_lineup(absent, NOW, kind="design")   # a pulled copy: flag, no plan name
     fable = next(v for v in lineup["lineup"]["voters"] if v["family"] == "fable")
     assert fable["seat"] == "cursor", fable
+
+
+@test
+def claude_max_reads_tier_then_plan_before_the_flag():
+    """A tier or plan name decides. The bool is only the fallback."""
+    assert su.claude_max({"claude_tier": "claude_ai"}) is False
+    named = {"claude_plan": "default_claude_max_5x", "claude_max": False}
+    assert su.claude_max(named) is True and su._claude_tier_word(named) == "Max"
 
 
 @test
