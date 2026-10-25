@@ -3048,6 +3048,68 @@ def muse_cache_stores_a_parsed_snapshot_even_after_the_window_reset():
     assert missing["muse_week"] == 4, missing
 
 
+@test
+def muse_snapshot_is_appended_to_history_and_a_missing_or_exhausted_file_is_not():
+    saved = su.HISTORY
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            su.HISTORY = os.path.join(d, "history.jsonl")
+            summary = {"v": 1, "as_of": {}, "errors": {}}
+            su.apply_muse(summary, NOW, path=str(MUSE_FIXTURES / "fresh.json"))
+            rows = [json.loads(line) for line in open(su.HISTORY)]
+            by = {r["pool"]: r for r in rows}
+            assert set(by) == {"muse 5h", "muse weekly"}, rows
+            assert by["muse 5h"]["seat"] == "muse" and by["muse 5h"]["source"] == "snapshot"
+            assert by["muse 5h"]["used_pct"] == 42 and by["muse 5h"]["window_s"] == 300 * 60
+            assert by["muse 5h"]["reset_ts"] == summary["muse_5h_reset_ts"]
+            assert by["muse 5h"]["read_ts"] == su.NOW
+            assert by["muse weekly"]["used_pct"] == 18.5 and by["muse weekly"]["window_s"] == 7 * 86400
+            assert by["muse weekly"]["reset_ts"] == summary["muse_week_reset_ts"]
+            before = open(su.HISTORY).read()
+            carried = {"v": 1, "as_of": {"muse": NOW}, "muse_week": 4, "muse_5h": 1}
+            su.apply_muse(carried, NOW, path=str(MUSE_FIXTURES / "no-such.json"))
+            assert open(su.HISTORY).read() == before, "a missing file restamped history"
+            os.remove(su.HISTORY)
+            exhausted = os.path.join(d, "exhausted.json")
+            with open(exhausted, "w") as handle:
+                json.dump({"captured_at": "2026-10-25T17:52:50Z", "exhausted": True,
+                           "exhausted_resets_at": 1792972800}, handle)
+            blank = {"v": 1, "as_of": {}, "muse_5h": 9, "muse_week": 9}
+            su.apply_muse(blank, NOW, path=exhausted)
+            assert "muse_5h" not in blank and "muse_week" not in blank, blank
+            assert not os.path.exists(su.HISTORY), "an exhausted file with no percent wrote history"
+    finally:
+        su.HISTORY = saved
+
+
+@test
+def codex_5h_is_recorded_beside_the_weekly_pool():
+    saved_summary, saved_history = su.SUMMARY, su.HISTORY
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            su.HISTORY = os.path.join(d, "history.jsonl")
+            su.SUMMARY = {"ts": NOW, "as_of": {}, "v": 1}
+            weekly_reset, five_reset = NOW + 3 * 86400, NOW + 4 * 3600
+            su.codex_line("plus", "live", [
+                ("primary", 12, five_reset, 5 * 3600),
+                ("secondary", 40, weekly_reset, 7 * 86400),
+            ], 0.0)
+            rows = [json.loads(line) for line in open(su.HISTORY)]
+            by = {r["pool"]: r for r in rows}
+            assert set(by) == {"chatgpt weekly", "chatgpt 5h"}, rows
+            assert by["chatgpt 5h"]["seat"] == "chatgpt" and by["chatgpt 5h"]["source"] == "live"
+            assert by["chatgpt 5h"]["used_pct"] == 12 and by["chatgpt 5h"]["window_s"] == 5 * 3600
+            assert by["chatgpt 5h"]["reset_ts"] == five_reset
+            assert by["chatgpt weekly"]["used_pct"] == 40 and by["chatgpt weekly"]["window_s"] == 7 * 86400
+            os.remove(su.HISTORY)
+            su.SUMMARY = {"ts": NOW, "as_of": {}, "v": 1}
+            su.codex_line("pro", "live", [("primary", 7, weekly_reset, 7 * 86400)], 0.0)
+            rows = [json.loads(line) for line in open(su.HISTORY)]
+            assert [r["pool"] for r in rows] == ["chatgpt weekly"], rows
+    finally:
+        su.SUMMARY, su.HISTORY = saved_summary, saved_history
+
+
 def _muse_stub(path, body):
     path.write_text("#!/usr/bin/env python3\n" + body)
     path.chmod(0o755)
