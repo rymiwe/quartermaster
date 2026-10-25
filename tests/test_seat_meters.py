@@ -92,7 +92,7 @@ def test_muse_file_draws_a_muse_track():
         im = Image.open(out).convert("RGB")
         assert BLUE in {im.getpixel((x, y)) for y in range(im.size[1]) for x in range(im.size[0])}
         doc = phone_text(t, {"ts": NOW}, muse_doc())
-    assert _pool(doc, "Muse \u00b7 weekly")["stats"].startswith("50% \u00b7 5h 35%"), doc
+    assert _pool(doc, "Muse (not read) \u00b7 weekly")["stats"].startswith("50% \u00b7 5h 35%"), doc
 
 def test_missing_or_stale_muse_file_says_no_reading():
     stale = muse_doc(); stale["window"]["resets_at"] = iso(NOW - 60)
@@ -103,7 +103,7 @@ def test_missing_or_stale_muse_file_says_no_reading():
             im = Image.open(out).convert("RGB")
             assert BLUE not in {im.getpixel((x, y)) for y in range(im.size[1]) for x in range(im.size[0])}
             doc = phone_text(t, {"ts": NOW}, muse)
-        assert _pool(doc, "Muse \u00b7 weekly")["stats"] == "no reading", doc
+        assert _pool(doc, "Muse (not read) \u00b7 weekly")["stats"] == "no reading", doc
 
 def test_phone_flag_is_a_no_op_alias():
     """One layout: orderly's cards in two columns of the narrow rail. --phone, which used to
@@ -213,7 +213,7 @@ def test_phone_5h_track_has_no_text_beside_it():
         ink = {x for y in five for x in range(lo, hi)
                if dim_text(im.getpixel((x, y))) and not any(abs(x - t) <= 4 for t in tick)}
         assert not ink, sorted(ink)[:5]
-        gem = _pool(phone_text(t, cache), "Google AI Pro \u00b7 Gemini")
+        gem = _pool(phone_text(t, cache), "Google AI Pro (not read) \u00b7 Gemini")
         assert gem["stats"].startswith("5% \u00b7 5h 20%"), gem["stats"]
 
 def test_phone_over_pace_segment_is_red_on_both_tracks():
@@ -276,7 +276,7 @@ def test_phone_stats_line_reads_like_orderly():
     assert _pool(doc, "Claude \u00b7 weekly")["stats"] == f"55% \u00b7 5h 1% \u00b7 resets {_wd(NOW + 4 * 86400)}"
     assert _pool(doc, "SuperGrok \u00b7 weekly")["stats"] == f"19% \u00b7 resets {_wd(NOW + 3 * 86400)}"
     assert _pool(doc, "Cursor \u00b7 Other Models")["stats"] == "21%"  # half up, like orderly; reset is the header's
-    assert _pool(doc, "Muse \u00b7 weekly")["stats"] == "no reading"
+    assert _pool(doc, "Muse (not read) \u00b7 weekly")["stats"] == "no reading"
 
 def test_phone_hot_5h_is_red_and_no_cached_projection_means_no_caps():
     """Caps wording comes only from seat-usage's <pool>_caps_early_s; far over pace without it says nothing."""
@@ -358,8 +358,8 @@ def test_phone_card_headers_use_cached_renewals_only():
     assert _pool(doc, "Cursor \u00b7 Cursor Models")["stats"] == "2%"           # its reset is on the header
     assert "resets" in _pool(doc, "Grok Bot \u00b7 weekly")["stats"]          # Grok Bot's is its own
     assert _card(doc, "SuperGrok \u00b7 weekly")["header"] == f"SuperGrok \u00b7 term ends {_md(grok_t)}"  # renews unknown
-    assert _card(doc, "Google AI Pro \u00b7 Argon")["header"] is None          # no renewal in the cache
-    assert _card(doc, "Muse \u00b7 weekly")["header"] is None
+    assert _card(doc, "Google AI Pro (not read) \u00b7 Argon")["header"] is None          # no renewal in the cache
+    assert _card(doc, "Muse (not read) \u00b7 weekly")["header"] is None
 
 def test_phone_chips_follow_orderly_whatever_the_claude_plan():
     """orderly seatLabel, except a known non-Max plan drops Fable from Claude weekly
@@ -385,8 +385,8 @@ def test_phone_chips_follow_orderly_whatever_the_claude_plan():
         assert all(p["chips_drawn"] == len(p["chips"]) for c in doc["cards"] for p in c["pools"]), doc
         assert _pool(doc, "SuperGrok \u00b7 weekly")["chips"] == [["Grok", "dotted"]]  # a full pool keeps its chip
         assert _pool(doc, "Cursor \u00b7 Other Models")["chips"] == [["Fable", "dashed"], ["Opus", "dashed"], ["Sol", "dashed"]]
-    assert _pool(unknown, "Muse \u00b7 weekly")["chips"] == [["Wonder full", "solid"], ["Wonder", "solid"]]
-    assert _pool(unknown, "Google AI Pro \u00b7 Argon")["chips"] == [["Argon", "solid"]]  # config/pools.json
+    assert _pool(unknown, "Muse (not read) \u00b7 weekly")["chips"] == [["Wonder full", "solid"], ["Wonder", "solid"]]
+    assert _pool(unknown, "Google AI Pro (not read) \u00b7 Argon")["chips"] == [["Argon", "solid"]]  # config/pools.json
     assert unknown["legend"] == "dashed = metered \u00b7 dotted = builder only \u00b7 \u2605 first usable pool for the family"
 
 def _fable_slice(doc):
@@ -777,14 +777,14 @@ def test_phone_google_chips_are_data_in_pools_json():
         edited = phone_text(t, GOOGLE_CACHE, pools=alt)
         json.dump({k: v for k, v in conf.items() if k != "google_ai_pro"}, open(alt, "w"))
         none = phone_text(t, GOOGLE_CACHE, pools=alt)
-    assert _pool(doc, "Google AI Pro \u00b7 Argon")["chips"] == [["Argon", "solid"]]
-    assert _pool(doc, "Google AI Pro \u00b7 Gemini")["chips"] == [["Argon", "solid"], ["Gemini Flash", "solid"]]
-    assert _pool(doc, "Google AI Pro \u00b7 Claude/GPT")["chips"] == [["Opus", "solid"], ["Sonnet", "solid"], ["GPT-OSS", "solid"]]
+    assert _pool(doc, "Google AI Pro (not read) \u00b7 Argon")["chips"] == [["Argon", "solid"]]
+    assert _pool(doc, "Google AI Pro (not read) \u00b7 Gemini")["chips"] == [["Argon", "solid"], ["Gemini Flash", "solid"]]
+    assert _pool(doc, "Google AI Pro (not read) \u00b7 Claude/GPT")["chips"] == [["Opus", "solid"], ["Sonnet", "solid"], ["GPT-OSS", "solid"]]
     assert all(p["chips_drawn"] == len(p["chips"]) for c in doc["cards"] for p in c["pools"]), doc
     # read, not hard-coded; orderly styles chips by seat only, so pools.json's "style" is not used
-    assert _pool(edited, "Google AI Pro \u00b7 Argon")["chips"] == [["Test fam", "solid"]]
-    assert _pool(edited, "Google AI Pro \u00b7 Claude/GPT")["chips"] == []
-    assert all(p["chips"] == [] for p in _card(none, "Google AI Pro \u00b7 Argon")["pools"])
+    assert _pool(edited, "Google AI Pro (not read) \u00b7 Argon")["chips"] == [["Test fam", "solid"]]
+    assert _pool(edited, "Google AI Pro (not read) \u00b7 Claude/GPT")["chips"] == []
+    assert all(p["chips"] == [] for p in _card(none, "Google AI Pro (not read) \u00b7 Argon")["pools"])
     assert doc["notes"] == []
 
 def test_phone_google_chips_take_orderlys_family_order():
@@ -805,12 +805,12 @@ def test_phone_google_chips_take_orderlys_family_order():
         no_reset = phone_text(t, {**five_only, "google_gemini_week": 5}, pools=alt)
         # no as_of.google: seat_rows draws a failed bar, which names no families
         no_stamp = phone_text(t, {**GOOGLE_CACHE, "as_of": {k: v for k, v in FRESH.items() if k != "google"}}, pools=alt)
-    assert _pool(no_reset, "Google AI Pro \u00b7 Gemini")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
-    assert all(p["chips"] == [] for p in _card(no_stamp, "Google AI Pro \u00b7 Argon")["pools"]), no_stamp
-    assert _pool(doc, "Google AI Pro \u00b7 Argon")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
-    assert _pool(doc, "Google AI Pro \u00b7 Gemini")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
-    assert _pool(doc, "Google AI Pro \u00b7 Claude/GPT")["chips"] == [["Opus", "solid"], ["GPT-OSS", "solid"]]
-    assert _pool(no_week, "Google AI Pro \u00b7 Gemini")["chips"] == []
+    assert _pool(no_reset, "Google AI Pro (not read) \u00b7 Gemini")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
+    assert all(p["chips"] == [] for p in _card(no_stamp, "Google AI Pro (not read) \u00b7 Argon")["pools"]), no_stamp
+    assert _pool(doc, "Google AI Pro (not read) \u00b7 Argon")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
+    assert _pool(doc, "Google AI Pro (not read) \u00b7 Gemini")["chips"] == [["Zeta", "solid"], ["Argon", "solid"]]
+    assert _pool(doc, "Google AI Pro (not read) \u00b7 Claude/GPT")["chips"] == [["Opus", "solid"], ["GPT-OSS", "solid"]]
+    assert _pool(no_week, "Google AI Pro (not read) \u00b7 Gemini")["chips"] == []
 
 def test_phone_chips_that_do_not_fit_wrap_and_the_card_grows():
     with tempfile.TemporaryDirectory() as t:
@@ -821,12 +821,12 @@ def test_phone_chips_that_do_not_fit_wrap_and_the_card_grows():
             conf["google_ai_pro"]["pools"]["argon"] = {"families": fams}
             json.dump(conf, open(alt, "w"))
             doc = phone_text(t, GOOGLE_CACHE, pools=alt)
-            p = _pool(doc, "Google AI Pro \u00b7 Argon")
+            p = _pool(doc, "Google AI Pro (not read) \u00b7 Argon")
             assert p["chips_drawn"] == len(fams), p
             heights.append(Image.open(os.path.join(t, "p.png")).size[1])
         conf["google_ai_pro"]["pools"] = ["not", "a", "dict"]  # a bad block: no chips, no crash
         json.dump(conf, open(alt, "w"))
-        assert _pool(phone_text(t, GOOGLE_CACHE, pools=alt), "Google AI Pro \u00b7 Argon")["chips"] == []
+        assert _pool(phone_text(t, GOOGLE_CACHE, pools=alt), "Google AI Pro (not read) \u00b7 Argon")["chips"] == []
     assert heights[1] > heights[0], heights
 
 def test_phone_caps_wording_comes_from_the_cached_projection():
@@ -853,8 +853,8 @@ def test_phone_caps_wording_comes_from_the_cached_projection():
     assert cl["stats"].startswith("60% \u00b7 caps 2d early \u00b7 5h 10%"), cl  # after the pct, weekly only
     assert cl["red"] == ["caps 2d early"], cl
     assert _pool(doc, "SuperGrok \u00b7 weekly")["red"] == ["caps 40m early"]
-    assert _pool(doc, "Google AI Pro \u00b7 Gemini")["red"] == ["caps 3h early"]
-    for title in ("Grok Bot \u00b7 weekly", "Google AI Pro \u00b7 Argon", "Google AI Pro \u00b7 Claude/GPT", "Codex \u00b7 weekly", "Cursor \u00b7 Other Models"):
+    assert _pool(doc, "Google AI Pro (not read) \u00b7 Gemini")["red"] == ["caps 3h early"]
+    for title in ("Grok Bot \u00b7 weekly", "Google AI Pro (not read) \u00b7 Argon", "Google AI Pro (not read) \u00b7 Claude/GPT", "Codex \u00b7 weekly", "Cursor \u00b7 Other Models"):
         assert "caps" not in _pool(doc, title)["stats"], _pool(doc, title)
 
 def _plan_fixture(now, **over):
@@ -879,7 +879,8 @@ def _fable_chip_rows(doc):
 
 def test_pro_versus_max_fixture():
     """Pro hides the Fable slice and says no Max. Max keeps the slice and the tier's word.
-    Google AI Pro and Muse stay their own cards; neither gets a plan code from the cache."""
+    Google AI Pro and Muse stay their own cards; neither gets a plan code from the cache,
+    so both titles keep the not-read label."""
     now = time.time()
     with tempfile.TemporaryDirectory() as t:
         pro = phone_text(t, _plan_fixture(now, claude_max=False, claude_tier="claude_ai"), muse_doc(now))
@@ -892,9 +893,9 @@ def test_pro_versus_max_fixture():
     assert _fable_chip_rows(mx) == ["Claude \u00b7 weekly", "Claude \u00b7 Fable slice", "Cursor \u00b7 Other Models"], _fable_chip_rows(mx)
     assert "Max" in json.dumps(mx) and "Max 5h full" in mx["host"], mx["host"]
     for doc in (pro, mx):
-        assert any(p["title"].startswith("Google AI Pro") for c in doc["cards"] for p in c["pools"])
-        assert any(p["title"].startswith("Muse") for c in doc["cards"] for p in c["pools"])
-        assert "not read" not in json.dumps(doc)  # that label stays on the plans line, not the meters
+        titles = [p["title"] for c in doc["cards"] for p in c["pools"]]
+        assert "Google AI Pro (not read) \u00b7 Argon" in titles, titles
+        assert "Muse (not read) \u00b7 weekly" in titles, titles
 
 if __name__ == "__main__":
     if Image is None:

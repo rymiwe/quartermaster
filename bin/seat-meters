@@ -298,10 +298,11 @@ POOL = {"Claude": ("claude_weekly", "claude", "Claude \u00b7 weekly", "claude"),
         "Cursor other": ("cursor_other", "cursor", "Cursor \u00b7 Other Models", "cursor"),
         "Grok Bot": ("grokbot", "cursor", "Grok Bot \u00b7 weekly", "grokbot"),
         "SuperGrok": ("supergrok", "grok", "SuperGrok \u00b7 weekly", "grok"),
-        "Argon": ("google_argon_week", "google", "Google AI Pro \u00b7 Argon", "google"),
-        "Gemini": ("google_gemini_week", "google", "Google AI Pro \u00b7 Gemini", "google"),
-        "Claude/GPT": ("google_claudegpt_week", "google", "Google AI Pro \u00b7 Claude/GPT", "google"),
-        "Muse": ("muse", "muse", "Muse \u00b7 weekly", None)}
+        # No Google or Muse plan code is in the cache (push copies none), so this label stays.
+        "Argon": ("google_argon_week", "google", "Google AI Pro (not read) \u00b7 Argon", "google"),
+        "Gemini": ("google_gemini_week", "google", "Google AI Pro (not read) \u00b7 Gemini", "google"),
+        "Claude/GPT": ("google_claudegpt_week", "google", "Google AI Pro (not read) \u00b7 Claude/GPT", "google"),
+        "Muse": ("muse", "muse", "Muse (not read) \u00b7 weekly", None)}
 RESET_KEY = {"Claude": "claude_week_reset_ts", "ChatGPT": "codex_reset_ts", "Cursor models": "cursor_reset_ts",
              "Cursor other": "cursor_reset_ts", "Grok Bot": "bot_reset_ts", "SuperGrok": "grok_reset_ts"}
 # The Fable slice row, as orderly's quota_claude_fable, except it is not drawn when the
