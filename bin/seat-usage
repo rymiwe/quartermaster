@@ -1871,6 +1871,14 @@ def _fill_tier(text, s):
     return text.replace("{tier}", _claude_tier_word(s))
 
 
+def _pool_facts(pid, s=None):
+    """Pool facts with {tier} in limits filled from the cache. window is unchanged."""
+    facts = dict((POOLS.get(pid) or {}).get("facts") or {})
+    if "limits" in facts:
+        facts["limits"] = _fill_tier(facts["limits"], s)
+    return facts
+
+
 def _ask_label(pid, s=None):
     meta = POOLS[pid]
     return _fill_tier(meta.get("ask_label") or meta["label"], s)
@@ -2085,7 +2093,7 @@ def pool_status(pool_id, s, now):
     if age > route_fresh_s(s):
         return "unknown", f"reading {int(age // 60)}m old"
     used = s.get(meta["used"])
-    short = (meta.get("facts") or {}).get("window") == "5h"
+    short = _pool_facts(pool_id, s).get("window") == "5h"
     if not _is_number(used):
         # A quota whose reset already passed left no measured percent. That is
         # not the "this plan has no session window" open state.
@@ -2736,10 +2744,11 @@ def _grok_row(role, pid, s, now, states):
     return row
 
 
-def _opus_phrase(role, effort):
+def _opus_phrase(role, effort, s):
+    word = _claude_tier_word(s)
     if role == "builder" and effort == "low":
-        return "Opus at low on Max"
-    return f"Opus on Max at {effort}"
+        return f"Opus at low on {word}"
+    return f"Opus on {word} at {effort}"
 
 
 def _max_unknown_reason(states, s):
@@ -2765,12 +2774,12 @@ def _opus_row(role, s, now, states, prefix):
     if state == "unknown":
         return _ask_row(role, s, now, f"{prefix}: {_max_unknown_reason(states, s)}")
     if state == "capped":
-        return _ask_row(role, s, now, f"{prefix} and Max capped: {_ASK}")
+        return _ask_row(role, s, now, f"{prefix} and {_claude_tier_word(s)} capped: {_ASK}")
     default = "low" if role == "builder" else "high"
     effort, mode = _effort_for("claude_week", s, now, states, default=default)
     if mode == "default":
         mode = "suggest"
-    reason = f"{prefix}: {_opus_phrase(role, effort)}"
+    reason = f"{prefix}: {_opus_phrase(role, effort, s)}"
     row = _row(role, s, now, mode, reason, seat="claude", family="opus", effort=effort, variant="-")
     row["reading_age_s"] = _reading_age("claude_week", s, now)
     return row
@@ -4074,7 +4083,7 @@ def _host_phrase(pool_id, state, s):
     name = _host_name(pool_id, s)
     if state == "ahead":
         return f"{name} over pace"
-    if state == "capped" and (POOLS[pool_id].get("facts") or {}).get("window") == "5h":
+    if state == "capped" and _pool_facts(pool_id, s).get("window") == "5h":
         return f"{name} full"
     if state == "capped":
         return f"{name} capped"

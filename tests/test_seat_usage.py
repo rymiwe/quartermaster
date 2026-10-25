@@ -2652,6 +2652,12 @@ def host_short_window_ahead_drops_max_and_keeps_default_effort():
 def host_ask_names_the_binding_window_and_leans():
     r = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34), NOW)
     assert r["mode"] == "ask" and r["suggestion"] is None, r
+    assert su._pool_facts("claude_5h", snap(claude_tier="claude_ai"))["limits"] == "Pro session window"
+    assert su._pool_facts("claude_week", snap(claude_max=True))["limits"] == "Max weekly, all models"
+    assert su._pool_facts("fable", snap())["limits"] == "Claude weekly Fable slice"
+    assert "{tier}" not in su._pool_facts("claude_5h", snap())["limits"]
+    assert su._opus_phrase("builder", "low", snap(claude_max=False)) == "Opus at low on Pro"
+    assert su._opus_phrase("chair", "high", snap(claude_tier="claude_max_5x")) == "Opus on Max at high"
     assert r["reason"] == "Bot over pace, Claude 5h full", r
     pro = su.route_host(snap(bot_pct=93, claude_5h=100, claude_week=34, claude_max=False), NOW)
     assert pro["reason"] == "Bot over pace, Pro 5h full", pro
