@@ -3056,19 +3056,57 @@ def muse_snapshot_is_appended_to_history_and_a_missing_or_exhausted_file_is_not(
             su.HISTORY = os.path.join(d, "history.jsonl")
             summary = {"v": 1, "as_of": {}, "errors": {}}
             su.apply_muse(summary, NOW, path=str(MUSE_FIXTURES / "fresh.json"))
+            captured = su._muse_epoch(load_muse_fixture("fresh.json")["captured_at"])
             rows = [json.loads(line) for line in open(su.HISTORY)]
             by = {r["pool"]: r for r in rows}
             assert set(by) == {"muse 5h", "muse weekly"}, rows
             assert by["muse 5h"]["seat"] == "muse" and by["muse 5h"]["source"] == "snapshot"
             assert by["muse 5h"]["used_pct"] == 42 and by["muse 5h"]["window_s"] == 300 * 60
             assert by["muse 5h"]["reset_ts"] == summary["muse_5h_reset_ts"]
-            assert by["muse 5h"]["read_ts"] == su.NOW
+            assert by["muse 5h"]["read_ts"] == captured and by["muse weekly"]["read_ts"] == captured
+            assert captured != su.NOW, (captured, su.NOW)
             assert by["muse weekly"]["used_pct"] == 18.5 and by["muse weekly"]["window_s"] == 7 * 86400
             assert by["muse weekly"]["reset_ts"] == summary["muse_week_reset_ts"]
-            before = open(su.HISTORY).read()
+            once = open(su.HISTORY).read()
+            su.apply_muse({"v": 1, "as_of": {}, "errors": {}}, NOW, path=str(MUSE_FIXTURES / "fresh.json"))
+            assert open(su.HISTORY).read() == once, "the same captured_at was appended twice"
+            # Other pools land after the Muse rows on a live run. The skip still
+            # has to see the earlier Muse line, including across a short tail.
+            saved_tail = su.HISTORY_TAIL_BYTES
+            su.HISTORY_TAIL_BYTES = 48
+            try:
+                su.record_pool("chatgpt", "chatgpt weekly", 11, NOW + WEEK, WEEK, "live")
+                su.apply_muse({"v": 1, "as_of": {}, "errors": {}}, NOW, path=str(MUSE_FIXTURES / "fresh.json"))
+                muse_rows = [json.loads(line) for line in open(su.HISTORY) if json.loads(line)["pool"].startswith("muse")]
+                assert len(muse_rows) == 2, muse_rows
+            finally:
+                su.HISTORY_TAIL_BYTES = saved_tail
+            older = os.path.join(d, "older.json")
+            with open(older, "w") as handle:
+                json.dump({"captured_at": "2026-10-11T15:04:00Z",
+                           "window": {"used_percent": 1, "window_duration_mins": 300, "resets_at": "2099-01-01T00:00:00Z"},
+                           "weekly": {"used_percent": 2, "resets_at": "2099-01-08T00:00:00Z"}}, handle)
+            before_older = open(su.HISTORY).read()
+            su.apply_muse({"v": 1, "as_of": {}, "errors": {}}, NOW, path=older)
+            assert open(su.HISTORY).read() == before_older, "an older captured_at was appended"
+            newer = os.path.join(d, "newer.json")
+            with open(newer, "w") as handle:
+                json.dump({"captured_at": "2026-10-13T15:04:00Z",
+                           "window": {"used_percent": 50, "window_duration_mins": 300, "resets_at": "2099-01-01T00:00:00Z"},
+                           "weekly": {"used_percent": 19, "resets_at": "2099-01-08T00:00:00Z"}}, handle)
+            su.apply_muse({"v": 1, "as_of": {}, "errors": {}}, NOW, path=newer)
+            got = [json.loads(line) for line in open(su.HISTORY) if json.loads(line)["pool"].startswith("muse")]
+            assert [r["pool"] for r in got] == ["muse 5h", "muse weekly", "muse 5h", "muse weekly"], got
+            newer_ts = su._muse_epoch("2026-10-13T15:04:00Z")
+            assert got[2]["read_ts"] == newer_ts and got[2]["used_pct"] == 50, got[2]
+            assert got[3]["read_ts"] == newer_ts and got[3]["used_pct"] == 19, got[3]
+            assert newer_ts > captured
+            again = open(su.HISTORY).read()
+            su.apply_muse({"v": 1, "as_of": {}, "errors": {}}, NOW, path=newer)
+            assert open(su.HISTORY).read() == again, "the newer captured_at was appended twice"
             carried = {"v": 1, "as_of": {"muse": NOW}, "muse_week": 4, "muse_5h": 1}
             su.apply_muse(carried, NOW, path=str(MUSE_FIXTURES / "no-such.json"))
-            assert open(su.HISTORY).read() == before, "a missing file restamped history"
+            assert open(su.HISTORY).read() == again, "a missing file restamped history"
             os.remove(su.HISTORY)
             exhausted = os.path.join(d, "exhausted.json")
             with open(exhausted, "w") as handle:
@@ -3078,6 +3116,9 @@ def muse_snapshot_is_appended_to_history_and_a_missing_or_exhausted_file_is_not(
             su.apply_muse(blank, NOW, path=exhausted)
             assert "muse_5h" not in blank and "muse_week" not in blank, blank
             assert not os.path.exists(su.HISTORY), "an exhausted file with no percent wrote history"
+            su._record_muse_history({"muse_5h": 42, "muse_5h_reset_ts": 1, "muse_week": 18, "muse_week_reset_ts": 2},
+                                    {"window": {"used_percent": 42}, "weekly": {"used_percent": 18}})
+            assert not os.path.exists(su.HISTORY), "a snapshot with no captured_at wrote history"
     finally:
         su.HISTORY = saved
 
@@ -3100,6 +3141,7 @@ def codex_5h_is_recorded_beside_the_weekly_pool():
             assert by["chatgpt 5h"]["seat"] == "chatgpt" and by["chatgpt 5h"]["source"] == "live"
             assert by["chatgpt 5h"]["used_pct"] == 12 and by["chatgpt 5h"]["window_s"] == 5 * 3600
             assert by["chatgpt 5h"]["reset_ts"] == five_reset
+            assert by["chatgpt 5h"]["read_ts"] == su.NOW and by["chatgpt weekly"]["read_ts"] == su.NOW
             assert by["chatgpt weekly"]["used_pct"] == 40 and by["chatgpt weekly"]["window_s"] == 7 * 86400
             os.remove(su.HISTORY)
             su.SUMMARY = {"ts": NOW, "as_of": {}, "v": 1}
