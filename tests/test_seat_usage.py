@@ -2480,27 +2480,80 @@ def absent_fable_slice_prompts_instead_of_a_failed_reading():
     assert su.downgrade_effort("ahead") == "high"
     max_plan = _absent_fable()
     max_plan["claude_plan"] = "default_claude_max"
-    asked = su.route_lineup(max_plan, NOW, kind="design")
-    assert asked["mode"] == "ask" and asked["lineup"] is None, asked
-    assert "fix the failed reading" in asked["reason"], asked
+    # A missing Fable percent on Max is still a failed reading. Design skips it.
+    # Audit still asks.
+    skipped_max = su.route_lineup(max_plan, NOW, kind="design")
+    assert skipped_max["mode"] != "ask" and skipped_max["lineup"] is not None, skipped_max
+    assert _voter_families(skipped_max) == ["astra", "grok", "wonder-full"], skipped_max
+    max_skip = next(item for item in skipped_max["skipped"] if item["family"] == "fable")
+    assert max_skip["code"] == "unknown" and "fix the failed reading" in max_skip["reason"], max_skip
+    audit_max = su.route_lineup(max_plan, NOW, kind="audit")
+    assert audit_max["mode"] == "ask" and audit_max["lineup"] is None, audit_max
+    assert "fix the failed reading" in audit_max["reason"], audit_max
+    # A stale non-Max stamp is an absent slice, so Fable sits on Cursor.
     stale = _absent_fable()
     stale["as_of"] = dict(stale["as_of"])
     stale["as_of"]["claude"] = NOW - 11 * 60
     stale_row = su.route_lineup(stale, NOW, kind="design")
-    assert stale_row["mode"] == "ask" and "reading" in stale_row["reason"], stale_row
+    assert stale_row["mode"] != "ask" and stale_row["lineup"] is not None, stale_row
+    stale_fable = next(v for v in stale_row["lineup"]["voters"] if v["family"] == "fable")
+    assert stale_fable["seat"] == "cursor", stale_fable
     missing = without_as_of(_absent_fable(), "claude")
     missing_row = su.route_lineup(missing, NOW, kind="design")
-    assert missing_row["mode"] == "ask" and "fix the failed reading" in missing_row["reason"], missing_row
+    assert missing_row["mode"] != "ask" and missing_row["lineup"] is not None, missing_row
+    assert "fable" not in _voter_families(missing_row), missing_row
+    missing_skip = next(item for item in missing_row["skipped"] if item["family"] == "fable")
+    assert missing_skip["code"] == "unknown" and "fix the failed reading" in missing_skip["reason"], missing_skip
     cursor_stale = _absent_fable()
     cursor_stale["as_of"] = dict(cursor_stale["as_of"])
     cursor_stale["as_of"]["cursor"] = NOW - 11 * 60
     cursor_row = su.route_lineup(cursor_stale, NOW, kind="design")
-    assert cursor_row["mode"] == "ask" and cursor_row["lineup"] is None, cursor_row
+    assert cursor_row["mode"] != "ask" and cursor_row["lineup"] is not None, cursor_row
+    assert "fable" not in _voter_families(cursor_row), cursor_row
+    cursor_skip = next(item for item in cursor_row["skipped"] if item["family"] == "fable")
+    assert cursor_skip["code"] == "stale", cursor_skip
     sibling = without_as_of(snap(fable=10, claude_plan="claude_ai"), "cursor")
     sibling_row = su.route_lineup(sibling, NOW, kind="design")
     assert sibling_row["mode"] != "ask" and sibling_row["lineup"] is not None, sibling_row
     sibling_fable = next(v for v in sibling_row["lineup"]["voters"] if v["family"] == "fable")
     assert sibling_fable["seat"] == "claude", sibling_fable
+
+
+@test
+def design_skips_a_stale_unknown_plan_and_seats_non_max_fable_on_cursor():
+    """A fresh design still seats four voters. Stale seats are skipped, not an ask.
+
+    Claude stale and token_expired with claude_max False seats Fable on Cursor
+    when Cursor is fresh. An unknown plan with a stale reading leaves Fable in
+    skipped and seats the other voters.
+    """
+    fresh = su.route_lineup(snap(), NOW, kind="design")
+    assert fresh["mode"] != "ask" and _voter_families(fresh) == [
+        "fable", "astra", "grok", "wonder-full"], fresh
+    assert "skipped" not in fresh, fresh
+    assert len(su.VOTER_ROSTER) == 4, su.VOTER_ROSTER
+
+    off = snap(claude_max=False)
+    off["as_of"] = dict(off["as_of"])
+    off["as_of"]["claude"] = NOW - 11 * 60
+    off["read_state"] = {"claude": "token_expired"}
+    seated = su.route_lineup(off, NOW, kind="design")
+    assert seated["mode"] != "ask" and seated["lineup"] is not None, seated
+    fable = next(v for v in seated["lineup"]["voters"] if v["family"] == "fable")
+    assert fable["seat"] == "cursor", fable
+    assert _voter_families(seated) == ["fable", "astra", "grok", "wonder-full"], seated
+    assert not any(item["family"] == "fable" for item in seated.get("skipped") or []), seated
+
+    unknown = snap(claude_plan="?")
+    unknown.pop("claude_max", None)
+    unknown["as_of"] = dict(unknown["as_of"])
+    unknown["as_of"]["claude"] = NOW - 11 * 60
+    held = su.route_lineup(unknown, NOW, kind="design")
+    assert held["mode"] != "ask" and held["lineup"] is not None, held
+    assert _voter_families(held) == ["astra", "grok", "wonder-full"], held
+    item = next(x for x in held["skipped"] if x["family"] == "fable")
+    assert item["code"] == "stale" and item["seat"] == "claude", item
+    assert "11m old" in item["reason"], item
 
 
 @test
@@ -5101,14 +5154,20 @@ def mixed_skips_stale_and_unknown_and_asks_only_when_short():
     text = su.format_lineup(row)
     assert "skipped: fable | stale |" in text, text
     assert "ask |" not in text.splitlines()[0], text
-    # Design, audit, and a lineup with no kind still ask on the first unknown.
-    for kind in (None, "design", "audit"):
+    # Audit and a lineup with no kind still ask on the first unknown.
+    # Design skips it, the same way mixed does. This snap has no plan flag.
+    for kind in (None, "audit"):
         if kind is None:
             asked = su.route_lineup(stale, NOW)
         else:
             asked = su.route_lineup(stale, NOW, kind=kind)
         assert asked["mode"] == "ask" and "old" in asked["reason"], (kind, asked["reason"])
         assert "skipped" not in asked, (kind, asked)
+    design_stale = su.route_lineup(stale, NOW, kind="design")
+    assert design_stale["mode"] != "ask" and design_stale["lineup"] is not None, design_stale
+    assert _voter_families(design_stale) == ["astra", "grok", "wonder-full"], design_stale
+    design_fable = next(item for item in design_stale["skipped"] if item["family"] == "fable")
+    assert design_fable["code"] == "stale" and design_fable["seat"] == "claude", design_fable
     # Muse with no reading is skipped, code unknown, and the others still sit.
     mute = without_as_of(snap(), "muse")
     muse_row = su.route_lineup(mute, NOW, kind="mixed")
