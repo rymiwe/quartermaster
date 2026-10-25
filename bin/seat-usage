@@ -1623,7 +1623,7 @@ def _copy_maps(raw, meta, *names):
             meta[name] = dict(raw[name])
 
 def _empty_pool_tables():
-    global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, FAMILY_VENDOR, _FAMILY_NAME, GOOGLE_FAMILIES
+    global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, FAMILY_VENDOR, _FAMILY_NAME, GOOGLE_FAMILIES, SEAT_PREFERENCE
     GOOGLE_FAMILIES = {}
     POOLS = {}
     ROLES = {}
@@ -1633,6 +1633,7 @@ def _empty_pool_tables():
     BURN_POOLS = ()
     FAMILY_VENDOR = {}
     _FAMILY_NAME = {}
+    SEAT_PREFERENCE = {}
 
 def load_config(pools_path=None, priors_path=None):
     """Load pool records and score weights. Disabled pools are not routable.
@@ -1642,7 +1643,7 @@ def load_config(pools_path=None, priors_path=None):
     install still sees it.
     """
     global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, BURN_HOURS, BURN_GAP, NEAR_CAP
-    global FAMILY_VENDOR, _FAMILY_NAME, ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S, GOOGLE_FAMILIES
+    global FAMILY_VENDOR, _FAMILY_NAME, ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S, GOOGLE_FAMILIES, SEAT_PREFERENCE
     ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S = (ROUTE_FRESHNESS_DEFAULT_S["live"], ROUTE_FRESHNESS_DEFAULT_S["pulled"])
     path = pools_path or pools_file()
     try:
@@ -1745,6 +1746,15 @@ def load_config(pools_path=None, priors_path=None):
     BURN_POOLS = tuple(burn)
     FAMILY_VENDOR = dict(data.get("vendors") or {})
     _FAMILY_NAME = dict(data.get("family_names") or {})
+    # Seat order for one family. First eligible seat is spent. Absent means no override.
+    pref = data.get("seat_preference") if isinstance(data.get("seat_preference"), dict) else {}
+    SEAT_PREFERENCE = {}
+    for family, seats in pref.items():
+        if not isinstance(family, str) or not isinstance(seats, list):
+            continue
+        clean = [seat for seat in seats if isinstance(seat, str) and seat]
+        if clean:
+            SEAT_PREFERENCE[family] = clean
     if priors_path is None:
         priors_path = priors_file()
     PRIORS = read_priors(priors_path)
@@ -1992,6 +2002,88 @@ def _explain_none(ranked, states, s=None):
         return _capped_reason(last[0], last[1], s)
     return "ask Ryan"
 
+def _serving_on_seat(family, seat):
+    """Pool ids on one seat that list this family in serves, in config order."""
+    return [pid for pid in POOL_ORDER
+            if POOLS[pid].get("seat") == seat and family in (POOLS[pid].get("serves") or ())]
+
+
+def _spend_pid(pids):
+    """The pool the other windows gate. A seat with no gate spends its last pool."""
+    downstream = [pid for pid in pids if POOLS[pid].get("blocked_by")]
+    if downstream:
+        return downstream[-1]
+    return pids[-1]
+
+
+def _seat_join(pids, states):
+    st = states[pids[0]][0]
+    for pid in pids[1:]:
+        st = _join_open(st, states[pid][0])
+    return st
+
+
+def _family_seat_choice(family, states):
+    """('use', spend) when a preferred seat can take the family, else the last seat's failure.
+
+    Order is seat_preference in config. A seat is skipped when any pool that
+    serves the family is unknown or capped, or the spend pool's gate is.
+    Those are the same rules _score_parts and _join_open already use.
+    None when this family has no preference.
+    """
+    order = SEAT_PREFERENCE.get(family) or ()
+    if not order:
+        return None
+    fallback = None
+    for seat in order:
+        pids = _serving_on_seat(family, seat)
+        if not pids:
+            continue
+        spend = _spend_pid(pids)
+        kind = None
+        blocked = _blockage(spend, states)
+        if blocked and blocked[0] in ("unknown", "capped"):
+            kind = blocked[0]
+        elif states[spend][0] in ("unknown", "capped"):
+            kind = states[spend][0]
+        else:
+            joined = _seat_join(pids, states)
+            if joined in ("unknown", "capped"):
+                kind = joined
+        if kind:
+            fallback = (kind, spend)
+            continue
+        return ("use", spend)
+    return fallback
+
+
+def _covers_default_model(role, meta):
+    """True when this pool serves the role's own model as well as its family.
+
+    bounded-question's default family is Fable. claude_week serves Fable, so
+    that fallthrough stays on Claude. Google does not serve Fable.
+    """
+    default = (ROLES.get(role) or {}).get("default") or {}
+    want = default.get("family")
+    if not isinstance(want, str) or want == meta.get("family"):
+        return False
+    return want in (meta.get("serves") or ())
+
+
+def _preferred_spend(family, role, states, s, now, track):
+    """Spend pool on the first preferred seat that the scorer can already use."""
+    choice = _family_seat_choice(family, states)
+    if not choice or choice[0] != "use":
+        return None
+    spend = choice[1]
+    fit = _strength_for(spend, role, track)
+    if fit is None:
+        return None
+    if _score_parts(spend, role, s, now, states, fit) is None:
+        return None
+    return spend
+
+
 def score_route(role, s, now, states=None):
     """Pick a pool by fit, headroom, cost, and use-it-or-lose-it. No rule table."""
     if states is None:
@@ -2026,6 +2118,18 @@ def score_route(role, s, now, states=None):
         return _row(role, s, now, "ask", _explain_none(ranked, states, s))
     meta = POOLS[best_pid]
     family = _family_for(meta, best["pace"])
+    # Among seats that serve the chosen family, config order wins over fit.
+    # A pool that also serves the role's own model is left where it scored.
+    if not _covers_default_model(role, meta):
+        preferred = _preferred_spend(family, role, states, s, now, track)
+        if preferred and preferred != best_pid:
+            fit = _strength_for(preferred, role, track)
+            parts = _score_parts(preferred, role, s, now, states, fit)
+            if parts is not None:
+                best = parts
+                best_pid = preferred
+                meta = POOLS[best_pid]
+                family = _family_for(meta, best["pace"])
     effort = _effort_for_score(meta, role, best["pace"], best["burning"])
     mode = _mode_for(role, meta, family, best)
     row = _row(
@@ -2531,6 +2635,7 @@ def refresh(seats):
 _VENDOR_NAME = {"xai": "xAI", "anthropic": "Anthropic", "openai": "OpenAI", "meta": "Meta", "google": "Google"}
 FAMILY_VENDOR = {}
 _FAMILY_NAME = {}
+SEAT_PREFERENCE = {}
 load_config()
 
 # Voter effort follows the same burn rule as chair and builder. With no kind,
@@ -2787,21 +2892,48 @@ def _max_unknown_reason(states, s):
     return f"{body}: {_FIX_ASK if failed else _ASK}"
 
 
+def _opus_scored_row(role, pid, s, now, states):
+    """One Opus spend pool, scored the same way score_route scores it."""
+    meta = POOLS[pid]
+    fit = _strength_for(pid, role, read_track())
+    parts = None if fit is None else _score_parts(pid, role, s, now, states, fit)
+    if parts is None:
+        default = "low" if role == "builder" else "high"
+        effort, mode = _effort_for(pid, s, now, states, default=default)
+        if mode == "default":
+            mode = "suggest"
+        reason = f"{meta['label']}: {_opus_phrase(role, effort, s)}"
+        family = meta.get("family") or "opus"
+    else:
+        family = _family_for(meta, parts["pace"])
+        effort = _effort_for_score(meta, role, parts["pace"], parts["burning"])
+        mode = _mode_for(role, meta, family, parts)
+        reason = _scored_reason(meta, parts)
+    row = _row(role, s, now, mode, reason, seat=meta["seat"], family=family,
+               effort=effort, variant=meta.get("variant", "-"))
+    row["reading_age_s"] = _reading_age(pid, s, now)
+    return row
+
+
 def _opus_row(role, s, now, states, prefix):
-    """Opus chair at high, Opus builder at low, unless that pool is burning or ahead."""
+    """Opus chair at high, Opus builder at low, unless that pool is burning or ahead.
+
+    seat_preference picks the seat. Claude is the fallback when every earlier
+    seat is capped, unread, or blocked by a gate.
+    """
+    choice = _family_seat_choice("opus", states)
+    if choice and choice[0] == "use":
+        return _opus_scored_row(role, choice[1], s, now, states)
+    if choice and choice[0] == "unknown":
+        return _ask_row(role, s, now, f"{prefix}: {_max_unknown_reason(states, s)}")
+    if choice and choice[0] == "capped":
+        return _ask_row(role, s, now, f"{prefix} and {_claude_tier_word(s)} capped: {_ASK}")
     state = _join_open(states["claude_week"][0], states["claude_5h"][0])
     if state == "unknown":
         return _ask_row(role, s, now, f"{prefix}: {_max_unknown_reason(states, s)}")
     if state == "capped":
         return _ask_row(role, s, now, f"{prefix} and {_claude_tier_word(s)} capped: {_ASK}")
-    default = "low" if role == "builder" else "high"
-    effort, mode = _effort_for("claude_week", s, now, states, default=default)
-    if mode == "default":
-        mode = "suggest"
-    reason = f"{prefix}: {_opus_phrase(role, effort, s)}"
-    row = _row(role, s, now, mode, reason, seat="claude", family="opus", effort=effort, variant="-")
-    row["reading_age_s"] = _reading_age("claude_week", s, now)
-    return row
+    return _opus_scored_row(role, "claude_week", s, now, states)
 
 
 def _xai_worker(role, s, now, states, keep_ahead=False):
@@ -2846,6 +2978,13 @@ def _constrained_worker(family, role, s, now, states, keep_ahead=False):
     if family == "grok":
         return _xai_worker(role, s, now, states, keep_ahead=keep_ahead)
     if family == "opus":
+        choice = _family_seat_choice("opus", states)
+        if choice:
+            if choice[0] == "unknown":
+                return _ask_row(role, s, now, _max_unknown_reason(states, s))
+            if choice[0] == "capped":
+                return None
+            return _opus_row(role, s, now, states, "builder family opus")
         state = _join_open(states["claude_week"][0], states["claude_5h"][0])
         if state == "unknown":
             return _ask_row(role, s, now, _max_unknown_reason(states, s))
@@ -4132,7 +4271,9 @@ def _host_lean(s, now, states):
 def route_host(s, now):
     """Suggest where to start a host session. Does not select one.
 
-    Capable order is Grok Bot, then Opus on Max. A burning pool is spent first,
+    Capable order is Grok Bot, then Opus. The Opus host is the first
+    seat_preference seat that is not capped or unread (Google, then Claude).
+    A burning pool is spent first,
     unless its short window is ahead or capped: that window is binding, Max
     leaves the ready list, and effort stays at the default. The reason names
     no host, no effort, and contains no parentheses. The page adds one pair.
@@ -4141,15 +4282,24 @@ def route_host(s, now):
     """
     states = {pid: pool_status(pid, s, now) for pid in POOLS}
     bot_state, bot_why = states["grokbot"]
-    opus_state, opus_binding = _host_binding("claude_week", states)
-    opus_effort, _opus_mode = _effort_for("claude_week", s, now, states, default="high")
+    # Opus host follows seat_preference. A capped or unread Google seat falls
+    # through to Claude, which is what the row describes when nothing is open.
+    choice = _family_seat_choice("opus", states)
+    if choice:
+        opus_spend = choice[1]
+    else:
+        opus_spend = "claude_week"
+    opus_seat = POOLS[opus_spend]["seat"]
+    opus_ids = _serving_on_seat("opus", opus_seat) or ["claude_week", "claude_5h"]
+    opus_state, opus_binding = _host_binding(opus_spend, states)
+    opus_effort, _opus_mode = _effort_for(opus_spend, s, now, states, default="high")
     bot_windows = _host_windows(["grokbot"], s)
-    opus_windows = _host_windows(["claude_week", "claude_5h"], s)
+    opus_windows = _host_windows(opus_ids, s)
     bot = _host_entry("grokbot", "grokbot", "grokbot", "-", bot_state, bot_windows.get("grokbot"),
                       _reading_age("grokbot", s, now), "grokbot", bot_windows)
     opus = _host_entry(
-        "opus", "claude", "opus", opus_effort, opus_state, opus_windows.get(opus_binding),
-        _reading_age("claude_week", s, now), opus_binding, opus_windows)
+        "opus", opus_seat, "opus", opus_effort, opus_state, opus_windows.get(opus_binding),
+        _reading_age(opus_spend, s, now), opus_binding, opus_windows)
     lean = _host_lean(s, now, states)
 
     def finish(mode, suggestion, reason, top):
@@ -4163,7 +4313,7 @@ def route_host(s, now):
     if bot["available"] and bot_state != "ahead":
         ready.append(("grokbot", bot, "grokbot"))
     if opus["available"] and opus_state != "ahead":
-        ready.append(("opus", opus, "claude_week"))
+        ready.append(("opus", opus, opus_spend))
     if ready:
         def key(item):
             _id, _entry, pool = item
