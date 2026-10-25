@@ -2478,8 +2478,8 @@ load_config()
 # nobody for design, the author's vendor for review and mixed, and the named
 # author for audit. A capped pool drops the leg. A pool that is ahead of
 # pace still votes, at low. A capped Muse window drops it. An unknown
-# reading asks, except mixed, which skips it and asks only when fewer
-# than two vendors remain.
+# reading asks, except design and mixed, which skip it and ask only when
+# fewer than two vendors remain.
 VOTER_ROSTER = (
     {"family": "fable", "seat": "claude", "pools": ("fable", "claude_week", "claude_5h")},
     {"family": "astra", "seat": "chatgpt", "pools": ("codex",)},
@@ -2828,18 +2828,21 @@ def _fable_substitute():
 
 
 def _fable_slice_absent(states, s):
-    """A finished non-Max Claude read with no weekly Fable slice.
+    """A non-Max Claude read with no weekly Fable slice.
 
-    The same shape ops-tab calls absent. A missing percent on Max, a missing
-    stamp, or a stale stamp stays a failed reading.
+    The same shape ops-tab calls absent. claude_max False is absent even when
+    the Claude stamp is older than the route window, so Fable can move to
+    Cursor Other Models. A missing percent on Max, a missing stamp, or a stale
+    stamp on an unknown plan stays a failed reading.
     """
+    if claude_max(s) is not False:
+        return False
     st, why = states["fable"]
-    if st != "unknown" or why != "no used %":
+    aged = isinstance(why, str) and why.startswith("reading ") and why.endswith(" old")
+    if st != "unknown" or (why != "no used %" and not aged):
         return False
     as_of = s.get("as_of") if isinstance(s.get("as_of"), dict) else {}
     if not as_of.get("claude"):
-        return False
-    if claude_max(s) is not False:
         return False
     if not _is_number(s.get("claude_week")) or not _is_number(s.get("claude_5h")):
         return False
@@ -3754,7 +3757,7 @@ def _mixed_finish(voters, skipped, downgrade, excluded_vendor):
 
 
 def _collect_mixed_voters(states, s, now, excluded_vendor):
-    """Mixed voters. Stale, unknown, and failed read_state seats are skipped.
+    """Design and mixed voters. Stale, unknown, and failed read_state seats are skipped.
 
     The council needs two voters from two vendors, neither of them the
     excluded vendor. Ask only when a stale, unknown, or read_state skip
@@ -3852,9 +3855,9 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
     A builder family the caller already used is kept when that pool can take it,
     and dropped when the pool is capped. With a kind, an ahead pool can still
     take that family. A voter is dropped only when its pool is capped. Ahead of
-    pace still votes, at low. Design, audit, and a lineup with no kind ask on
-    the first unknown reading. Mixed skips a stale, unknown, or failed
-    read_state and asks only when fewer than two vendors remain. A capped
+    pace still votes, at low. Audit and a lineup with no kind ask on the first
+    unknown reading. Design and mixed skip a stale, unknown, or failed
+    read_state and ask only when fewer than two vendors remain. A capped
     seat is listed and still leaves a one-voter lineup in place. Voter effort
     follows burn. One voter is a weaker lineup, not an ask, when the shortfall
     is only caps.
@@ -3942,12 +3945,12 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
             return asked
         voters, review_skipped, review_why = payload
         downgrade = None
-    elif kind == "mixed":
+    elif kind in ("mixed", "design"):
         status, payload = _collect_mixed_voters(states, s, now, excluded_vendor)
         if status == "ask":
             why, mixed_skipped = payload
             asked = _lineup_ask(s, now, states, why, [])
-            asked["kind"] = "mixed"
+            asked["kind"] = kind
             asked["skipped"] = mixed_skipped
             if excl is not None:
                 asked["author"] = excl.get("author")
@@ -3982,7 +3985,7 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
         row["builder_vendor"] = excluded_vendor
         row["skipped"] = review_skipped or []
         row["why"] = review_why
-    if kind == "mixed":
+    if kind == "mixed" or (kind == "design" and mixed_skipped):
         row["skipped"] = mixed_skipped or []
     if downgrade:
         row["downgrade"] = downgrade
