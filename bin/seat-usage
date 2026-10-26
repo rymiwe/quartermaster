@@ -3193,6 +3193,10 @@ REVIEW_ROSTER = (
      "contributor_mode": "off"},
 )
 _REVIEW_VENDOR_ALIAS = {"grok": "xai"}
+# --runner NAME keeps only the review models that runner can launch. Conclave's
+# merge gate runs agy, and agy lists Gemini 4 Argon. An Astra, Fable, Grok, or
+# Muse pick would fail inside agy with no verdict.
+REVIEW_RUNNERS = {"agy": frozenset(("gemini-4-argon-high",))}
 # --route review seats one reviewer. --route lineup --kind review seats two.
 # Both call _review_candidates. The counts stay different on purpose: changing
 # either public count would break callers. The standing rule wants two on both.
@@ -3496,7 +3500,7 @@ def _review_hold(spec, row, s, failures, eligible, skipped):
     skipped.append(_review_skip(shown, block[1], block[0]))
 
 
-def _review_candidates(states, s, now, excluded_vendor):
+def _review_candidates(states, s, now, excluded_vendor, runner=None):
     """Eligible review seats, and every seat that was not eligible.
 
     Before pace is considered, a seat is excluded when its read_state is a
@@ -3513,6 +3517,9 @@ def _review_candidates(states, s, now, excluded_vendor):
     for index, spec in enumerate(REVIEW_ROSTER):
         if _review_model_barred(spec.get("model")):
             skipped.append(_review_skip(spec, "spark and contributor models are excluded", "barred_model"))
+            continue
+        if runner is not None and spec.get("model") not in REVIEW_RUNNERS.get(runner, ()):
+            skipped.append(_review_skip(spec, f"{runner} cannot run {spec.get('model')}", "runner"))
             continue
         if excluded_vendor and spec["vendor"] == excluded_vendor:
             skipped.append(_review_skip(spec, f"shares builder vendor {excluded_vendor}", "builder_vendor"))
@@ -3655,7 +3662,7 @@ def _review_why(chosen):
     return "ranked by pace then headroom: " + "; ".join(parts)
 
 
-def _pick_review_seats(states, s, now, excluded_vendor, need):
+def _pick_review_seats(states, s, now, excluded_vendor, need, runner=None):
     """The best `need` seats on distinct vendors. Ask when fewer are eligible.
 
     Rank is the design pace order (under, open, on, ahead, then near_cap),
@@ -3663,7 +3670,7 @@ def _pick_review_seats(states, s, now, excluded_vendor, need):
     headroom table the scorer uses. A seat that loses the rank is listed as
     skipped with that reason. The pick log is not read here.
     """
-    eligible, skipped = _review_candidates(states, s, now, excluded_vendor)
+    eligible, skipped = _review_candidates(states, s, now, excluded_vendor, runner)
     ranked = sorted(eligible, key=_review_rank_key)
     chosen = []
     seen = set()
@@ -3680,7 +3687,8 @@ def _pick_review_seats(states, s, now, excluded_vendor, need):
         row.pop("_index", None)
     if len(chosen) < need:
         shown = _VENDOR_NAME.get(excluded_vendor, excluded_vendor or "unknown")
-        reason = (f"need {need} review seat(s) outside {shown}; {len(chosen)} eligible: {_ASK}")
+        what = f"{runner}-runnable review seat(s)" if runner else "review seat(s)"
+        reason = (f"need {need} {what} outside {shown}; {len(chosen)} eligible: {_ASK}")
         return "ask", reason, chosen, skipped
     return "ok", _review_why(chosen), chosen, skipped
 
@@ -3692,10 +3700,11 @@ def _collect_review_voters(states, s, now, excluded_vendor):
     return "ok", (chosen, skipped, why)
 
 
-def route_review(s, now, builder_vendor):
+def route_review(s, now, builder_vendor, runner=None):
     """One merge-gate reviewer whose vendor is not the builder's.
 
-    Unknown and capped seats are skipped. Ask only when none remain.
+    Unknown and capped seats are skipped. Ask only when none remain. With a
+    runner, a model that runner cannot launch is skipped with code runner.
     """
     states = {pid: pool_status(pid, s, now) for pid in POOLS}
     vendor = _normalize_vendor(builder_vendor)
@@ -3706,8 +3715,10 @@ def route_review(s, now, builder_vendor):
         asked["builder_vendor"] = None
         asked["reviewers"] = []
         asked["skipped"] = []
+        if runner is not None:
+            asked["runner"] = runner
         return asked
-    status, why, chosen, skipped = _pick_review_seats(states, s, now, vendor, 1)
+    status, why, chosen, skipped = _pick_review_seats(states, s, now, vendor, 1, runner)
     ages = [row.get("reading_age_s") for row in chosen]
     ages.extend(row.get("reading_age_s") for row in skipped if isinstance(row.get("reading_age_s"), (int, float)))
     known = [age for age in ages if isinstance(age, (int, float)) and not isinstance(age, bool)]
@@ -3717,12 +3728,17 @@ def route_review(s, now, builder_vendor):
                "builder_vendor": vendor, "reviewers": [], "skipped": skipped,
                "reading_age_s": seated, "usage": _usage_snapshot(states, s),
                "usage_age_s": _snapshot_age(s, now)}
+        if runner is not None:
+            row["runner"] = runner
         return row
     mode = chosen[0].get("mode") or "default"
-    return {"role": "review", "mode": mode, "reason": why, "why": why,
-            "builder_vendor": vendor, "reviewers": chosen, "skipped": skipped,
-            "reading_age_s": seated, "usage": _usage_snapshot(states, s),
-            "usage_age_s": _snapshot_age(s, now)}
+    row = {"role": "review", "mode": mode, "reason": why, "why": why,
+           "builder_vendor": vendor, "reviewers": chosen, "skipped": skipped,
+           "reading_age_s": seated, "usage": _usage_snapshot(states, s),
+           "usage_age_s": _snapshot_age(s, now)}
+    if runner is not None:
+        row["runner"] = runner
+    return row
 
 
 _READ_STATE_FAIL = ("token_expired", "rate_limited", "usage_failed")
@@ -4453,6 +4469,15 @@ def cmd_route():
     if role == "review" and builder_vendor is None:
         print("--route review needs --builder-vendor", file=sys.stderr)
         raise SystemExit(2)
+    runner = None
+    if "--runner" in argv:
+        if role != "review":
+            print("--runner applies to --route review", file=sys.stderr)
+            raise SystemExit(2)
+        runner = _opt(argv, "--runner").strip().lower()
+        if runner not in REVIEW_RUNNERS:
+            print(f"unknown runner {runner}; runners: {', '.join(sorted(REVIEW_RUNNERS))}", file=sys.stderr)
+            raise SystemExit(2)
     global _REVIEW_FORCE_EXCLUDE
     _REVIEW_FORCE_EXCLUDE = set()
     if "--exclude-seat" in argv:
@@ -4504,7 +4529,7 @@ def cmd_route():
         rows = [route_lineup(summary, now, builder=builder, kind=kind, author=author,
                              builder_vendor=builder_vendor)]
     elif role == "review":
-        rows = [route_review(summary, now, builder_vendor)]
+        rows = [route_review(summary, now, builder_vendor, runner)]
     elif role == "host":
         rows = [route_host(summary, now)]
     elif role == "ask":

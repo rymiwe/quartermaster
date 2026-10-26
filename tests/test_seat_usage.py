@@ -4584,6 +4584,43 @@ def review_gate_picks_one_other_vendor():
 
 
 @test
+def review_runner_agy_keeps_only_models_agy_runs():
+    # The merge gate runs agy. Without --runner, Astra wins this snapshot.
+    s = _argon(snap(), 60)
+    plain = su.route_review(s, NOW, "anthropic")
+    assert [r["model"] for r in plain["reviewers"]] == ["gpt-6-astra"], plain
+    assert "runner" not in plain, plain
+    row = su.route_review(s, NOW, "anthropic", "agy")
+    assert row["mode"] != "ask" and row["runner"] == "agy", row
+    assert [r["model"] for r in row["reviewers"]] == ["gemini-4-argon-high"], row
+    for r in row["reviewers"]:
+        assert r["model"] in su.REVIEW_RUNNERS["agy"], r
+    codes = {item["family"]: item["code"] for item in row["skipped"]}
+    assert codes.get("astra") == "runner" and codes.get("wonder") == "runner", codes
+    assert any(item["reason"] == "agy cannot run gpt-6-astra" for item in row["skipped"]), row["skipped"]
+    # The builder's own vendor is still excluded: a Google builder leaves no agy reviewer.
+    own = su.route_review(s, NOW, "google", "agy")
+    assert own["mode"] == "ask" and own["reviewers"] == [] and own["runner"] == "agy", own
+    assert "agy-runnable" in own["reason"], own["reason"]
+    # A capped Argon is skipped and the route asks rather than seating a model agy cannot run.
+    capped = su.route_review(_argon(snap(), 100), NOW, "anthropic", "agy")
+    assert capped["mode"] == "ask" and capped["reviewers"] == [], capped
+    assert "agy-runnable" in capped["reason"], capped["reason"]
+    base = {"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1",
+            "SEAT_USAGE_PULL_ONLY_FILE": "/nonexistent/pull-only"}
+    with tempfile.TemporaryDirectory() as home:
+        env = dict(base, HOME=home)
+        bad = subprocess.run([sys.executable, str(BIN), "--route", "review", "--cached", "--json",
+                              "--builder-vendor", "anthropic", "--runner", "codex"],
+                             capture_output=True, text=True, env=env, timeout=20)
+        assert bad.returncode == 2 and "unknown runner codex; runners: agy" in bad.stderr, (bad.returncode, bad.stderr)
+        wrong = subprocess.run([sys.executable, str(BIN), "--route", "lineup", "--kind", "review",
+                                "--cached", "--runner", "agy"],
+                               capture_output=True, text=True, env=env, timeout=20)
+        assert wrong.returncode == 2 and "--runner applies to --route review" in wrong.stderr, wrong.stderr
+
+
+@test
 def review_argon_matches_pool_pace_and_vendor_flag_wins():
     hot = _argon(snap(), 96)
     pace, why, _used = su._argon_reading(hot, NOW)
