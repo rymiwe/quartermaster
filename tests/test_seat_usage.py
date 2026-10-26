@@ -5492,12 +5492,19 @@ def _drop_muse_percents(summary):
 @test
 def muse_quota_turn_records_exhausted_and_not_a_used_percent():
     resets_ms = 1792972800000  # 2026-10-26T00:00:00Z, from the sanitized probe
-    message = "nope"
-    with tempfile.TemporaryDirectory() as d:
-        d = Path(d)
-        argv_path = d / "argv.txt"
-        binary = d / "muse"
-        _muse_stub(binary, '''
+    # The clock is fixed six hours before that reset, both the now passed in
+    # and the module clock the Muse reader uses for observed_at, so the quota
+    # reads as exhausted whatever the real date is.
+    now = 1792972800 - 6 * 3600
+    real_time = su.time.time
+    su.time.time = lambda: now
+    try:
+        message = "nope"
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            argv_path = d / "argv.txt"
+            binary = d / "muse"
+            _muse_stub(binary, '''
 import json, sys
 open(%r, "w").write("\\n".join(sys.argv))
 for line in sys.stdin:
@@ -5518,48 +5525,50 @@ for line in sys.stdin:
         }}), flush=True)
         break
 ''' % (str(argv_path), json.dumps(message), resets_ms))
-        dest = d / "muse-usage.json"
-        dest.write_text(json.dumps({
-            "captured_at": "2026-10-22T17:50:29Z",
-            "window": {"used_percent": 99, "window_duration_mins": 300, "resets_at": 1792972800},
-            "weekly": {"used_percent": 99, "resets_at": "2026-10-26T00:00:00Z"},
-        }))
-        assert su.refresh_muse_usage(time.time(), path=str(dest), binary=str(binary), timeout=5) is True
-        argv = argv_path.read_text().splitlines()
-        assert "--contributor-mode" in argv and argv[argv.index("--contributor-mode") + 1] == "off", argv
-        assert "--model" not in argv, argv
-        raw = dest.read_text()
-        got = json.loads(raw)
-        assert got["exhausted"] is True, got
-        assert got["exhausted_resets_at"] == 1792972800, got
-        assert "used_percent" not in raw and "usedPercent" not in raw, raw
-        assert message not in raw, raw
-        summary = {"v": 1, "as_of": {}, "muse_5h": 99, "muse_week": 99,
-                   "muse_5h_reset_ts": 1, "muse_week_reset_ts": 1}
-        su.apply_muse(summary, time.time(), path=str(dest))
-        assert summary["muse_exhausted"] is True, summary
-        assert summary["muse_exhausted_reset_ts"] == 1792972800, summary
-        assert "muse_5h" not in summary and "muse_week" not in summary, summary
-        assert abs(summary["as_of"]["muse"] - su._muse_epoch(got["captured_at"])) < 1, summary
-        called = d / "called"
-        decoy = d / "decoy"
-        _muse_stub(decoy, 'open(%r, "w").write("called\\n")\n' % str(called))
-        assert su.refresh_muse_usage(time.time(), path=str(dest), binary=str(decoy), timeout=5) is False
-        assert not called.exists()
-        assert json.loads(dest.read_text())["exhausted"] is True
-        with local_tz("UTC"):
-            shown = su.format_muse_line(got, time.time())
-            assert shown.startswith("muse     | quota exhausted, resets "), shown
-            assert "%" not in shown and "99" not in shown, shown
-            assert su.muse_line(time.time(), path=str(dest)) == shown
-            both = dict(got)
-            both["window"] = {"used_percent": 99, "window_duration_mins": 300, "resets_at": 1792972800}
-            both["weekly"] = {"used_percent": 99, "resets_at": "2026-10-26T00:00:00Z"}
-            both_line = su.format_muse_line(both, time.time())
-            assert both_line.startswith("muse     | quota exhausted, resets "), both_line
-            assert "Weekly" not in both_line, both_line
-        past_doc = {"captured_at": got["captured_at"], "exhausted": True, "exhausted_resets_at": 1}
-        assert su.format_muse_line(past_doc, time.time()) is None
+            dest = d / "muse-usage.json"
+            dest.write_text(json.dumps({
+                "captured_at": "2026-10-22T17:50:29Z",
+                "window": {"used_percent": 99, "window_duration_mins": 300, "resets_at": 1792972800},
+                "weekly": {"used_percent": 99, "resets_at": "2026-10-26T00:00:00Z"},
+            }))
+            assert su.refresh_muse_usage(now, path=str(dest), binary=str(binary), timeout=5) is True
+            argv = argv_path.read_text().splitlines()
+            assert "--contributor-mode" in argv and argv[argv.index("--contributor-mode") + 1] == "off", argv
+            assert "--model" not in argv, argv
+            raw = dest.read_text()
+            got = json.loads(raw)
+            assert got["exhausted"] is True, got
+            assert got["exhausted_resets_at"] == 1792972800, got
+            assert "used_percent" not in raw and "usedPercent" not in raw, raw
+            assert message not in raw, raw
+            summary = {"v": 1, "as_of": {}, "muse_5h": 99, "muse_week": 99,
+                       "muse_5h_reset_ts": 1, "muse_week_reset_ts": 1}
+            su.apply_muse(summary, now, path=str(dest))
+            assert summary["muse_exhausted"] is True, summary
+            assert summary["muse_exhausted_reset_ts"] == 1792972800, summary
+            assert "muse_5h" not in summary and "muse_week" not in summary, summary
+            assert abs(summary["as_of"]["muse"] - su._muse_epoch(got["captured_at"])) < 1, summary
+            called = d / "called"
+            decoy = d / "decoy"
+            _muse_stub(decoy, 'open(%r, "w").write("called\\n")\n' % str(called))
+            assert su.refresh_muse_usage(now, path=str(dest), binary=str(decoy), timeout=5) is False
+            assert not called.exists()
+            assert json.loads(dest.read_text())["exhausted"] is True
+            with local_tz("UTC"):
+                shown = su.format_muse_line(got, now)
+                assert shown.startswith("muse     | quota exhausted, resets "), shown
+                assert "%" not in shown and "99" not in shown, shown
+                assert su.muse_line(now, path=str(dest)) == shown
+                both = dict(got)
+                both["window"] = {"used_percent": 99, "window_duration_mins": 300, "resets_at": 1792972800}
+                both["weekly"] = {"used_percent": 99, "resets_at": "2026-10-26T00:00:00Z"}
+                both_line = su.format_muse_line(both, now)
+                assert both_line.startswith("muse     | quota exhausted, resets "), both_line
+                assert "Weekly" not in both_line, both_line
+            past_doc = {"captured_at": got["captured_at"], "exhausted": True, "exhausted_resets_at": 1}
+            assert su.format_muse_line(past_doc, now) is None
+    finally:
+        su.time.time = real_time
 
 
 @test
