@@ -5883,6 +5883,12 @@ def seat_ends_cli_shows_ended_in_status_and_routes():
         assert "wonder-full" in [v["family"] for v in row["lineup"]["voters"]], row
 
 
+# The property tests (tests/test_properties.py) run with this suite, after the tests above.
+sys.path.insert(0, str(HERE))
+import test_properties  # noqa: E402
+TESTS.extend(test_properties.TESTS)
+
+
 def main():
     passed = failed = 0
     for fn in TESTS:
