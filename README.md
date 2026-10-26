@@ -4,6 +4,8 @@ Snapshot of Ryan's "router core": `seat-usage` (reads per-seat/pool usage for Cl
 
 `seat-usage` can update itself from GitHub. This is off by default; set `QUARTERMASTER_AUTO_UPDATE=1` to turn it on.
 
+Requires Python 3.9 or newer (`zoneinfo`, the walrus operator). Standard library only, except Pillow for `seat-meters`. Tested on 3.13 (box) and 3.14 (BLD).
+
 ## Layout
 
 | Path | Role |
