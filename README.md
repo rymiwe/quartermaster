@@ -195,6 +195,10 @@ Offline; uses loopback servers and a fake temp credentials file:
 
 At snapshot time this printed `69 passed, 0 failed`. The only change from the dotfiles test is the two path constants (`BIN`, `HOOK`) pointing at `bin/seat-usage` and `hooks/seat-route-hook`. `SEAT_USAGE_BIN` still overrides `BIN`.
 
+`tests/test_properties.py` holds property tests for the pace, headroom, capped and ranking rules: a seeded generator loop, no extra dependency. `tests/test_seat_usage.py` runs them after its own tests, and the file runs alone too. The seed is fixed (`PROPERTY_SEED`, default `20261026`; `PROPERTY_CASES`, default 300), and a failure prints the seed, the case number and the generated input:
+
+    env -i PATH=/usr/bin:/bin HOME=/tmp/emptyhome PYTHONDONTWRITEBYTECODE=1 python3 tests/test_properties.py
+
 `tests/test_contract.py` is a second suite. It calls the CLI and the hook the way a user does. It covers quiet hook failure, the installed paths, cached route output, and renewals. Run it with the same empty environment:
 
     env -i PATH=/usr/bin:/bin HOME=/tmp/emptyhome PYTHONDONTWRITEBYTECODE=1 python3 tests/test_contract.py
