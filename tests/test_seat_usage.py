@@ -4758,6 +4758,16 @@ def exclude_vendor_leaves_builder_vendor_behavior_alone():
 
 
 @test
+def exclude_vendor_ask_reason_names_only_excluded_vendors():
+    s = _exv_fixtures()["claude"]
+    row = su.route_lineup(s, NOW, kind="review", exclude_vendors=("anthropic", "openai", "google", "meta"))
+    assert row["mode"] == "ask", row
+    assert "outside Anthropic, Google, Meta, OpenAI;" in row["reason"], row["reason"]
+    row = su.route_review(s, NOW, "xai", exclude_vendors=("anthropic", "openai", "google", "meta"))
+    assert "outside xAI, Anthropic, Google, Meta, OpenAI;" in row["reason"], row["reason"]
+
+
+@test
 def review_capped_argon_falls_through():
     s = _argon(snap(), 100)
     row = su.route_review(s, NOW, "anthropic")

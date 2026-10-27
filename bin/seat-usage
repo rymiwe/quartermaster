@@ -3838,10 +3838,9 @@ def _pick_review_seats(states, s, now, excluded_vendor, need, runner=None, exclu
     for row in chosen:
         row.pop("_index", None)
     if len(chosen) < need:
-        shown = _VENDOR_NAME.get(excluded_vendor, excluded_vendor or "unknown")
-        others = [_VENDOR_NAME.get(v, v) for v in sorted(exclude_vendors - {excluded_vendor})]
-        if others:
-            shown = ", ".join([shown] + others)
+        names = [_VENDOR_NAME.get(excluded_vendor, excluded_vendor)] if excluded_vendor else []
+        names += [_VENDOR_NAME.get(v, v) for v in sorted(exclude_vendors - {excluded_vendor})]
+        shown = ", ".join(names) or "unknown"
         what = f"{runner}-runnable review seat(s)" if runner else "review seat(s)"
         reason = (f"need {need} {what} outside {shown}; {len(chosen)} eligible: {_ASK}")
         return "ask", reason, chosen, skipped
