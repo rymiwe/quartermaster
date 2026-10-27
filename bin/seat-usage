@@ -3238,12 +3238,16 @@ def _collect_voters(states, s, now, excluded_vendor, skipped=None):
 LINEUP_KINDS = ("design", "review", "mixed", "audit")
 
 
-def _kind_rule(kind, excluded_vendor, voters):
+def _kind_rule(kind, excluded_vendor, voters, exclude_vendors=frozenset()):
     names = _name_list(voters)
-    if not excluded_vendor:
+    vendors = [excluded_vendor] if excluded_vendor else []
+    vendors += sorted(set(exclude_vendors) - {excluded_vendor})
+    if not vendors:
         return f"{kind} excludes nobody: {names} vote"
-    shown = _VENDOR_NAME.get(excluded_vendor, excluded_vendor)
-    return f"{kind} excludes {shown}: {names} vote"
+    shown = [_VENDOR_NAME.get(v, v) for v in vendors]
+    if len(shown) > 2:
+        shown = [", ".join(shown[:-1]) + ",", shown[-1]]
+    return f"{kind} excludes {' and '.join(shown)}: {names} vote"
 
 
 def _lineup_exclusion(kind, author, builder_row, caller_passed_builder=False):
@@ -4230,7 +4234,8 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
     if kind is None:
         rule = _rule_text(chair_row, builder_row, voters)
     else:
-        rule = _kind_rule(kind, excluded_vendor, voters)
+        rule = _kind_rule(kind, excluded_vendor, voters,
+                          exclude_vendors if kind == "review" else ())
     row = _emit_lineup(s, now, states, chair_row, builder_row, voters, rule)
     if excl is not None:
         row["kind"] = kind
