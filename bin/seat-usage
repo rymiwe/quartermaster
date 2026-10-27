@@ -1419,23 +1419,6 @@ BURN_POOLS = ()
 NEAR_CAP = 95
 _ASK = "ask Ryan"
 _FIX_ASK = "fix the failed reading, then ask Ryan"
-# Work context: SEAT_USAGE_WORK=1 (or `--route ... --work`, which sets it) says
-# the target repo is a work repo (SOFware, skedify). Fable is not
-# zero-data-retention, so no route seats it there. _work_barred is the one guard:
-# launch rows (_row), every voter roster, and --route pstack ask it.
-WORK_BARRED_FAMILIES = {"fable": "work repo: Fable is not zero-data-retention"}
-
-
-def _work_context():
-    return os.environ.get("SEAT_USAGE_WORK") == "1"
-
-
-def _work_barred(family):
-    """The reason a family may not be seated in a work repo, else None."""
-    if not _work_context():
-        return None
-    return WORK_BARRED_FAMILIES.get(family)
-
 def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
@@ -2218,10 +2201,6 @@ def _row(role, s, now, mode, reason, **over):
     for k in ("seat", "family", "effort", "variant"):
         if k in over:
             out[k] = over[k]
-    barred = _work_barred(out["family"])
-    if barred and mode != "ask":
-        out["mode"] = "ask"
-        out["reason"] = f"{barred}: {reason}: {_ASK}"
     return out
 
 def _has_room(pool_id, states, s):
@@ -3181,8 +3160,8 @@ def _collect_voters(states, s, now, excluded_vendor, skipped=None):
 
     One voter is a degraded lineup. An unknown reading the lineup depends on
     asks. Fable is required when the excluded vendor is xAI: a full 5h window
-    with no Other Models room asks and names the reopen. A family barred in a
-    work repo is left out, and listed in skipped when a list is passed.
+    with no Other Models room asks and names the reopen. Families left out
+    are listed in skipped when a list is passed.
     """
     excluded = {excluded_vendor} if excluded_vendor else set()
     required = excluded_vendor == "xai"
@@ -3190,11 +3169,6 @@ def _collect_voters(states, s, now, excluded_vendor, skipped=None):
     downgrade = None
     for spec in VOTER_ROSTER:
         if FAMILY_VENDOR[spec["family"]] in excluded:
-            continue
-        barred = _work_barred(spec["family"])
-        if barred:
-            if skipped is not None:
-                skipped.append(_mixed_skip(spec["family"], spec["seat"], barred, "work"))
             continue
         if spec["family"] == "fable":
             status, payload = _fable_voter(states, s, now, required)
@@ -3645,10 +3619,6 @@ def _review_candidates(states, s, now, excluded_vendor, runner=None):
         if excluded_vendor and spec["vendor"] == excluded_vendor:
             skipped.append(_review_skip(spec, f"shares builder vendor {excluded_vendor}", "builder_vendor"))
             continue
-        barred = _work_barred(spec["family"])
-        if barred:
-            skipped.append(_review_skip(spec, barred, "work"))
-            continue
         pick = spec["pick"]
         if pick == "fable":
             status, payload = _fable_voter(states, s, now, False)
@@ -3982,10 +3952,6 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
     for spec in VOTER_ROSTER:
         family = spec["family"]
         if FAMILY_VENDOR.get(family) in excluded:
-            continue
-        barred = _work_barred(family)
-        if barred:
-            skipped.append(_mixed_skip(family, spec["seat"], barred, "work"))
             continue
         pid = None
         why = None
@@ -4362,8 +4328,6 @@ def _ask_one(spec, states, s, now):
     an ahead Grok pool ranks lower and can still answer a question.
     """
     family = spec["family"]
-    if _work_barred(family):
-        return None
     if family == "fable":
         status, payload = _fable_voter(states, s, now, required=False)
         if status != "row" or payload.get("downgraded"):
@@ -4490,7 +4454,7 @@ def route_pstack(s, now, model, role="builder"):
     seats, since the model is pstack's call). The cap is _effort_for on that
     pool with the requested effort (high when none) as its default, and the
     final effort is the lower of the two. Other families stay unrouted with the
-    requested effort. A work repo never seats a barred family. Unknown readings
+    requested effort. Unknown readings
     and capped pools ask.
     """
     states = {pid: pool_status(pid, s, now) for pid in POOLS}
@@ -4498,14 +4462,11 @@ def route_pstack(s, now, model, role="builder"):
     base = {"role": "pstack", "model": model, "pstack_role": role, "family": family or "-",
             "requested_effort": requested, "effort_cap": None, "effort": requested or "-",
             "fast": fast, "pool": None, "pool_label": None, "seat": "-", "runner": None,
-            "work": _work_context(), "reading_age_s": _snapshot_age(s, now)}
+            "reading_age_s": _snapshot_age(s, now)}
 
     def ask(reason):
         return dict(base, mode="ask", reason=reason)
 
-    barred = _work_barred(family)
-    if barred:
-        return ask(f"{barred}: {model}: {_ASK}")
     pid = None
     if family == "opus":
         kind, found = _opus_pick(states)
@@ -4702,9 +4663,6 @@ def cmd_route():
     if role is not None and role not in known:
         print(f"unknown role {role}; roles: {', '.join(known)}", file=sys.stderr)
         raise SystemExit(2)
-    if "--work" in argv:
-        # The same switch as SEAT_USAGE_WORK=1, so every guard reads one place.
-        os.environ["SEAT_USAGE_WORK"] = "1"
     if role == "pstack":
         return cmd_route_pstack(argv, as_json)
     builder = None
@@ -4833,7 +4791,7 @@ def cmd_route():
         print(note, file=sys.stderr if as_json else sys.stdout)
 
 def cmd_route_pstack(argv, as_json):
-    """--route pstack --model M [--role R] [--json] [--work]. Read-only.
+    """--route pstack --model M [--role R] [--json]. Read-only.
 
     Reads the cache only: no seat read, no lock, no ask log, no cache write.
     An ask prints and exits 0 like every other route.

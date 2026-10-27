@@ -262,7 +262,7 @@ Opus is routed by headroom across three pools, listed in `config/pools.json` `"o
 
 Each Opus pool has a `"runner"` in `config/pools.json`: `agy --model "Claude Opus 5.5"`, `claude --model opus`, and `cursor-agent --model` plus a `"slug"` pattern (`claude-opus-5-5-{effort}`). `{effort}` is filled with the capped effort, and a requested `-fast` is kept when the runner has a `"fast_suffix"`. Slugs live only in the config.
 
-`seat-usage --route pstack --model <slug-or-family> [--role <role>] [--json] [--work]` reads the cache only: no seat read, no lock, no ask log, no cache write. The model is a family (`opus`, `grok`, `fable`, ...) or a slug such as `claude-opus-5-5-xhigh`, `claude-opus-5-5-xhigh-fast`, or `grok-4.7-high-fast`. The effort token in the slug (low, medium, high, xhigh, max) is the requested effort. Opus picks its pool as above and prints the pool, the runner command, and the effort. Grok uses the worker pools (an all-ahead band still seats). The cap is the pool's burn/pace effort with the requested effort (high when none) as its default, and the final effort is the lower of requested and cap on low < medium < high < xhigh < max. Other families print `unrouted` with the model and effort unchanged. An unknown or capped pick prints an ask line and exits 0, like every route.
+`seat-usage --route pstack --model <slug-or-family> [--role <role>] [--json]` reads the cache only: no seat read, no lock, no ask log, no cache write. The model is a family (`opus`, `grok`, `fable`, ...) or a slug such as `claude-opus-5-5-xhigh`, `claude-opus-5-5-xhigh-fast`, or `grok-4.7-high-fast`. The effort token in the slug (low, medium, high, xhigh, max) is the requested effort. Opus picks its pool as above and prints the pool, the runner command, and the effort. Grok uses the worker pools (an all-ahead band still seats). The cap is the pool's burn/pace effort with the requested effort (high when none) as its default, and the final effort is the lower of requested and cap on low < medium < high < xhigh < max. Other families print `unrouted` with the model and effort unchanged. An unknown or capped pick prints an ask line and exits 0, like every route.
 
 ```
 route: pstack | <seat> | <family> | <effort> | <pool> | <mode> | <reason> | reading <age>
@@ -271,8 +271,6 @@ route: pstack | <seat> | <family> | <effort> | <pool> | <mode> | <reason> | read
 ```
 
 The launch hook (`hooks/seat-route-hook`) also reads `--model` from a `cursor-agent`, `claude -p`, or `agy -p` launch and calls `--route pstack --model <m> --role <role>`. It adds one advisory line with the pool, runner, and capped effort. It never swaps the model and never blocks; an unrouted model or any failure adds nothing. The Agent deny rule is unchanged.
-
-Work repos: `SEAT_USAGE_WORK=1` in the environment, or `--work` on any `--route`, marks the target repo as a work repo (SOFware, skedify). Fable is not zero-data-retention, so it is never seated there. One guard (`_work_barred`) covers every path: a launch row that would seat Fable becomes an ask (`work repo: Fable is not zero-data-retention: ...`), voters, lineups, review, and ask drop Fable as skipped with code `work`, and `--route pstack --model fable` asks. The hook passes the environment through. `--route review --runner agy` is unchanged and still seats only Argon.
 
 ### Review council
 

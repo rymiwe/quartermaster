@@ -5930,19 +5930,6 @@ def seat_ends_cli_shows_ended_in_status_and_routes():
         assert "wonder-full" in [v["family"] for v in row["lineup"]["voters"]], row
 
 
-@contextlib.contextmanager
-def _work_env(value="1"):
-    old = os.environ.get("SEAT_USAGE_WORK")
-    os.environ["SEAT_USAGE_WORK"] = value
-    try:
-        yield
-    finally:
-        if old is None:
-            os.environ.pop("SEAT_USAGE_WORK", None)
-        else:
-            os.environ["SEAT_USAGE_WORK"] = old
-
-
 def _opus_states(s):
     return {pid: su.pool_status(pid, s, NOW) for pid in su.POOLS}
 
@@ -6087,38 +6074,32 @@ def test_pstack_gate_ahead_lowers_the_cap_and_names_the_gate():
 @test
 def test_review_runner_agy_stays_argon_only_with_opus_layering():
     s = _argon(snap(), 10)
-    for work in ("0", "1"):
-        with _work_env(work):
-            row = su.route_review(s, NOW, "anthropic", "agy")
-            assert [r["model"] for r in row["reviewers"]] == ["gemini-4-argon-high"], row
-            assert row["runner"] == "agy", row
+    row = su.route_review(s, NOW, "anthropic", "agy")
+    assert [r["model"] for r in row["reviewers"]] == ["gemini-4-argon-high"], row
+    assert row["runner"] == "agy", row
 
 
 @test
-def test_work_context_never_seats_fable():
+def test_fable_seats_on_work_code_and_the_old_work_flag_is_inert():
+    """Ryan allowed Fable on work code (2026-10-26): SEAT_USAGE_WORK and --work bar nothing."""
     s = snap()
-    assert su.route("bounded-question", s, NOW)["family"] == "fable"
-    with _work_env():
-        r = su.route("bounded-question", s, NOW)
-        assert r["mode"] == "ask", r
-        assert r["reason"].startswith("work repo: Fable is not zero-data-retention: "), r
-        assert r["reason"].endswith(": ask Ryan"), r
+    plain = su.route("bounded-question", s, NOW)
+    assert plain["family"] == "fable" and plain["mode"] != "ask", plain
+    old = os.environ.get("SEAT_USAGE_WORK")
+    os.environ["SEAT_USAGE_WORK"] = "1"
+    try:
+        assert su.route("bounded-question", s, NOW) == plain
         for model in ("fable", "claude-fable-5-1-high"):
             p = su.route_pstack(s, NOW, model, "bounded-question")
-            assert p["mode"] == "ask" and p["pool"] is None and p["runner"] is None, p
-            assert p["reason"].startswith("work repo: Fable is not zero-data-retention"), p
-        assert su.route_pstack(s, NOW, "opus")["mode"] != "ask", "Opus still seats in a work repo"
+            assert "work repo" not in p["reason"] and "work" not in p, p
         design = su.route_lineup(s, NOW, kind="design")
-        assert "fable" not in [v["family"] for v in design["lineup"]["voters"]], design
-        assert any(k["family"] == "fable" and k["code"] == "work" for k in design["skipped"]), design
-        plain = su.route_lineup(s, NOW)
-        assert "fable" not in [v["family"] for v in plain["lineup"]["voters"]], plain
-        assert any(k["code"] == "work" for k in plain["skipped"]), plain
-        review = su.route_review(s, NOW, "xai")
-        assert all(r["family"] != "fable" for r in review["reviewers"]), review
-        assert any(k["family"] == "fable" and k["code"] == "work" for k in review["skipped"]), review
-        asked = su.route_ask(s, NOW)
-        assert all(v["family"] != "fable" for v in asked["voters"]), asked
+        assert "fable" in [v["family"] for v in design["lineup"]["voters"]], design
+        assert not any(k.get("code") == "work" for k in design.get("skipped", [])), design
+    finally:
+        if old is None:
+            os.environ.pop("SEAT_USAGE_WORK", None)
+        else:
+            os.environ["SEAT_USAGE_WORK"] = old
     with tempfile.TemporaryDirectory() as home:
         home = Path(home)
         cache_dir = home / "seat-cache"
@@ -6128,7 +6109,7 @@ def test_work_context_never_seats_fable():
                                          "bounded-question", "--work", "--json"])
         assert cli.returncode == 0, (cli.returncode, cli.stderr)
         row = json.loads(cli.stdout)[0]
-        assert row["mode"] == "ask" and row["work"] is True, row
+        assert "work repo" not in row["reason"] and "work" not in row, row
         text = _run_bin(home, cache_dir, ["--route", "pstack", "--model", "claude-opus-5-5-xhigh"])
         assert text.returncode == 0 and text.stdout.startswith("route: pstack | google | opus | xhigh"), text.stdout
         assert "runner: agy --model 'Claude Opus 5.5'" in text.stdout, text.stdout
