@@ -5450,7 +5450,7 @@ def variant_comes_from_the_voter_slug():
     # No slug, as for every other voter, stays "-".
     assert su._voter("fable", "claude", "fable", s, NOW, "high", "default", "r")["variant"] == "-"
     assert su._voter("grok", "grok", "grok", s, NOW, "high", "default", "r", "grok-4.7")["variant"] == "-"
-    assert su.GROK_VOTER_SLUG.endswith("-fast")
+    assert su.GROK_VOTER_LABEL.endswith("-fast")
 
 
 def _grok_voter_rows(s, **kw):
@@ -5498,6 +5498,175 @@ def grok_voter_runs_on_cursor_models_not_supergrok():
     for kind in ("mixed", "review"):
         got = su.route_lineup(super_bad, NOW, kind=kind, builder_vendor="anthropic")
         assert "grok" in _review_eligible_families(got), (kind, got)
+
+
+@contextlib.contextmanager
+def _failure_log(*records):
+    """SEAT_USAGE_FAILURES points at a temp file holding these (seat, reason) records."""
+    with tempfile.TemporaryDirectory() as d:
+        old = os.environ.get("SEAT_USAGE_FAILURES")
+        os.environ["SEAT_USAGE_FAILURES"] = os.path.join(d, "failures.jsonl")
+        try:
+            for seat, reason in records:
+                assert su.record_seat_failure(seat, reason, now=NOW) is not None, (seat, reason)
+            yield
+        finally:
+            if old is None:
+                os.environ.pop("SEAT_USAGE_FAILURES", None)
+            else:
+                os.environ["SEAT_USAGE_FAILURES"] = old
+
+
+@contextlib.contextmanager
+def _force_exclude(*seats):
+    su._REVIEW_FORCE_EXCLUDE.update(seats)
+    try:
+        yield
+    finally:
+        su._REVIEW_FORCE_EXCLUDE.clear()
+
+
+def _grok_review_outcomes(s):
+    """Where the Grok voter sits on each route that reads failures: (seated, skip code) by route."""
+    only_grok = dict(s, codex=100, muse_week=100, muse_5h=100)
+    out = {}
+    routed = su.route_review(only_grok, NOW, "anthropic")
+    out["review"] = (
+        any(r["family"] == "grok" for r in routed["reviewers"]),
+        next((i["code"] for i in routed["skipped"] if i["family"] == "grok"), None),
+    )
+    lineup = su.route_lineup(s, NOW, kind="review", builder_vendor="anthropic")
+    out["lineup-review"] = (
+        "grok" in _voter_families(lineup),
+        next((i["code"] for i in lineup["skipped"] if i["family"] == "grok"), None),
+    )
+    return out
+
+
+@test
+def grok_voter_stops_on_a_cursor_failure_record():
+    healthy = snap(cursor_auto_pct=10)
+    for route, (seated, code) in _grok_review_outcomes(healthy).items():
+        assert seated and code is None, (route, seated, code)
+    for seat, reason, want in (("cursor", "max_turns", "failed_recently:max_turns"),
+                               ("cursor", "credits", "no_credits"),
+                               ("grok", "max_turns", "failed_recently:max_turns")):
+        with _failure_log((seat, reason)):
+            for route, (seated, code) in _grok_review_outcomes(healthy).items():
+                assert not seated and code == want, (seat, reason, route, seated, code)
+    # A failure on an unrelated seat does not touch the Grok voter.
+    with _failure_log(("chatgpt", "auth")):
+        for route, (seated, code) in _grok_review_outcomes(healthy).items():
+            assert seated, (route, code)
+    # A failure line past the TTL does not block it.
+    with _failure_log(("cursor", "max_turns")):
+        later = su.load_recent_failures(NOW + su.FAILURE_TTL_S + 1)
+        assert later == {}, later
+
+
+@test
+def grok_voter_stops_on_exclude_seat_cursor():
+    healthy = snap(cursor_auto_pct=10)
+    for seat in ("cursor", "grok"):
+        with _force_exclude(seat):
+            for route, (seated, code) in _grok_review_outcomes(healthy).items():
+                assert not seated and code == "failed_recently:nonzero", (seat, route, seated, code)
+    with _force_exclude("chatgpt"):
+        for route, (seated, code) in _grok_review_outcomes(healthy).items():
+            assert seated, (route, code)
+    with tempfile.TemporaryDirectory() as d:
+        body = _shift_snap(time.time(), cursor_auto_pct=10,
+                           google_argon_week=40, google_argon_week_reset_ts=time.time() + 3 * 86400)
+        with open(os.path.join(d, "latest.json"), "w") as handle:
+            json.dump(body, handle)
+        env = os.environ.copy()
+        env.update({"HOME": d, "SEAT_USAGE_CACHE_DIR": d, "SEAT_USAGE_FAILURES": os.path.join(d, "f.jsonl"),
+                    "SEAT_USAGE_REVIEW_LOG": os.path.join(d, "picks.jsonl"),
+                    "SEAT_USAGE_ASKS": os.path.join(d, "asks.jsonl"), "QUARTERMASTER_NO_UPDATE": "1"})
+        env.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
+        for seat in ("cursor", "grok"):
+            proc = subprocess.run(
+                [sys.executable, str(BIN), "--route", "lineup", "--cached", "--json", "--kind", "review",
+                 "--builder-vendor", "anthropic", "--exclude-seat", seat],
+                capture_output=True, text=True, env=env, timeout=20)
+            assert proc.returncode == 0, proc.stderr
+            row = json.loads(proc.stdout)[0]
+            assert "grok" not in _voter_families(row), (seat, row["lineup"])
+            skip = next(i for i in row["skipped"] if i["family"] == "grok")
+            assert skip["code"] == "failed_recently:nonzero", (seat, skip)
+
+
+@test
+def non_review_routes_ignore_failures_for_grok_and_cursor_alike():
+    # Mixed, design and ask never read the failure log or --exclude-seat. A cursor record
+    # must behave exactly as a grok record does there: the voter stays seated.
+    healthy = snap(cursor_auto_pct=10)
+    for seat in ("grok", "cursor"):
+        with _failure_log((seat, "max_turns")):
+            for kind in ("mixed", "design"):
+                got = su.route_lineup(healthy, NOW, kind=kind)
+                assert "grok" in _voter_families(got), (seat, kind, got)
+            asked = su.route_ask(healthy, NOW)
+            assert any(v["family"] == "grok" for v in asked["candidates"]), (seat, asked)
+
+
+@test
+def stale_grok_reading_names_cursor_models_not_grok():
+    # SuperGrok stays fresh: the label must follow the pool read, not the family.
+    stale = snap(cursor_auto_pct=10)
+    stale["as_of"] = dict(stale["as_of"])
+    stale["as_of"]["cursor"] = NOW - 650
+    mixed = su.route_lineup(stale, NOW, kind="mixed")
+    skip = next(i for i in mixed["skipped"] if i["family"] == "grok")
+    assert skip["code"] == "stale" and skip["reason"].startswith("Cursor Models reading "), skip
+    assert "Grok: reading" not in skip["reason"] and "Grok reading" not in skip["reason"], skip
+    review = su.route_lineup(stale, NOW, kind="review", builder_vendor="anthropic")
+    skip = next(i for i in review["skipped"] if i["family"] == "grok")
+    assert skip["code"] == "stale" and skip["reason"].startswith("Cursor Models reading "), skip
+    unknown = snap()
+    unknown["cursor_auto_pct"] = None
+    unknown["as_of"] = dict(unknown["as_of"])
+    unknown["as_of"].pop("cursor", None)
+    got = su.route_lineup(unknown, NOW, kind="mixed")
+    skip = next(i for i in got["skipped"] if i["family"] == "grok")
+    assert skip["reason"].startswith("Cursor Models "), skip
+    assert not skip["reason"].startswith("Grok"), skip
+    # Other families keep their own names.
+    held = without_as_of(snap(), "chatgpt")
+    held["as_of"]["chatgpt"] = NOW - 650
+    astra = su.route_lineup(held, NOW, kind="mixed")
+    assert next(i for i in astra["skipped"] if i["family"] == "astra")["reason"].startswith("Astra "), astra
+    assert su._reading_label("grok", "cursor_models") == "Cursor Models"
+    assert su._reading_label("astra", "codex") == "Astra"
+
+
+@test
+def grok_voter_label_is_display_only_and_never_a_launch_id():
+    label = su.GROK_VOTER_LABEL
+    assert label == "grok-xhigh-fast" and not hasattr(su, "GROK_VOTER_SLUG")
+    assert su._slug_variant(label) == "fast"
+    # No route output carries it, in the rows or in a launch argv.
+    s = snap(cursor_auto_pct=10)
+    outputs = [su.route_lineup(s, NOW, kind=k, builder_vendor="anthropic") for k in ("mixed", "design", "review")]
+    outputs += [su.route_ask(s, NOW), su.route_lineup(s, NOW), su.route_review(
+        dict(s, codex=100, muse_week=100, muse_5h=100), NOW, "anthropic")]
+    for out in outputs:
+        assert label not in json.dumps(out), out
+    solo = su.route_review(dict(s, codex=100, muse_week=100, muse_5h=100), NOW, "anthropic")
+    assert solo["reviewers"][0]["family"] == "grok", solo
+    assert solo["reviewers"][0]["runner"] == ["cursor-agent", "--model", "grok"], solo["reviewers"][0]
+    for model in ("grok", label):
+        argv = su._review_launch(model, "high")
+        assert argv is None or label not in argv, (model, argv)
+    assert label not in json.dumps(su.REVIEW_LAUNCH)
+    # The constant is read in the roster and in _grok_voter, as a slug, and nowhere else.
+    uses = [line.strip() for line in BIN.read_text().splitlines()
+            if "GROK_VOTER_LABEL" in line and not line.strip().startswith("#")]
+    allowed = ("GROK_VOTER_LABEL = ", '"slug": GROK_VOTER_LABEL', "slug=GROK_VOTER_LABEL")
+    stray = [line for line in uses if not any(a in line for a in allowed)]
+    assert not stray, stray
+    pools = (BIN.parents[1] / "config" / "pools.json").read_text()
+    assert label not in pools
 
 
 @test
