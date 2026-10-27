@@ -4529,10 +4529,16 @@ def route_pstack(s, now, model, role="builder"):
         return dict(base, mode="default", pool="unrouted",
                     reason=f"{shown} is not routed by pstack: model and effort unchanged")
     cap, _mode = _effort_for(pid, s, now, states, default=requested or "high")
+    state, binding = states[pid][0], pid
+    if family == "opus":
+        # A gate (5h) that is ahead of pace lowers the cap like its weekly pool would.
+        state, binding, _band = _opus_group(pid, states)
+        if binding != pid:
+            gate_cap, _gate_mode = _effort_for(binding, s, now, states, default=requested or "high")
+            cap = _lower_effort(cap, gate_cap)
     effort = _lower_effort(requested, cap)
     lowered = requested is not None and effort != requested
-    label = _ask_label(pid, s)
-    state = _opus_group(pid, states)[0] if family == "opus" else states[pid][0]
+    label = _ask_label(binding, s)
     if lowered:
         reason = f"{label} {_PACE_WORD.get(state, state)}: effort {requested} capped to {effort}"
     else:

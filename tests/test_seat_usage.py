@@ -6075,6 +6075,16 @@ def test_pstack_effort_cap_only_lowers():
 
 
 @test
+def test_pstack_gate_ahead_lowers_the_cap_and_names_the_gate():
+    gate = snap(google_claudegpt_5h=90, claude_week=100, cursor_api_pct=100)
+    p = su.route_pstack(gate, NOW, "claude-opus-5-5-xhigh", "chair")
+    assert p["pool"] == "google_opus_week", p
+    assert (p["requested_effort"], p["effort"], p["mode"]) == ("xhigh", "low", "suggest"), p
+    assert "5h" in p["reason"] and "ahead" in p["reason"], p
+    assert p["model"] == "claude-opus-5-5-xhigh" and p["family"] == "opus", p
+
+
+@test
 def test_review_runner_agy_stays_argon_only_with_opus_layering():
     s = _argon(snap(), 10)
     for work in ("0", "1"):
