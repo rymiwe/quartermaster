@@ -278,6 +278,8 @@ The launch hook (`hooks/seat-route-hook`) also reads `--model` from a `cursor-ag
 
 `--runner agy` on `--route review` keeps only the models agy can run, today `gemini-4-argon-high`. Conclave's merge gate runs agy, so its pick passes this flag. Any other model is skipped with code `runner`. When no agy-runnable seat remains, the route asks with no reviewer. An unknown runner, or `--runner` on another route, exits 2.
 
+A seated `--route review` reviewer carries a `runner` argv from `review_runners` in `config/pools.json`. Text and `--json` both show it. `--runner agy` still returns only Argon and still sets the top-level JSON `runner` string to `agy`.
+
 The builder vendor is `--builder-vendor` when that flag is set. On a lineup it otherwise comes from `--author`'s family, and when `--author` is omitted it is the resolved builder's vendor (the same builder `--builder-family` already feeds). Neither chosen seat shares that vendor, and the two lineup voters are two vendor families.
 
 Rank is the design pace order (under, then open, then on, then ahead, then near cap), then lower used percent, then roster order. The headroom number is the scoring table for that pace (under 1.00, on 0.90, open 0.95, ahead 0.55, near cap 0.22), times the cohort factor when the pool has one. Human output and `--json` include those pace and headroom numbers, the used percent, and every skipped seat with a reason. A seat that loses the rank is skipped as `lower pace and headroom rank`.

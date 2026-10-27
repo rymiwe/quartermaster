@@ -2,6 +2,13 @@
   "version": 1,
   "route_freshness_s": {"live": 600, "pulled": 1200},
   "opus_order": ["google_opus_week", "claude_week", "cursor_other"],
+  "review_runners": {
+    "gemini-4-argon-high": {"cmd": ["agy", "--model", "gemini-4-argon-high"]},
+    "fable": {"cmd": ["cursor-agent", "--model", "fable"]},
+    "grok": {"cmd": ["cursor-agent", "--model", "grok"]},
+    "gpt-6-astra": {"cmd": ["codex", "exec", "-m", "gpt-6-astra"]},
+    "wonder": {"cmd": ["muse", "exec", "--model", "wonder"]}
+  },
   "scoring": {
     "provider_pseudo": 8,
     "prior_pseudo": 8,
