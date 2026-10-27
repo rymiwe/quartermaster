@@ -3644,8 +3644,12 @@ def _review_hold(spec, row, s, failures, eligible, skipped):
     skipped.append(_review_skip(shown, block[1], block[0]))
 
 
-def _review_candidates(states, s, now, excluded_vendor, runner=None):
+def _review_candidates(states, s, now, excluded_vendor, runner=None, exclude_vendors=frozenset()):
     """Eligible review seats, and every seat that was not eligible.
+
+    exclude_vendors is --exclude-vendor. It drops a roster row by its
+    family's vendor before any seat or pool is picked, so a family is gone
+    on every pool that serves it (Fable on Claude or Cursor Other Models).
 
     Before pace is considered, a seat is excluded when its read_state is a
     failure code, it failed inside the TTL, or --exclude-seat named it.
@@ -3667,6 +3671,10 @@ def _review_candidates(states, s, now, excluded_vendor, runner=None):
             continue
         if excluded_vendor and spec["vendor"] == excluded_vendor:
             skipped.append(_review_skip(spec, f"shares builder vendor {excluded_vendor}", "builder_vendor"))
+            continue
+        if spec["vendor"] in exclude_vendors:
+            skipped.append(_review_skip(spec, f"vendor {spec['vendor']} excluded by --exclude-vendor",
+                                        "excluded_vendor"))
             continue
         pick = spec["pick"]
         if pick == "fable":
@@ -3806,7 +3814,7 @@ def _review_why(chosen):
     return "ranked by pace then headroom: " + "; ".join(parts)
 
 
-def _pick_review_seats(states, s, now, excluded_vendor, need, runner=None):
+def _pick_review_seats(states, s, now, excluded_vendor, need, runner=None, exclude_vendors=frozenset()):
     """The best `need` seats on distinct vendors. Ask when fewer are eligible.
 
     Rank is the design pace order (under, open, on, ahead, then near_cap),
@@ -3814,7 +3822,7 @@ def _pick_review_seats(states, s, now, excluded_vendor, need, runner=None):
     headroom table the scorer uses. A seat that loses the rank is listed as
     skipped with that reason. The pick log is not read here.
     """
-    eligible, skipped = _review_candidates(states, s, now, excluded_vendor, runner)
+    eligible, skipped = _review_candidates(states, s, now, excluded_vendor, runner, exclude_vendors)
     ranked = sorted(eligible, key=_review_rank_key)
     chosen = []
     seen = set()
@@ -3831,21 +3839,25 @@ def _pick_review_seats(states, s, now, excluded_vendor, need, runner=None):
         row.pop("_index", None)
     if len(chosen) < need:
         shown = _VENDOR_NAME.get(excluded_vendor, excluded_vendor or "unknown")
+        others = [_VENDOR_NAME.get(v, v) for v in sorted(exclude_vendors - {excluded_vendor})]
+        if others:
+            shown = ", ".join([shown] + others)
         what = f"{runner}-runnable review seat(s)" if runner else "review seat(s)"
         reason = (f"need {need} {what} outside {shown}; {len(chosen)} eligible: {_ASK}")
         return "ask", reason, chosen, skipped
     return "ok", _review_why(chosen), chosen, skipped
 
 
-def _collect_review_voters(states, s, now, excluded_vendor):
-    status, why, chosen, skipped = _pick_review_seats(states, s, now, excluded_vendor, 2)
+def _collect_review_voters(states, s, now, excluded_vendor, exclude_vendors=frozenset()):
+    status, why, chosen, skipped = _pick_review_seats(states, s, now, excluded_vendor, 2,
+                                                      exclude_vendors=exclude_vendors)
     if status == "ask":
         return "ask", (why, skipped)
     return "ok", (chosen, skipped, why)
 
 
-def route_review(s, now, builder_vendor, runner=None):
-    """One merge-gate reviewer whose vendor is not the builder's.
+def route_review(s, now, builder_vendor, runner=None, exclude_vendors=()):
+    """One merge-gate reviewer whose vendor is not the builder's, nor any exclude_vendors vendor.
 
     Unknown and capped seats are skipped. Ask only when none remain. With a
     runner, a model that runner cannot launch is skipped with code runner.
@@ -3864,7 +3876,8 @@ def route_review(s, now, builder_vendor, runner=None):
         if runner is not None:
             asked["runner"] = runner
         return asked
-    status, why, chosen, skipped = _pick_review_seats(states, s, now, vendor, 1, runner)
+    status, why, chosen, skipped = _pick_review_seats(states, s, now, vendor, 1, runner,
+                                                      frozenset(exclude_vendors))
     ages = [row.get("reading_age_s") for row in chosen]
     ages.extend(row.get("reading_age_s") for row in skipped if isinstance(row.get("reading_age_s"), (int, float)))
     known = [age for age in ages if isinstance(age, (int, float)) and not isinstance(age, bool)]
@@ -4068,7 +4081,7 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
     return _mixed_finish(voters, skipped, downgrade, excluded_vendor)
 
 
-def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=None):
+def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=None, exclude_vendors=()):
     """One lineup, or ask.
 
     With no kind, chair and builder come from one vendor and that vendor does
@@ -4087,6 +4100,7 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
     no author was named. With no author and no caller-passed builder, nobody
     is excluded. `--author human` and `--author none` exclude nobody.
     `--builder-vendor` wins over `--author` and over the resolved builder.
+    exclude_vendors (--exclude-vendor) drops those vendors' review rows too.
     An unknown or capped seat is skipped.
     The lineup asks only when fewer than two eligible seats remain. Design,
     mixed, audit, and a lineup with no kind do not use that roster.
@@ -4173,7 +4187,7 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
     review_skipped = None
     mixed_skipped = None
     if kind == "review":
-        status, payload = _collect_review_voters(states, s, now, excluded_vendor)
+        status, payload = _collect_review_voters(states, s, now, excluded_vendor, frozenset(exclude_vendors))
         if status == "ask":
             why, review_skipped = payload
             asked = _lineup_ask(s, now, states, why, [])
@@ -4777,6 +4791,18 @@ def cmd_route():
         if runner not in REVIEW_RUNNERS:
             print(f"unknown runner {runner}; runners: {', '.join(sorted(REVIEW_RUNNERS))}", file=sys.stderr)
             raise SystemExit(2)
+    exclude_vendors = []
+    if "--exclude-vendor" in argv:
+        if role != "review" and not (role == "lineup" and kind == "review"):
+            print("--exclude-vendor applies to --route review and --route lineup --kind review",
+                  file=sys.stderr)
+            raise SystemExit(2)
+        for raw in _opts(argv, "--exclude-vendor"):
+            vendor = _normalize_vendor(raw)
+            if vendor is None:
+                print(f"unknown vendor {raw}; vendors: {_review_vendors_text()}", file=sys.stderr)
+                raise SystemExit(2)
+            exclude_vendors.append(vendor)
     global _REVIEW_FORCE_EXCLUDE
     _REVIEW_FORCE_EXCLUDE = set()
     if "--exclude-seat" in argv:
@@ -4826,9 +4852,9 @@ def cmd_route():
         now = _ROUTE_NOW if _ROUTE_NOW is not None else time.time()
     if role == "lineup":
         rows = [route_lineup(summary, now, builder=builder, kind=kind, author=author,
-                             builder_vendor=builder_vendor)]
+                             builder_vendor=builder_vendor, exclude_vendors=exclude_vendors)]
     elif role == "review":
-        rows = [route_review(summary, now, builder_vendor, runner)]
+        rows = [route_review(summary, now, builder_vendor, runner, exclude_vendors)]
     elif role == "host":
         rows = [route_host(summary, now)]
     elif role == "ask":
