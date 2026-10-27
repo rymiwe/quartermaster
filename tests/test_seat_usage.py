@@ -4768,6 +4768,28 @@ def exclude_vendor_ask_reason_names_only_excluded_vendors():
 
 
 @test
+def exclude_vendor_review_rule_names_every_excluded_vendor():
+    s = _exv_fixtures()["claude"]
+    cases = (("anthropic", ("xai",), "review excludes Anthropic and xAI: "),
+             ("xai", ("anthropic", "meta"), "review excludes xAI, Anthropic, and Meta: "))
+    for builder, extra, prefix in cases:
+        row = su.route_lineup(s, NOW, kind="review", builder_vendor=builder, exclude_vendors=extra)
+        assert row["mode"] != "ask", (builder, extra, row["reason"])
+        assert row["rule"].startswith(prefix) and row["rule"].endswith(" vote"), (builder, extra, row["rule"])
+        assert row["reason"] == row["rule"], row
+    with tempfile.TemporaryDirectory() as home:
+        cache_dir = Path(home) / "seat-cache"
+        cache_dir.mkdir()
+        (cache_dir / "latest.json").write_text(json.dumps(_shift_snap(
+            time.time(), codex=80, cursor_auto_pct=3, muse_week=60, muse_5h=20, fable=70,
+            google_argon_week=80, google_argon_week_reset_ts=NOW + 3 * 86400)))
+        proc = _run_bin(home, cache_dir, ["--route", "lineup", "--kind", "review", "--cached",
+                                          "--builder-vendor", "xai", "--exclude-vendor", "anthropic"])
+        assert proc.returncode == 0, (proc.returncode, proc.stderr)
+        assert "| review excludes xAI and Anthropic: " in proc.stdout.splitlines()[0], proc.stdout
+
+
+@test
 def review_capped_argon_falls_through():
     s = _argon(snap(), 100)
     row = su.route_review(s, NOW, "anthropic")
