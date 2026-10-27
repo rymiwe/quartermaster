@@ -4644,6 +4644,129 @@ def review_builder_vendor_is_never_seated():
     assert argon["code"] == "builder_vendor", argon
 
 
+def _exv_rows(row):
+    return row.get("reviewers") or (row.get("lineup") or {}).get("voters") or []
+
+
+def _exv_vendor_pools(vendor):
+    """Every pool that serves a family of this vendor, whatever seat pays for it."""
+    return {pid for pid, meta in su.POOLS.items()
+            if any(su.FAMILY_VENDOR.get(f) == vendor for f in meta.get("serves") or ())}
+
+
+def _exv_fixtures():
+    base = _argon(snap(codex=80, cursor_auto_pct=70, muse_week=60, muse_5h=20), 80)
+    capped_claude = dict(base, fable=100, claude_5h=100, claude_week=100)
+    return {
+        "claude": dict(base, fable=5),
+        "cursor_other": dict(capped_claude, cursor_api_pct=5),
+        "antigravity": dict(capped_claude, cursor_api_pct=100,
+                            google_opus_week=5, google_opus_week_reset_ts=NOW + 3 * 86400,
+                            google_opus_5h=5, google_opus_5h_reset_ts=NOW + 4 * 3600),
+    }
+
+
+def _exv_routes(s, builder, **kw):
+    return {"review": su.route_review(s, NOW, builder, **kw),
+            "lineup-review": su.route_lineup(s, NOW, kind="review", builder_vendor=builder, **kw)}
+
+
+@test
+def exclude_vendor_anthropic_drops_fable_and_opus_on_every_pool():
+    anthropic_pools = _exv_vendor_pools("anthropic")
+    assert {"fable", "claude_week", "cursor_other", "google_opus_week"} <= anthropic_pools, anthropic_pools
+    for name, s in _exv_fixtures().items():
+        if name != "antigravity":
+            for route, row in _exv_routes(s, "xai").items():
+                seated = [v for v in _exv_rows(row) if v["family"] == "fable"]
+                assert seated and seated[0]["pool"] == name.replace("claude", "fable"), (name, route, seated)
+        for route, row in _exv_routes(s, "xai", exclude_vendors=("anthropic",)).items():
+            assert row["mode"] != "ask", (name, route, row["reason"])
+            for v in _exv_rows(row):
+                assert v["vendor"] != "anthropic", (name, route, v)
+                assert v["family"] not in ("fable", "opus"), (name, route, v)
+                assert v.get("pool") not in anthropic_pools, (name, route, v)
+            fable = next(i for i in row["skipped"] if i["family"] == "fable")
+            assert fable["code"] == "excluded_vendor", (name, route, fable)
+            assert "anthropic" in fable["reason"], (name, route, fable)
+            assert row["builder_vendor"] == "xai", (name, route, row["builder_vendor"])
+
+
+@test
+def exclude_vendor_xai_drops_grok_on_every_runner():
+    s = _argon(snap(codex=80, cursor_auto_pct=3, muse_week=60, muse_5h=20, fable=70), 80)
+    xai_pools = _exv_vendor_pools("xai")
+    assert {"cursor_models", "grok"} <= xai_pools, xai_pools
+    for route, row in _exv_routes(s, "anthropic").items():
+        assert any(v["family"] == "grok" for v in _exv_rows(row)), (route, _exv_rows(row))
+    runs = dict(_exv_routes(s, "anthropic", exclude_vendors=("xai",)))
+    runs["review --runner agy"] = su.route_review(s, NOW, "anthropic", "agy", exclude_vendors=("xai",))
+    for route, row in runs.items():
+        for v in _exv_rows(row):
+            assert v["vendor"] != "xai" and v.get("pool") not in xai_pools, (route, v)
+        grok = next(i for i in row["skipped"] if i["family"] == "grok")
+        expect = "runner" if route.endswith("agy") else "excluded_vendor"
+        assert grok["code"] == expect, (route, grok)
+    with tempfile.TemporaryDirectory() as home:
+        cache_dir = Path(home) / "seat-cache"
+        cache_dir.mkdir()
+        (cache_dir / "latest.json").write_text(json.dumps(_shift_snap(
+            time.time(), codex=80, cursor_auto_pct=3, muse_week=60, muse_5h=20, fable=70,
+            google_argon_week=80, google_argon_week_reset_ts=NOW + 3 * 86400)))
+        for args in (["--route", "review"], ["--route", "lineup", "--kind", "review"]):
+            proc = _run_bin(home, cache_dir, args + ["--cached", "--json", "--builder-vendor", "anthropic",
+                                                     "--exclude-vendor", "grok", "--exclude-vendor", "openai"])
+            assert proc.returncode == 0, (args, proc.returncode, proc.stderr)
+            row = json.loads(proc.stdout)[0]
+            assert all(v["vendor"] not in ("xai", "openai") for v in _exv_rows(row)), (args, _exv_rows(row))
+            codes = _codes(row["skipped"])
+            assert codes["grok"] == "excluded_vendor" and codes["astra"] == "excluded_vendor", (args, codes)
+
+
+@test
+def exclude_vendor_unknown_or_misplaced_exits_nonzero():
+    with tempfile.TemporaryDirectory() as home:
+        cache_dir = Path(home) / "seat-cache"
+        cache_dir.mkdir()
+        (cache_dir / "latest.json").write_text(json.dumps(_shift_snap(time.time())))
+        for args in (["--route", "review", "--builder-vendor", "xai"],
+                     ["--route", "lineup", "--kind", "review"]):
+            proc = _run_bin(home, cache_dir, args + ["--cached", "--json", "--exclude-vendor", "anthropic",
+                                                     "--exclude-vendor", "acme"])
+            assert proc.returncode == 2, (args, proc.returncode, proc.stdout)
+            assert "unknown vendor acme" in proc.stderr and "vendors: anthropic" in proc.stderr, proc.stderr
+            assert proc.stdout == "", proc.stdout
+        bare = _run_bin(home, cache_dir, ["--route", "review", "--cached", "--builder-vendor", "xai",
+                                          "--exclude-vendor"])
+        assert bare.returncode == 2 and "--exclude-vendor needs a value" in bare.stderr, bare.stderr
+        for args in (["--route", "lineup", "--kind", "mixed"], ["--route", "chair"]):
+            proc = _run_bin(home, cache_dir, args + ["--cached", "--exclude-vendor", "xai"])
+            assert proc.returncode == 2, (args, proc.returncode)
+            assert "--exclude-vendor applies to --route review" in proc.stderr, proc.stderr
+
+
+@test
+def exclude_vendor_leaves_builder_vendor_behavior_alone():
+    for name, s in _exv_fixtures().items():
+        plain = _exv_routes(s, "xai")
+        assert plain == _exv_routes(s, "xai", exclude_vendors=()), name
+        grok = next(i for i in plain["review"]["skipped"] if i["family"] == "grok")
+        assert grok["code"] == "builder_vendor" and grok["reason"] == "shares builder vendor xai", grok
+        both = _exv_routes(s, "xai", exclude_vendors=("xai",))
+        for route, row in both.items():
+            assert row == plain[route], (name, route)
+
+
+@test
+def exclude_vendor_ask_reason_names_only_excluded_vendors():
+    s = _exv_fixtures()["claude"]
+    row = su.route_lineup(s, NOW, kind="review", exclude_vendors=("anthropic", "openai", "google", "meta"))
+    assert row["mode"] == "ask", row
+    assert "outside Anthropic, Google, Meta, OpenAI;" in row["reason"], row["reason"]
+    row = su.route_review(s, NOW, "xai", exclude_vendors=("anthropic", "openai", "google", "meta"))
+    assert "outside xAI, Anthropic, Google, Meta, OpenAI;" in row["reason"], row["reason"]
+
+
 @test
 def review_capped_argon_falls_through():
     s = _argon(snap(), 100)
