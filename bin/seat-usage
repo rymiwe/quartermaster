@@ -1412,6 +1412,9 @@ POOL_ORDER = ()
 # Opus pools that own a runner, in tie-break order (pools.json "opus_order").
 # A config without the key keeps the one Claude pool Opus used before.
 OPUS_ORDER = ("claude_week",)
+# Launch argv for review models, from pools.json "review_runners".
+# REVIEW_RUNNERS is only the --runner filter, not these commands.
+REVIEW_LAUNCH = {}
 SCORING = {}
 PRIORS = {}
 ROUTE_RULES = ()
@@ -1630,14 +1633,22 @@ def _copy_maps(raw, meta, *names):
         if isinstance(raw.get(name), dict):
             meta[name] = dict(raw[name])
 
+def _runner_record(raw):
+    """A pools.json runner whose cmd parts are strings, or None when the shape is wrong."""
+    if isinstance(raw, dict) and isinstance(raw.get("cmd"), list):
+        return dict(raw, cmd=[str(part) for part in raw["cmd"]])
+    return None
+
+
 def _empty_pool_tables():
     global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, FAMILY_VENDOR, _FAMILY_NAME, GOOGLE_FAMILIES
-    global OPUS_ORDER
+    global OPUS_ORDER, REVIEW_LAUNCH
     GOOGLE_FAMILIES = {}
     POOLS = {}
     ROLES = {}
     POOL_ORDER = ()
     OPUS_ORDER = ()
+    REVIEW_LAUNCH = {}
     SCORING = {}
     PRIORS = {}
     BURN_POOLS = ()
@@ -1653,6 +1664,7 @@ def load_config(pools_path=None, priors_path=None):
     """
     global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, BURN_HOURS, BURN_GAP, NEAR_CAP
     global FAMILY_VENDOR, _FAMILY_NAME, ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S, GOOGLE_FAMILIES, OPUS_ORDER
+    global REVIEW_LAUNCH
     ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S = (ROUTE_FRESHNESS_DEFAULT_S["live"], ROUTE_FRESHNESS_DEFAULT_S["pulled"])
     path = pools_path or pools_file()
     try:
@@ -1737,9 +1749,9 @@ def load_config(pools_path=None, priors_path=None):
         if raw.get("burn_effort"):
             meta["burn_effort"] = raw["burn_effort"]
         _copy_maps(raw, meta, "effort_by_role", "effort_by_pace", "burn_effort_by_role", "family_by_pace")
-        runner = raw.get("runner")
-        if isinstance(runner, dict) and isinstance(runner.get("cmd"), list):
-            meta["runner"] = dict(runner, cmd=[str(part) for part in runner["cmd"]])
+        runner = _runner_record(raw.get("runner"))
+        if runner:
+            meta["runner"] = runner
         pools[pid] = meta
         if meta.get("lose_it"):
             burn.append((meta["seat"], meta.get("burn") or meta["label"], meta["used"], meta["reset"], window))
@@ -1752,9 +1764,17 @@ def load_config(pools_path=None, priors_path=None):
             "under_mode": raw.get("under_mode", "suggest"),
             "default": dict(raw.get("default") or {}),
         }
+    launches = {}
+    raw_launch = data.get("review_runners")
+    if isinstance(raw_launch, dict):
+        for model, spec in raw_launch.items():
+            rec = _runner_record(spec)
+            if rec:
+                launches[model] = rec
     POOLS = pools
     ROLES = roles
     POOL_ORDER = tuple(pools)
+    REVIEW_LAUNCH = launches
     order = data.get("opus_order")
     if isinstance(order, list):
         OPUS_ORDER = tuple(pid for pid in order if pid in pools)
@@ -3288,9 +3308,8 @@ REVIEW_ROSTER = (
      "contributor_mode": "off"},
 )
 _REVIEW_VENDOR_ALIAS = {"grok": "xai"}
-# --runner NAME keeps only the review models that runner can launch. Conclave's
-# merge gate runs agy, and agy lists Gemini 4 Argon. An Astra, Fable, Grok, or
-# Muse pick would fail inside agy with no verdict.
+# The filter table is only the --runner flag. agy keeps Gemini 4 Argon, which
+# is what Conclave's merge gate can launch. The launch argv lives in review_runners.
 REVIEW_RUNNERS = {"agy": frozenset(("gemini-4-argon-high",))}
 # --route review seats one reviewer. --route lineup --kind review seats two.
 # Both call _review_candidates. The counts stay different on purpose: changing
@@ -3800,6 +3819,8 @@ def route_review(s, now, builder_vendor, runner=None):
 
     Unknown and capped seats are skipped. Ask only when none remain. With a
     runner, a model that runner cannot launch is skipped with code runner.
+    A seated reviewer carries its review_runners argv. The top-level runner
+    field is that argv, unless --runner named a filter, which stays the name.
     """
     states = {pid: pool_status(pid, s, now) for pid in POOLS}
     vendor = _normalize_vendor(builder_vendor)
@@ -3826,13 +3847,20 @@ def route_review(s, now, builder_vendor, runner=None):
         if runner is not None:
             row["runner"] = runner
         return row
+    argv = _review_launch(chosen[0].get("model"), chosen[0].get("effort"))
+    if argv is not None:
+        chosen[0]["runner"] = list(argv)
     mode = chosen[0].get("mode") or "default"
     row = {"role": "review", "mode": mode, "reason": why, "why": why,
            "builder_vendor": vendor, "reviewers": chosen, "skipped": skipped,
            "reading_age_s": seated, "usage": _usage_snapshot(states, s),
            "usage_age_s": _snapshot_age(s, now)}
+    # A filter name stays the string the merge gate checks. No filter means
+    # the same launch argv the seated reviewer carries.
     if runner is not None:
         row["runner"] = runner
+    elif argv is not None:
+        row["runner"] = list(argv)
     return row
 
 
@@ -4430,9 +4458,8 @@ def _lower_effort(requested, cap):
     return min(requested, cap, key=EFFORT_ORDER.index)
 
 
-def _pstack_runner(pool_id, effort, fast):
-    """The pool's runner argv from pools.json. A slug is filled with the effort."""
-    runner = POOLS[pool_id].get("runner")
+def _expand_runner(runner, effort, fast):
+    """Fill a pools.json runner. A slug replaces {effort} and appends fast_suffix when fast."""
     if not runner:
         return None
     cmd = list(runner["cmd"])
@@ -4443,6 +4470,16 @@ def _pstack_runner(pool_id, effort, fast):
             slug += runner["fast_suffix"]
         cmd.append(slug)
     return cmd
+
+
+def _pstack_runner(pool_id, effort, fast):
+    """The pool's runner argv from pools.json. A slug is filled with the effort."""
+    return _expand_runner(POOLS[pool_id].get("runner"), effort, fast)
+
+
+def _review_launch(model, effort):
+    """Launch argv for a review model from review_runners, or None when it has no entry."""
+    return _expand_runner(REVIEW_LAUNCH.get(model), effort, False)
 
 
 def route_pstack(s, now, model, role="builder"):
@@ -4604,6 +4641,9 @@ def format_review(row):
                 f"  reviewer: {rev.get('seat')} | {rev.get('family')} | {rev.get('model')} | "
                 f"{rev.get('effort')} | {rev.get('vendor')} | pace {rev.get('pace')} | "
                 f"headroom {_fmt_headroom(rev.get('headroom'))} | used {used_s}")
+            argv = rev.get("runner")
+            if isinstance(argv, (list, tuple)) and argv:
+                lines.append(f"  runner: {shlex.join(argv)}")
     for skip in row.get("skipped") or []:
         lines.append(_skip_line(skip))
     return "\n".join(lines)

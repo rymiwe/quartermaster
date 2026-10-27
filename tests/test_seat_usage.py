@@ -4590,10 +4590,16 @@ def review_runner_agy_keeps_only_models_agy_runs():
     s = _argon(snap(), 60)
     plain = su.route_review(s, NOW, "anthropic")
     assert [r["model"] for r in plain["reviewers"]] == ["gpt-6-astra"], plain
-    assert "runner" not in plain, plain
+    astra_argv = ["codex", "exec", "-m", "gpt-6-astra"]
+    assert plain["runner"] == astra_argv, plain
+    assert plain["reviewers"][0]["runner"] == astra_argv, plain
+    assert "runner: codex exec -m gpt-6-astra" in su.format_review(plain)
     row = su.route_review(s, NOW, "anthropic", "agy")
     assert row["mode"] != "ask" and row["runner"] == "agy", row
     assert [r["model"] for r in row["reviewers"]] == ["gemini-4-argon-high"], row
+    argon_argv = ["agy", "--model", "gemini-4-argon-high"]
+    assert row["reviewers"][0]["runner"] == argon_argv, row
+    assert "runner: agy --model gemini-4-argon-high" in su.format_review(row)
     for r in row["reviewers"]:
         assert r["model"] in su.REVIEW_RUNNERS["agy"], r
     codes = {item["family"]: item["code"] for item in row["skipped"]}
@@ -4606,7 +4612,9 @@ def review_runner_agy_keeps_only_models_agy_runs():
     # A capped Argon is skipped and the route asks rather than seating a model agy cannot run.
     capped = su.route_review(_argon(snap(), 100), NOW, "anthropic", "agy")
     assert capped["mode"] == "ask" and capped["reviewers"] == [], capped
+    assert capped["runner"] == "agy", capped
     assert "agy-runnable" in capped["reason"], capped["reason"]
+    assert "  runner:" not in su.format_review(capped)
     base = {"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1",
             "SEAT_USAGE_PULL_ONLY_FILE": "/nonexistent/pull-only"}
     with tempfile.TemporaryDirectory() as home:
@@ -4619,6 +4627,79 @@ def review_runner_agy_keeps_only_models_agy_runs():
                                 "--cached", "--runner", "agy"],
                                capture_output=True, text=True, env=env, timeout=20)
         assert wrong.returncode == 2 and "--runner applies to --route review" in wrong.stderr, wrong.stderr
+
+
+@test
+def review_builder_vendor_is_never_seated():
+    s = _argon(snap(), 10)
+    xai = su.route_review(s, NOW, "xai")
+    assert all(r["vendor"] != "xai" for r in xai["reviewers"]), xai
+    grok = next(item for item in xai["skipped"] if item["family"] == "grok")
+    assert grok["code"] == "builder_vendor", grok
+    google = su.route_review(s, NOW, "google")
+    assert all(r["vendor"] != "google" for r in google["reviewers"]), google
+    argon = next(item for item in google["skipped"] if item["family"] == "argon")
+    assert argon["code"] == "builder_vendor", argon
+
+
+@test
+def review_capped_argon_falls_through():
+    s = _argon(snap(), 100)
+    row = su.route_review(s, NOW, "anthropic")
+    chosen = row["reviewers"][0]
+    assert chosen["model"] == "gpt-6-astra", chosen
+    assert chosen["vendor"] != "anthropic", chosen
+    assert chosen["runner"] == ["codex", "exec", "-m", "gpt-6-astra"], chosen
+    assert row["runner"] == ["codex", "exec", "-m", "gpt-6-astra"], row
+    argon = next(item for item in row["skipped"] if item["family"] == "argon")
+    assert argon["code"] == "capped", argon
+    other = su.route_review(s, NOW, "xai")
+    seated = other["reviewers"][0]
+    assert seated["family"] == "fable", seated
+    assert seated["runner"] == ["cursor-agent", "--model", "fable"], seated
+    assert "runner: cursor-agent --model fable" in su.format_review(other)
+
+
+@test
+def review_asks_when_no_seat_is_eligible():
+    capped = snap(codex=100, muse_week=100, muse_5h=100, fable=100, cursor_api_pct=100,
+                  claude_5h=100, grok_pct=100, google_argon_week=100,
+                  google_argon_week_reset_ts=NOW + 86400)
+    asked = su.route_review(capped, NOW, "xai")
+    assert asked["mode"] == "ask" and asked["reviewers"] == [], asked
+    assert "need 1" in asked["reason"] and "0 eligible" in asked["reason"], asked["reason"]
+    assert "  runner:" not in su.format_review(asked)
+    only_builder = snap(codex=100, muse_week=100, muse_5h=100, fable=100, cursor_api_pct=100,
+                        claude_5h=100, google_argon_week=100,
+                        google_argon_week_reset_ts=NOW + 86400)
+    alone = su.route_review(only_builder, NOW, "xai")
+    assert alone["mode"] == "ask" and alone["reviewers"] == [], alone
+    assert all(r.get("vendor") != "xai" for r in alone["reviewers"])
+    assert "  runner:" not in su.format_review(alone)
+
+
+@test
+def review_text_and_json_show_the_launch_argv():
+    now = time.time()
+    with tempfile.TemporaryDirectory() as home:
+        home = Path(home)
+        cache_dir = home / "seat-cache"
+        cache_dir.mkdir()
+        body = _shift_snap(now)
+        body["google_argon_week"] = 100
+        body["google_argon_week_reset_ts"] = now + 3 * 86400
+        (cache_dir / "latest.json").write_text(json.dumps(body))
+        args = ["--route", "review", "--cached", "--builder-vendor", "anthropic"]
+        js = _run_bin(home, cache_dir, args + ["--json"])
+        assert js.returncode == 0, (js.returncode, js.stderr, js.stdout)
+        row = json.loads(js.stdout)[0]
+        argv = ["codex", "exec", "-m", "gpt-6-astra"]
+        assert row["runner"] == argv, row
+        assert row["reviewers"][0]["runner"] == argv, row
+        text = _run_bin(home, cache_dir, args)
+        assert text.returncode == 0, (text.returncode, text.stderr, text.stdout)
+        assert "codex exec -m gpt-6-astra" in text.stdout, text.stdout
+        assert "codex exec -m gpt-6-astra" in " ".join(row["runner"]), row
 
 
 @test
