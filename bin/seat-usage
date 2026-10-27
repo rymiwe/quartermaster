@@ -52,7 +52,7 @@ no Muse or agy ask, and no cache write. Output says "pull-only" and the cache
 age. For a VM that only renders a reader host's pushed copy.
 Sources are documented in the Delegation Routing section of ~/.claude/CLAUDE.md.
 """
-import base64, fcntl, glob, json, os, re, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+import base64, fcntl, glob, json, os, re, shlex, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 from datetime import datetime, timezone
 
 H = os.path.expanduser("~")
@@ -1409,6 +1409,9 @@ POOLS = {}
 GOOGLE_FAMILIES = {}
 ROLES = {}
 POOL_ORDER = ()
+# Opus pools that own a runner, in tie-break order (pools.json "opus_order").
+# A config without the key keeps the one Claude pool Opus used before.
+OPUS_ORDER = ("claude_week",)
 SCORING = {}
 PRIORS = {}
 ROUTE_RULES = ()
@@ -1416,6 +1419,22 @@ BURN_POOLS = ()
 NEAR_CAP = 95
 _ASK = "ask Ryan"
 _FIX_ASK = "fix the failed reading, then ask Ryan"
+# Work context: SEAT_USAGE_WORK=1 (or `--route ... --work`, which sets it) says
+# the target repo is a work repo (SOFware, skedify). Fable is not
+# zero-data-retention, so no route seats it there. _work_barred is the one guard:
+# launch rows (_row), every voter roster, and --route pstack ask it.
+WORK_BARRED_FAMILIES = {"fable": "work repo: Fable is not zero-data-retention"}
+
+
+def _work_context():
+    return os.environ.get("SEAT_USAGE_WORK") == "1"
+
+
+def _work_barred(family):
+    """The reason a family may not be seated in a work repo, else None."""
+    if not _work_context():
+        return None
+    return WORK_BARRED_FAMILIES.get(family)
 
 def _repo_root():
     return os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
@@ -1630,10 +1649,12 @@ def _copy_maps(raw, meta, *names):
 
 def _empty_pool_tables():
     global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, FAMILY_VENDOR, _FAMILY_NAME, GOOGLE_FAMILIES
+    global OPUS_ORDER
     GOOGLE_FAMILIES = {}
     POOLS = {}
     ROLES = {}
     POOL_ORDER = ()
+    OPUS_ORDER = ()
     SCORING = {}
     PRIORS = {}
     BURN_POOLS = ()
@@ -1648,7 +1669,7 @@ def load_config(pools_path=None, priors_path=None):
     install still sees it.
     """
     global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, BURN_HOURS, BURN_GAP, NEAR_CAP
-    global FAMILY_VENDOR, _FAMILY_NAME, ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S, GOOGLE_FAMILIES
+    global FAMILY_VENDOR, _FAMILY_NAME, ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S, GOOGLE_FAMILIES, OPUS_ORDER
     ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S = (ROUTE_FRESHNESS_DEFAULT_S["live"], ROUTE_FRESHNESS_DEFAULT_S["pulled"])
     path = pools_path or pools_file()
     try:
@@ -1733,6 +1754,9 @@ def load_config(pools_path=None, priors_path=None):
         if raw.get("burn_effort"):
             meta["burn_effort"] = raw["burn_effort"]
         _copy_maps(raw, meta, "effort_by_role", "effort_by_pace", "burn_effort_by_role", "family_by_pace")
+        runner = raw.get("runner")
+        if isinstance(runner, dict) and isinstance(runner.get("cmd"), list):
+            meta["runner"] = dict(runner, cmd=[str(part) for part in runner["cmd"]])
         pools[pid] = meta
         if meta.get("lose_it"):
             burn.append((meta["seat"], meta.get("burn") or meta["label"], meta["used"], meta["reset"], window))
@@ -1748,6 +1772,11 @@ def load_config(pools_path=None, priors_path=None):
     POOLS = pools
     ROLES = roles
     POOL_ORDER = tuple(pools)
+    order = data.get("opus_order")
+    if isinstance(order, list):
+        OPUS_ORDER = tuple(pid for pid in order if pid in pools)
+    else:
+        OPUS_ORDER = tuple(pid for pid in ("claude_week",) if pid in pools)
     BURN_POOLS = tuple(burn)
     FAMILY_VENDOR = dict(data.get("vendors") or {})
     _FAMILY_NAME = dict(data.get("family_names") or {})
@@ -2189,6 +2218,10 @@ def _row(role, s, now, mode, reason, **over):
     for k in ("seat", "family", "effort", "variant"):
         if k in over:
             out[k] = over[k]
+    barred = _work_barred(out["family"])
+    if barred and mode != "ask":
+        out["mode"] = "ask"
+        out["reason"] = f"{barred}: {reason}: {_ASK}"
     return out
 
 def _has_room(pool_id, states, s):
@@ -2574,15 +2607,6 @@ def _voter_state(spec, states):
     return "open"
 
 
-def _join_open(a, b):
-    """unknown if either reading is unknown, capped if either is capped, else the first state."""
-    if a == "unknown" or b == "unknown":
-        return "unknown"
-    if a == "capped" or b == "capped":
-        return "capped"
-    return a
-
-
 def _usage_snapshot(states, s):
     out = {}
     for pid, meta in POOLS.items():
@@ -2769,8 +2793,8 @@ def _grok_row(role, pid, s, now, states):
     return row
 
 
-def _opus_phrase(role, effort, s):
-    word = _claude_tier_word(s)
+def _opus_phrase(role, effort, s, owner="claude_week"):
+    word = _opus_where(owner, s)
     if role == "builder" and effort == "low":
         return f"Opus at low on {word}"
     return f"Opus on {word} at {effort}"
@@ -2793,20 +2817,112 @@ def _max_unknown_reason(states, s):
     return f"{body}: {_FIX_ASK if failed else _ASK}"
 
 
+def _opus_members(owner):
+    """The owner pool and the short windows that gate it (its blocked_by)."""
+    return [owner] + [gate for gate in (POOLS[owner].get("blocked_by") or ()) if gate in POOLS]
+
+
+# Opus headroom bands, best first. Under, on, and open all have room, so they
+# tie and opus_order decides; a 5h gate that reads "on" early in its window
+# must not hand the pick to a pool with no gate.
+_OPUS_BANDS = {"under": 0, "on": 0, "open": 0, "ahead": 1, "near_cap": 2}
+
+
+def _opus_group(owner, states):
+    """(state, binding pool, band) for one Opus pool and its gates.
+
+    capped when any member is capped, else unknown when any member is unknown,
+    else the member in the worst _OPUS_BANDS band (lower is more headroom). The
+    band is None for capped and unknown.
+    """
+    members = _opus_members(owner)
+    for rank in ("capped", "unknown"):
+        for pid in members:
+            if states[pid][0] == rank:
+                return rank, pid, None
+    pid = max(members, key=lambda p: _OPUS_BANDS.get(states[p][0], 0))
+    state = states[pid][0]
+    return state, pid, _OPUS_BANDS.get(state, 0)
+
+
+def _opus_pick(states):
+    """('pool', owner), ('ask', unknown pool ids), or ('capped', binding pool ids).
+
+    Each pool in OPUS_ORDER (Google agy, Claude Code, Cursor Other Models) is
+    judged with its gates by _opus_group. The best headroom band wins and a
+    tie keeps OPUS_ORDER. Capped groups are skipped. Like _grok_pools, a known
+    uncapped group wins over an unknown one; with none, an unknown group asks.
+    Every group capped is ('capped', ...). Opus never falls back to another family.
+    """
+    best, best_band, unknown, capped = None, None, [], []
+    for owner in OPUS_ORDER:
+        state, pid, band = _opus_group(owner, states)
+        if state == "capped":
+            capped.append(pid)
+            continue
+        if state == "unknown":
+            unknown.extend(p for p in _opus_members(owner) if states[p][0] == "unknown")
+            continue
+        if best is None or band < best_band:
+            best, best_band = owner, band
+    if best is not None:
+        return "pool", best
+    if unknown:
+        return "ask", unknown
+    return "capped", capped
+
+
+def _unknown_pools_reason(pids, states, s):
+    """The _max_unknown_reason wording for any pools: old reading, or failed."""
+    parts, failed = [], False
+    for pid in pids:
+        why = states[pid][1] or "unknown"
+        label = _ask_label(pid, s)
+        if why.startswith("reading ") and why.endswith(" old"):
+            parts.append(f"{label} {why}")
+        else:
+            failed = True
+            parts.append(f"{label} reading unknown")
+    body = "; ".join(parts) or "Opus reading unknown"
+    return f"{body}: {_FIX_ASK if failed else _ASK}"
+
+
+def _opus_capped_reason(pids, s):
+    names = ", ".join(_ask_label(pid, s) for pid in pids) or "none configured"
+    return f"all Opus pools capped ({names}): {_ASK}"
+
+
+def _opus_where(owner, s):
+    """Claude keeps the tier word (Max, Pro). Other pools name their label."""
+    if owner == "claude_week":
+        return _claude_tier_word(s)
+    return _ask_label(owner, s)
+
+
 def _opus_row(role, s, now, states, prefix):
-    """Opus chair at high, Opus builder at low, unless that pool is burning or ahead."""
-    state = _join_open(states["claude_week"][0], states["claude_5h"][0])
-    if state == "unknown":
-        return _ask_row(role, s, now, f"{prefix}: {_max_unknown_reason(states, s)}")
-    if state == "capped":
-        return _ask_row(role, s, now, f"{prefix} and {_claude_tier_word(s)} capped: {_ASK}")
+    """Opus on the Opus pool with the most headroom, or an ask row.
+
+    The pick is _opus_pick: Google (agy), then Claude Code, then Cursor Other
+    Models, by the headroom of each pool and its gates, ties in that order. An
+    unknown group loses to a known uncapped one and asks when none is left. All
+    capped asks. There is no other-family fallback. Opus chair at high, Opus
+    builder at low, unless the chosen pool is burning or ahead. A prefix of None
+    leaves the ask reason unprefixed.
+    """
+    lead = f"{prefix}: " if prefix else ""
+    kind, found = _opus_pick(states)
+    if kind == "ask":
+        return _ask_row(role, s, now, f"{lead}{_unknown_pools_reason(found, states, s)}")
+    if kind == "capped":
+        return _ask_row(role, s, now, f"{lead}{_opus_capped_reason(found, s)}")
+    owner = found
     default = "low" if role == "builder" else "high"
-    effort, mode = _effort_for("claude_week", s, now, states, default=default)
+    effort, mode = _effort_for(owner, s, now, states, default=default)
     if mode == "default":
         mode = "suggest"
-    reason = f"{prefix}: {_opus_phrase(role, effort, s)}"
-    row = _row(role, s, now, mode, reason, seat="claude", family="opus", effort=effort, variant="-")
-    row["reading_age_s"] = _reading_age("claude_week", s, now)
+    reason = f"{lead}{_opus_phrase(role, effort, s, owner)}"
+    row = _row(role, s, now, mode, reason, seat=POOLS[owner]["seat"], family="opus", effort=effort, variant="-")
+    row["reading_age_s"] = _reading_age(owner, s, now)
     return row
 
 
@@ -2848,16 +2964,15 @@ def _constrained_worker(family, role, s, now, states, keep_ahead=False):
     An unknown reading is an ask. A family that is not a capable chair or builder
     is an ask. None means the caller should use the unconstrained route.
     keep_ahead holds a Grok builder whose pools are ahead of pace.
+    Opus is never None: _opus_row picks across the Opus pools, and an unknown
+    or all-capped pick is an ask, not a fall-through to another family.
     """
     if family == "grok":
         return _xai_worker(role, s, now, states, keep_ahead=keep_ahead)
     if family == "opus":
-        state = _join_open(states["claude_week"][0], states["claude_5h"][0])
-        if state == "unknown":
-            return _ask_row(role, s, now, _max_unknown_reason(states, s))
-        if state == "capped":
-            return None
-        return _opus_row(role, s, now, states, "builder family opus")
+        # The unknown ask keeps its old unprefixed wording.
+        unknown = _opus_pick(states)[0] == "ask"
+        return _opus_row(role, s, now, states, None if unknown else "builder family opus")
     return _ask_row(role, s, now, f"builder family {family} is not a capable builder: {_ASK}")
 
 
@@ -3061,12 +3176,13 @@ def _lineup_mode(chair, builder, voters, weaker):
     return "default"
 
 
-def _collect_voters(states, s, now, excluded_vendor):
+def _collect_voters(states, s, now, excluded_vendor, skipped=None):
     """Voters outside one excluded vendor. None excludes nobody.
 
     One voter is a degraded lineup. An unknown reading the lineup depends on
     asks. Fable is required when the excluded vendor is xAI: a full 5h window
-    with no Other Models room asks and names the reopen.
+    with no Other Models room asks and names the reopen. A family barred in a
+    work repo is left out, and listed in skipped when a list is passed.
     """
     excluded = {excluded_vendor} if excluded_vendor else set()
     required = excluded_vendor == "xai"
@@ -3074,6 +3190,11 @@ def _collect_voters(states, s, now, excluded_vendor):
     downgrade = None
     for spec in VOTER_ROSTER:
         if FAMILY_VENDOR[spec["family"]] in excluded:
+            continue
+        barred = _work_barred(spec["family"])
+        if barred:
+            if skipped is not None:
+                skipped.append(_mixed_skip(spec["family"], spec["seat"], barred, "work"))
             continue
         if spec["family"] == "fable":
             status, payload = _fable_voter(states, s, now, required)
@@ -3524,6 +3645,10 @@ def _review_candidates(states, s, now, excluded_vendor, runner=None):
         if excluded_vendor and spec["vendor"] == excluded_vendor:
             skipped.append(_review_skip(spec, f"shares builder vendor {excluded_vendor}", "builder_vendor"))
             continue
+        barred = _work_barred(spec["family"])
+        if barred:
+            skipped.append(_review_skip(spec, barred, "work"))
+            continue
         pick = spec["pick"]
         if pick == "fable":
             status, payload = _fable_voter(states, s, now, False)
@@ -3858,6 +3983,10 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
         family = spec["family"]
         if FAMILY_VENDOR.get(family) in excluded:
             continue
+        barred = _work_barred(family)
+        if barred:
+            skipped.append(_mixed_skip(family, spec["seat"], barred, "work"))
+            continue
         pid = None
         why = None
         if family == "fable":
@@ -4048,9 +4177,13 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
         else:
             voters, mixed_skipped = payload
     else:
-        status, payload = _collect_voters(states, s, now, excluded_vendor)
+        mixed_skipped = []
+        status, payload = _collect_voters(states, s, now, excluded_vendor, mixed_skipped)
         if status == "ask":
-            return _lineup_ask(s, now, states, payload, [])
+            asked = _lineup_ask(s, now, states, payload, [])
+            if mixed_skipped:
+                asked["skipped"] = mixed_skipped
+            return asked
         downgrade = None
         if status == "downgrade":
             voters, downgrade = payload
@@ -4070,7 +4203,7 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
         row["builder_vendor"] = excluded_vendor
         row["skipped"] = review_skipped or []
         row["why"] = review_why
-    if kind == "mixed" or (kind == "design" and mixed_skipped):
+    if kind == "mixed" or (kind in ("design", "audit", None) and mixed_skipped):
         row["skipped"] = mixed_skipped or []
     if downgrade:
         row["downgrade"] = downgrade
@@ -4229,6 +4362,8 @@ def _ask_one(spec, states, s, now):
     an ahead Grok pool ranks lower and can still answer a question.
     """
     family = spec["family"]
+    if _work_barred(family):
+        return None
     if family == "fable":
         status, payload = _fable_voter(states, s, now, required=False)
         if status != "row" or payload.get("downgraded"):
@@ -4298,6 +4433,136 @@ def route_ask(s, now):
     seated = max(known) if known else None
     return {"role": "ask", "mode": mode, "reason": reason, "voters": picked, "candidates": candidates,
             "reading_age_s": seated, "usage": _usage_snapshot(states, s), "usage_age_s": age}
+
+
+EFFORT_ORDER = ("low", "medium", "high", "xhigh", "max")
+
+
+def parse_pstack_model(model):
+    """(family, effort, fast) from a family name or a cursor-style slug.
+
+    'opus' is (opus, None, False). A Cursor Opus slug ending '-xhigh-fast' is
+    (opus, xhigh, True). 'grok-4.7-high-fast' is (grok, high, True). agy's
+    'Claude Opus 5.5' is (opus, None, False). The family is the first token
+    that names a configured family, else None. Slugs live in pools.json.
+    """
+    text = (model or "").strip().lower()
+    if text in FAMILY_VENDOR:
+        return text, None, False
+    tokens = [t for t in re.split(r"[-\s_/]+", text) if t]
+    family = next((t for t in tokens if t in FAMILY_VENDOR), None)
+    fast = bool(tokens) and tokens[-1] == "fast"
+    rest = tokens[:-1] if fast else tokens
+    effort = rest[-1] if rest and rest[-1] in EFFORT_ORDER else None
+    return family, effort, fast
+
+
+def _lower_effort(requested, cap):
+    """The lower of the two on EFFORT_ORDER. A cap may only lower a request."""
+    if requested not in EFFORT_ORDER:
+        return cap
+    if cap not in EFFORT_ORDER:
+        return requested
+    return min(requested, cap, key=EFFORT_ORDER.index)
+
+
+def _pstack_runner(pool_id, effort, fast):
+    """The pool's runner argv from pools.json. A slug is filled with the effort."""
+    runner = POOLS[pool_id].get("runner")
+    if not runner:
+        return None
+    cmd = list(runner["cmd"])
+    slug = runner.get("slug")
+    if isinstance(slug, str):
+        slug = slug.replace("{effort}", effort or "high")
+        if fast and isinstance(runner.get("fast_suffix"), str):
+            slug += runner["fast_suffix"]
+        cmd.append(slug)
+    return cmd
+
+
+def route_pstack(s, now, model, role="builder"):
+    """Where pstack's model runs and how hard. Read-only: never swaps the model.
+
+    pstack picks the model; this caps effort and, for Opus, picks the pool.
+    Opus uses _opus_pick (Google agy, Claude Code, Cursor Other Models by
+    headroom). Grok uses the worker pools (_grok_pools; an all-ahead band still
+    seats, since the model is pstack's call). The cap is _effort_for on that
+    pool with the requested effort (high when none) as its default, and the
+    final effort is the lower of the two. Other families stay unrouted with the
+    requested effort. A work repo never seats a barred family. Unknown readings
+    and capped pools ask.
+    """
+    states = {pid: pool_status(pid, s, now) for pid in POOLS}
+    family, requested, fast = parse_pstack_model(model)
+    base = {"role": "pstack", "model": model, "pstack_role": role, "family": family or "-",
+            "requested_effort": requested, "effort_cap": None, "effort": requested or "-",
+            "fast": fast, "pool": None, "pool_label": None, "seat": "-", "runner": None,
+            "work": _work_context(), "reading_age_s": _snapshot_age(s, now)}
+
+    def ask(reason):
+        return dict(base, mode="ask", reason=reason)
+
+    barred = _work_barred(family)
+    if barred:
+        return ask(f"{barred}: {model}: {_ASK}")
+    pid = None
+    if family == "opus":
+        kind, found = _opus_pick(states)
+        if kind == "ask":
+            return ask(_unknown_pools_reason(found, states, s))
+        if kind == "capped":
+            return ask(_opus_capped_reason(found, s))
+        pid = found
+    elif family == "grok":
+        kind, band = _grok_pools(states)
+        if kind == "over":
+            kind, band = "pool", [p for p in _serving("grok") if states[p][0] == "ahead"]
+        if kind == "ask":
+            return ask(_unknown_pools_reason(band, states, s))
+        if kind != "pool" or not band:
+            names = ", ".join(_ask_label(p, s) for p in _serving("grok")) or "none configured"
+            return ask(f"all Grok pools capped ({names}): {_ASK}")
+        pid = _spend_first(band, s, now)
+    if pid is None:
+        shown = family or model
+        return dict(base, mode="default", pool="unrouted",
+                    reason=f"{shown} is not routed by pstack: model and effort unchanged")
+    cap, _mode = _effort_for(pid, s, now, states, default=requested or "high")
+    state, binding = states[pid][0], pid
+    if family == "opus":
+        # A gate (5h) that is ahead of pace lowers the cap like its weekly pool would.
+        state, binding, _band = _opus_group(pid, states)
+        if binding != pid:
+            gate_cap, _gate_mode = _effort_for(binding, s, now, states, default=requested or "high")
+            cap = _lower_effort(cap, gate_cap)
+    effort = _lower_effort(requested, cap)
+    lowered = requested is not None and effort != requested
+    label = _ask_label(binding, s)
+    if lowered:
+        reason = f"{label} {_PACE_WORD.get(state, state)}: effort {requested} capped to {effort}"
+    else:
+        reason = f"{label} {_PACE_WORD.get(state, state)}: effort {effort}"
+    return dict(base, mode="suggest" if lowered else "default", reason=reason,
+                effort_cap=cap, effort=effort, pool=pid, pool_label=label,
+                seat=POOLS[pid]["seat"], runner=_pstack_runner(pid, effort, fast),
+                reading_age_s=_reading_age(pid, s, now))
+
+
+def format_pstack(row):
+    age = row.get("reading_age_s")
+    shown = "unknown" if age is None else f"{int(age // 60)}m"
+    if row.get("mode") == "ask":
+        return (f"route: pstack | - | {row.get('family')} | - | - | ask | {row.get('reason')} | "
+                f"reading {shown}")
+    lines = [f"route: pstack | {row.get('seat')} | {row.get('family')} | {row.get('effort')} | "
+             f"{row.get('pool')} | {row.get('mode')} | {row.get('reason')} | reading {shown}"]
+    if row.get("runner"):
+        lines.append(f"  runner: {shlex.join(row['runner'])}")
+    if row.get("pool") != "unrouted":
+        lines.append(f"  effort: requested {row.get('requested_effort') or '-'} | "
+                     f"cap {row.get('effort_cap') or '-'} | final {row.get('effort')}")
+    return "\n".join(lines)
 
 
 def format_ask(row):
@@ -4433,10 +4698,15 @@ def cmd_route():
     if role == "voter":
         print("voters do not route", file=sys.stderr)
         raise SystemExit(2)
-    known = list(ROLES) + ["lineup", "host", "ask", "review"]
+    known = list(ROLES) + ["lineup", "host", "ask", "review", "pstack"]
     if role is not None and role not in known:
         print(f"unknown role {role}; roles: {', '.join(known)}", file=sys.stderr)
         raise SystemExit(2)
+    if "--work" in argv:
+        # The same switch as SEAT_USAGE_WORK=1, so every guard reads one place.
+        os.environ["SEAT_USAGE_WORK"] = "1"
+    if role == "pstack":
+        return cmd_route_pstack(argv, as_json)
     builder = None
     kind = None
     author = None
@@ -4561,6 +4831,29 @@ def cmd_route():
     if note:
         # stderr when stdout is JSON, so a hook can still parse the route rows.
         print(note, file=sys.stderr if as_json else sys.stdout)
+
+def cmd_route_pstack(argv, as_json):
+    """--route pstack --model M [--role R] [--json] [--work]. Read-only.
+
+    Reads the cache only: no seat read, no lock, no ask log, no cache write.
+    An ask prints and exits 0 like every other route.
+    """
+    model = _opt(argv, "--model") if "--model" in argv else None
+    if not model or not model.strip():
+        print("--route pstack needs --model", file=sys.stderr)
+        raise SystemExit(2)
+    role = _opt(argv, "--role").strip() if "--role" in argv else "builder"
+    if role not in ROLES:
+        print(f"unknown role {role}; roles: {', '.join(ROLES)}", file=sys.stderr)
+        raise SystemExit(2)
+    summary = _load_cache()
+    row = route_pstack(summary, time.time(), model.strip(), role)
+    if as_json:
+        json.dump([row], sys.stdout)
+        sys.stdout.write("\n")
+    else:
+        print(format_pstack(row))
+
 
 def log_asks(rows, s, now):
     """Append one line per row the router could not settle. Write failures are silent."""

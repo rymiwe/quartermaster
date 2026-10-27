@@ -1707,7 +1707,8 @@ def lineup_opus_builder_uses_opus_chair_and_grok_voter():
     r = su.route_lineup(snap(), NOW, builder=opus_builder())
     assert r["mode"] != "ask", r
     assert r["lineup"]["chair"]["family"] == "opus" and r["lineup"]["chair"]["effort"] == "high", r
-    assert r["lineup"]["chair"]["seat"] == "claude" and r["lineup"]["chair"]["vendor"] == "anthropic", r
+    # snap() reads every Opus pool under pace: the tie goes to Google (agy), first in opus_order.
+    assert r["lineup"]["chair"]["seat"] == "google" and r["lineup"]["chair"]["vendor"] == "anthropic", r
     assert [v["family"] for v in r["lineup"]["voters"]] == ["astra", "grok", "wonder-full"], r
     grok = r["lineup"]["voters"][1]
     assert grok["effort"] == "high" and grok["seat"] == "grok" and grok["vendor"] == "xai", grok
@@ -5927,6 +5928,255 @@ def seat_ends_cli_shows_ended_in_status_and_routes():
         design = _run_bin(home, cache_dir, ["--route", "lineup", "--kind", "design", "--cached", "--json"])
         row = json.loads(design.stdout)[0]
         assert "wonder-full" in [v["family"] for v in row["lineup"]["voters"]], row
+
+
+@contextlib.contextmanager
+def _work_env(value="1"):
+    old = os.environ.get("SEAT_USAGE_WORK")
+    os.environ["SEAT_USAGE_WORK"] = value
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("SEAT_USAGE_WORK", None)
+        else:
+            os.environ["SEAT_USAGE_WORK"] = old
+
+
+def _opus_states(s):
+    return {pid: su.pool_status(pid, s, NOW) for pid in su.POOLS}
+
+
+@test
+def test_opus_order_and_runners_come_from_config():
+    assert su.OPUS_ORDER == ("google_opus_week", "claude_week", "cursor_other"), su.OPUS_ORDER
+    assert su.POOLS["google_opus_week"]["runner"]["cmd"] == ["agy", "--model", "Claude Opus 5.5"]
+    assert su.POOLS["claude_week"]["runner"]["cmd"] == ["claude", "--model", "opus"]
+    assert su.POOLS["cursor_other"]["runner"]["slug"] == "claude-opus-5-5-{effort}"
+    assert "claude-opus-5-5" not in BIN.read_text(), "the Cursor slug lives in pools.json only"
+
+
+@test
+def test_opus_all_pools_under_pace_goes_to_google():
+    s = snap()
+    states = _opus_states(s)
+    assert su._opus_pick(states) == ("pool", "google_opus_week")
+    row = su._opus_row("builder", s, NOW, states, "builder family opus")
+    assert (row["seat"], row["family"], row["effort"], row["mode"]) == ("google", "opus", "low", "suggest"), row
+    assert row["reason"] == "builder family opus: Opus at low on Google Claude/GPT weekly", row
+    chair = su._opus_row("chair", s, NOW, states, "p")
+    assert chair["seat"] == "google" and chair["effort"] == "high", chair
+    built = su.route_lineup(s, NOW, builder={"role": "builder", "family": "opus"})
+    assert built["lineup"]["builder"]["seat"] == "google", built
+    p = su.route_pstack(s, NOW, "opus", "builder")
+    assert (p["mode"], p["pool"], p["seat"], p["effort"]) == ("default", "google_opus_week", "google", "high"), p
+    assert p["runner"] == ["agy", "--model", "Claude Opus 5.5"], p
+
+
+@test
+def test_opus_google_ahead_goes_to_claude():
+    s = snap(google_claudegpt_week=80)
+    states = _opus_states(s)
+    assert su._opus_pick(states) == ("pool", "claude_week")
+    row = su._opus_row("builder", s, NOW, states, "x")
+    assert row["seat"] == "claude" and row["reason"] == "x: Opus at low on Claude", row
+    # The Google 5h gate ahead also makes that group ahead.
+    gate = snap(google_claudegpt_5h=90)
+    assert su._opus_pick(_opus_states(gate)) == ("pool", "claude_week")
+    p = su.route_pstack(s, NOW, "claude-opus-5-5-high", "builder")
+    assert p["pool"] == "claude_week" and p["runner"] == ["claude", "--model", "opus"], p
+
+
+@test
+def test_opus_google_and_claude_capped_goes_to_cursor_with_the_config_slug():
+    s = snap(google_claudegpt_week=100, claude_week=100)
+    states = _opus_states(s)
+    assert su._opus_pick(states) == ("pool", "cursor_other")
+    row = su._opus_row("chair", s, NOW, states, "x")
+    assert row["seat"] == "cursor" and row["family"] == "opus" and row["effort"] == "high", row
+    p = su.route_pstack(s, NOW, "claude-opus-5-5-xhigh", "builder")
+    assert p["pool"] == "cursor_other" and p["effort"] == "xhigh", p
+    assert p["runner"] == ["cursor-agent", "--model", "claude-opus-5-5-xhigh"], p
+    fast = su.route_pstack(s, NOW, "claude-opus-5-5-xhigh-fast", "builder")
+    assert fast["runner"] == ["cursor-agent", "--model", "claude-opus-5-5-xhigh-fast"], fast
+    bare = su.route_pstack(s, NOW, "opus", "builder")
+    assert bare["runner"] == ["cursor-agent", "--model", "claude-opus-5-5-high"], bare
+    # A 5h gate at 100 caps its weekly pool the same way.
+    gated = snap(google_claudegpt_5h=100, claude_5h=100)
+    assert su._opus_pick(_opus_states(gated)) == ("pool", "cursor_other")
+    text = su.format_pstack(p)
+    assert "  runner: cursor-agent --model claude-opus-5-5-xhigh" in text, text
+
+
+@test
+def test_opus_all_capped_asks_with_no_other_family():
+    s = snap(google_claudegpt_week=100, claude_week=100, cursor_api_pct=100)
+    states = _opus_states(s)
+    assert su._opus_pick(states)[0] == "capped"
+    want = "all Opus pools capped (Google Claude/GPT weekly, Claude weekly, Other Models): ask Ryan"
+    row = su._opus_row("builder", s, NOW, states, "x")
+    assert row["mode"] == "ask" and row["reason"] == f"x: {want}", row
+    worker = su._constrained_worker("opus", "builder", s, NOW, states)
+    assert worker is not None and worker["mode"] == "ask", worker
+    assert worker["reason"] == f"builder family opus: {want}", worker
+    lineup = su.route_lineup(s, NOW, builder={"role": "builder", "family": "opus"})
+    assert lineup["mode"] == "ask" and lineup["lineup"] is None, lineup
+    assert "all Opus pools capped" in lineup["reason"], lineup
+    p = su.route_pstack(s, NOW, "claude-opus-5-5-xhigh", "builder")
+    assert p["mode"] == "ask" and p["pool"] is None and p["runner"] is None, p
+    assert p["family"] == "opus" and p["reason"] == want, p
+    assert su.format_pstack(p).startswith("route: pstack | - | opus | - | - | ask | all Opus pools capped"), p
+
+
+@test
+def test_opus_unknown_reading_loses_to_known_and_asks_when_nothing_known():
+    s = without_as_of(snap(), "google")
+    assert su._opus_pick(_opus_states(s)) == ("pool", "claude_week")
+    assert su.route_pstack(s, NOW, "opus")["pool"] == "claude_week"
+    dead = without_as_of(snap(claude_week=100, cursor_api_pct=100), "google")
+    states = _opus_states(dead)
+    assert su._opus_pick(states) == ("ask", ["google_opus_week", "google_opus_5h"])
+    want = ("Google Claude/GPT weekly reading unknown; Google Claude/GPT 5h reading unknown: "
+            "fix the failed reading, then ask Ryan")
+    row = su._opus_row("builder", dead, NOW, states, "x")
+    assert row["mode"] == "ask" and row["reason"] == f"x: {want}", row
+    worker = su._constrained_worker("opus", "builder", dead, NOW, states)
+    assert worker["mode"] == "ask" and worker["reason"] == want, worker
+    p = su.route_pstack(dead, NOW, "opus")
+    assert p["mode"] == "ask" and p["reason"] == want, p
+    old = snap(claude_week=100, cursor_api_pct=100)
+    old["as_of"] = dict(old["as_of"], google=NOW - 15 * 60)
+    aged = su.route_pstack(old, NOW, "opus")
+    assert aged["mode"] == "ask" and "Google Claude/GPT weekly reading 15m old" in aged["reason"], aged
+    assert aged["reason"].endswith(": ask Ryan"), aged
+
+
+@test
+def test_pstack_effort_cap_only_lowers():
+    ahead = snap(google_claudegpt_week=80, claude_week=80, cursor_api_pct=100)
+    p = su.route_pstack(ahead, NOW, "claude-opus-5-5-xhigh", "builder")
+    assert p["pool"] == "google_opus_week", p
+    assert (p["requested_effort"], p["effort_cap"], p["effort"], p["mode"]) == ("xhigh", "low", "low", "suggest"), p
+    assert p["family"] == "opus" and p["model"] == "claude-opus-5-5-xhigh", "the model is never swapped"
+    # A burning Google pool caps at xhigh. A low request stays low; a max request comes down.
+    burning = snap(google_claudegpt_week=10, google_claudegpt_week_reset_ts=NOW + 12 * 3600)
+    assert su._pool_burning("google_opus_week", burning, NOW)
+    low = su.route_pstack(burning, NOW, "claude-opus-5-5-low", "builder")
+    assert (low["pool"], low["effort_cap"], low["effort"], low["mode"]) == ("google_opus_week", "xhigh", "low", "default"), low
+    top = su.route_pstack(burning, NOW, "claude-opus-5-5-max", "builder")
+    assert top["effort"] == "xhigh" and top["mode"] == "suggest", top
+    assert su.parse_pstack_model("grok-4.7-high-fast") == ("grok", "high", True)
+    assert su.parse_pstack_model("Claude Opus 5.5") == ("opus", None, False)
+    assert su.parse_pstack_model("sonnet") == (None, None, False)
+    grok = su.route_pstack(snap(cursor_auto_pct=80, grok_pct=80), NOW, "grok-4.7-xhigh-fast", "builder")
+    assert grok["family"] == "grok" and grok["effort"] == "low" and grok["seat"] in ("cursor", "grok"), grok
+    other = su.route_pstack(snap(), NOW, "gpt-6-astra-medium", "hard-bug")
+    assert other["pool"] == "unrouted" and other["effort"] == "medium" and other["mode"] == "default", other
+
+
+@test
+def test_pstack_gate_ahead_lowers_the_cap_and_names_the_gate():
+    gate = snap(google_claudegpt_5h=90, claude_week=100, cursor_api_pct=100)
+    p = su.route_pstack(gate, NOW, "claude-opus-5-5-xhigh", "chair")
+    assert p["pool"] == "google_opus_week", p
+    assert (p["requested_effort"], p["effort"], p["mode"]) == ("xhigh", "low", "suggest"), p
+    assert "5h" in p["reason"] and "ahead" in p["reason"], p
+    assert p["model"] == "claude-opus-5-5-xhigh" and p["family"] == "opus", p
+
+
+@test
+def test_review_runner_agy_stays_argon_only_with_opus_layering():
+    s = _argon(snap(), 10)
+    for work in ("0", "1"):
+        with _work_env(work):
+            row = su.route_review(s, NOW, "anthropic", "agy")
+            assert [r["model"] for r in row["reviewers"]] == ["gemini-4-argon-high"], row
+            assert row["runner"] == "agy", row
+
+
+@test
+def test_work_context_never_seats_fable():
+    s = snap()
+    assert su.route("bounded-question", s, NOW)["family"] == "fable"
+    with _work_env():
+        r = su.route("bounded-question", s, NOW)
+        assert r["mode"] == "ask", r
+        assert r["reason"].startswith("work repo: Fable is not zero-data-retention: "), r
+        assert r["reason"].endswith(": ask Ryan"), r
+        for model in ("fable", "claude-fable-5-1-high"):
+            p = su.route_pstack(s, NOW, model, "bounded-question")
+            assert p["mode"] == "ask" and p["pool"] is None and p["runner"] is None, p
+            assert p["reason"].startswith("work repo: Fable is not zero-data-retention"), p
+        assert su.route_pstack(s, NOW, "opus")["mode"] != "ask", "Opus still seats in a work repo"
+        design = su.route_lineup(s, NOW, kind="design")
+        assert "fable" not in [v["family"] for v in design["lineup"]["voters"]], design
+        assert any(k["family"] == "fable" and k["code"] == "work" for k in design["skipped"]), design
+        plain = su.route_lineup(s, NOW)
+        assert "fable" not in [v["family"] for v in plain["lineup"]["voters"]], plain
+        assert any(k["code"] == "work" for k in plain["skipped"]), plain
+        review = su.route_review(s, NOW, "xai")
+        assert all(r["family"] != "fable" for r in review["reviewers"]), review
+        assert any(k["family"] == "fable" and k["code"] == "work" for k in review["skipped"]), review
+        asked = su.route_ask(s, NOW)
+        assert all(v["family"] != "fable" for v in asked["voters"]), asked
+    with tempfile.TemporaryDirectory() as home:
+        home = Path(home)
+        cache_dir = home / "seat-cache"
+        cache_dir.mkdir()
+        (cache_dir / "latest.json").write_text(json.dumps(_shift_snap(time.time())))
+        cli = _run_bin(home, cache_dir, ["--route", "pstack", "--model", "fable", "--role",
+                                         "bounded-question", "--work", "--json"])
+        assert cli.returncode == 0, (cli.returncode, cli.stderr)
+        row = json.loads(cli.stdout)[0]
+        assert row["mode"] == "ask" and row["work"] is True, row
+        text = _run_bin(home, cache_dir, ["--route", "pstack", "--model", "claude-opus-5-5-xhigh"])
+        assert text.returncode == 0 and text.stdout.startswith("route: pstack | google | opus | xhigh"), text.stdout
+        assert "runner: agy --model 'Claude Opus 5.5'" in text.stdout, text.stdout
+        assert not (cache_dir / "asks.jsonl").exists(), "pstack is read-only"
+
+
+@test
+def test_hook_prints_pstack_advisory_for_an_opus_cursor_launch():
+    s = snap(google_claudegpt_week=100, claude_week=100)
+    row = su.route_pstack(s, NOW, "claude-opus-5-5-xhigh", "builder")
+    route_rows = [su.route("builder", s, NOW)]
+    command = "cursor-agent --model claude-opus-5-5-xhigh -p 'build it'"
+    assert hook.command_model(command) == "claude-opus-5-5-xhigh"
+    assert hook.command_model("claude -p --model opus") == "opus"
+    assert hook.command_model('agy --model "Claude Opus 5.5" -p go') == "Claude Opus 5.5"
+    assert hook.command_model("git status") is None
+    with tempfile.TemporaryDirectory() as home:
+        args_log = Path(home) / "args.log"
+        script = ("#!/bin/sh\n"
+                  f"printf '%s\\n' \"$*\" >> {json.dumps(str(args_log))}\n"
+                  "case \"$*\" in\n"
+                  f"  *pstack*) printf '%s\\n' {json.dumps(json.dumps([row]))} ;;\n"
+                  f"  *) printf '%s\\n' {json.dumps(json.dumps(route_rows))} ;;\n"
+                  "esac\n")
+        path = Path(home) / ".local" / "bin" / "seat-usage"
+        path.parent.mkdir(parents=True)
+        path.write_text(script)
+        path.chmod(0o755)
+        env = {"PATH": "/usr/bin:/bin", "HOME": home, "PYTHONDONTWRITEBYTECODE": "1"}
+        data = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
+        proc = subprocess.run([sys.executable, str(HOOK)], input=data, capture_output=True,
+                              text=True, env=env, timeout=15)
+        assert proc.returncode == 0 and proc.stderr == "", (proc.returncode, proc.stderr)
+        out = json.loads(proc.stdout)["hookSpecificOutput"]
+        assert "permissionDecision" not in out, out
+        text = out["additionalContext"]
+        assert text.splitlines()[0].startswith("route: builder |"), text
+        assert ("pstack: claude-opus-5-5-xhigh | pool cursor_other (Other Models) | "
+                "runner cursor-agent --model claude-opus-5-5-xhigh | effort xhigh") in text, text
+        calls = args_log.read_text().splitlines()
+        assert "--route pstack --model claude-opus-5-5-xhigh --role builder --json" in calls, calls
+        # A failing pstack call adds nothing and still exits 0.
+        path.write_text("#!/bin/sh\ncase \"$*\" in\n  *pstack*) exit 3 ;;\n"
+                        f"  *) printf '%s\\n' {json.dumps(json.dumps(route_rows))} ;;\nesac\n")
+        quiet = subprocess.run([sys.executable, str(HOOK)], input=data, capture_output=True,
+                               text=True, env=env, timeout=15)
+        assert quiet.returncode == 0, quiet.returncode
+        assert "pstack:" not in quiet.stdout and "route: builder" in quiet.stdout, quiet.stdout
 
 
 # The property tests (tests/test_properties.py) run with this suite, after the tests above.

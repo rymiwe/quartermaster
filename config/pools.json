@@ -1,6 +1,7 @@
 {
   "version": 1,
   "route_freshness_s": {"live": 600, "pulled": 1200},
+  "opus_order": ["google_opus_week", "claude_week", "cursor_other"],
   "scoring": {
     "provider_pseudo": 8,
     "prior_pseudo": 8,
@@ -111,6 +112,7 @@
       "effort": "-",
       "effort_by_role": {"builder": "low", "chair": "high", "bounded-question": "-"},
       "burn_effort_by_role": {"builder": "xhigh", "chair": "xhigh"},
+      "runner": {"cmd": ["claude", "--model", "opus"]},
       "usage": {
         "used": "claude_week",
         "reset": "claude_week_reset_ts",
@@ -253,6 +255,7 @@
       "effort": "high",
       "effort_by_role": {"bounded-question": "xhigh"},
       "burn_effort": "xhigh",
+      "runner": {"cmd": ["cursor-agent", "--model"], "slug": "claude-opus-5-5-{effort}", "fast_suffix": "-fast"},
       "usage": {
         "used": "cursor_api_pct",
         "reset": "cursor_reset_ts",
@@ -305,6 +308,7 @@
       "effort": "-",
       "effort_by_role": {"builder": "low", "chair": "high"},
       "burn_effort_by_role": {"builder": "high", "chair": "high"},
+      "runner": {"cmd": ["agy", "--model", "Claude Opus 5.5"]},
       "usage": {
         "used": "google_claudegpt_week",
         "reset": "google_claudegpt_week_reset_ts",
