@@ -6,6 +6,12 @@ a routed CLI, and for any failure of seat-usage.
 
 Denies an Agent launch that would build code on Claude while the builder route
 names another seat, unless the prompt has a 'route-override: <reason>' line.
+
+A launch that names a model (cursor-agent/claude/agy --model M) also asks
+`seat-usage --route pstack --model M --role R` and adds one advisory line: the
+pool and runner Quartermaster would use and the capped effort. It never swaps
+the model and never blocks. An unrouted model or a failure adds nothing.
+SEAT_USAGE_WORK passes through the environment to seat-usage.
 """
 import json, os, re, shlex, subprocess, sys
 
@@ -243,11 +249,62 @@ def format_route(row):
             f"{row['variant']} | {row['mode']} | {row['reason']} | reading {shown}")
 
 
+def command_model(command):
+    """The --model value of a routed launch (cursor-agent, claude, agy), else None."""
+    if command_role(command) is None:
+        return None
+    tokens = _command_tokens(command)
+    if os.path.basename(tokens[0]) not in ("cursor-agent", "claude", "agy"):
+        return None
+    return _model_arg(tokens[1:])
+
+
+def format_pstack(row):
+    """Advisory only: pstack's model stays; effort can only go down."""
+    if row.get("mode") == "ask":
+        return f"pstack: {row.get('model')} | ask | {row.get('reason')}"
+    runner = row.get("runner")
+    shown = " ".join(shlex.quote(part) for part in runner) if runner else "-"
+    return (f"pstack: {row.get('model')} | pool {row.get('pool')} ({row.get('pool_label')}) | "
+            f"runner {shown} | effort {row.get('effort')} (requested {row.get('requested_effort') or '-'}, "
+            f"cap {row.get('effort_cap') or '-'}) | {row.get('reason')}")
+
+
+def _seat_usage(args):
+    """Parsed JSON rows from seat-usage, or None on any failure."""
+    try:
+        proc = subprocess.run([os.path.expanduser("~/.local/bin/seat-usage"), *args],
+                              capture_output=True, text=True, timeout=45)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return None
+        rows = json.loads(proc.stdout)
+    except Exception:
+        return None
+    if not isinstance(rows, list) or not rows:
+        return None
+    return rows
+
+
+def _pstack_text(model, role):
+    """One advisory line for a launch that names a model, or None.
+
+    An unrouted model and any failure print nothing.
+    """
+    rows = _seat_usage(["--route", "pstack", "--model", model, "--role", role, "--json"])
+    if not rows:
+        return None
+    row = rows[0]
+    if not isinstance(row, dict) or row.get("role") != "pstack" or row.get("pool") == "unrouted":
+        return None
+    return format_pstack(row)
+
+
 def _emit(data):
     if os.environ.get("COUNCIL_VOTER") == "1":
         return
     tool = data.get("tool_name")
     role = None
+    model = None
     if tool == "Agent":
         role = ""
     elif tool == "Bash":
@@ -256,19 +313,22 @@ def _emit(data):
         role = command_role(command)
         if role is None:
             return
+        model = command_model(command)
     else:
         return
-    cmd = [os.path.expanduser("~/.local/bin/seat-usage"), "--route"]
+    args = ["--route"]
     if role:
-        cmd.append(role)
-    cmd.append("--json")
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
-    if proc.returncode != 0 or not proc.stdout.strip():
+        args.append(role)
+    args.append("--json")
+    rows = _seat_usage(args) or []
+    lines = [format_route(r) for r in rows]
+    if model:
+        extra = _pstack_text(model, role)
+        if extra:
+            lines.append(extra)
+    if not lines:
         return
-    rows = json.loads(proc.stdout)
-    if not isinstance(rows, list) or not rows:
-        return
-    text = "\n".join(format_route(r) for r in rows)
+    text = "\n".join(lines)
     out = {"hookEventName": "PreToolUse", "additionalContext": text}
     if tool == "Agent":
         reason = agent_deny_reason(data.get("tool_input"), rows)
