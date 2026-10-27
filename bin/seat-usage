@@ -2579,10 +2579,15 @@ load_config()
 # pace still votes, at low. A capped Muse window drops it. An unknown
 # reading asks, except design and mixed, which skip it and ask only when
 # fewer than two vendors remain.
+# The Grok voter runs on cursor-agent, on Cursor Models. Conclave launches
+# grok-N-xhigh-fast (the id's N is resolved at launch), so the slug here is
+# fast. The seat stays "grok": it is the voter's identity in Conclave's lineup
+# parser and in --record-failure, not the pool that pays for it.
+GROK_VOTER_SLUG = "grok-xhigh-fast"
 VOTER_ROSTER = (
     {"family": "fable", "seat": "claude", "pools": ("fable", "claude_week", "claude_5h")},
     {"family": "astra", "seat": "chatgpt", "pools": ("codex",)},
-    {"family": "grok", "seat": "grok", "pools": ("grok",)},
+    {"family": "grok", "seat": "grok", "pools": ("cursor_models",), "slug": GROK_VOTER_SLUG},
     {"family": "wonder-full", "seat": "muse", "pools": ("muse_week", "muse_5h")},
 )
 # lineup, host, and ask are not in ROLES: `--route` with no role stays the four
@@ -2997,9 +3002,13 @@ def _voter_effort(pool_id, s, now, states):
     return effort, "default", "voter effort high"
 
 
-def _voter(family, seat, pool_id, s, now, effort, mode, reason):
+def _slug_variant(slug):
+    return "fast" if isinstance(slug, str) and slug.endswith("-fast") else "-"
+
+
+def _voter(family, seat, pool_id, s, now, effort, mode, reason, slug=None):
     return {"role": "voter", "seat": seat, "family": family, "vendor": FAMILY_VENDOR[family],
-            "effort": effort, "variant": "-", "mode": mode, "reason": reason,
+            "effort": effort, "variant": _slug_variant(slug), "mode": mode, "reason": reason,
             "reading_age_s": _reading_age(pool_id, s, now)}
 
 
@@ -3154,15 +3163,21 @@ def _muse_voter(states, s, now, skip_ahead=True):
     return "row", _voter("wonder-full", "muse", "muse_week", s, now, effort, mode, reason)
 
 
-def _other_voter(family, pool_id, states, s, now, skip_ahead=False):
+def _other_voter(family, pool_id, states, s, now, skip_ahead=False, seat=None, slug=None):
     state, why = states[pool_id]
     if state == "unknown":
         return "ask", _unknown_text(_FAMILY_NAME.get(family, family), why)
     if state == "capped" or (skip_ahead and state == "ahead"):
         return "skip", None
     effort, mode, reason = _voter_effort(pool_id, s, now, states)
-    seat = POOLS[pool_id]["seat"]
-    return "row", _voter(family, seat, pool_id, s, now, effort, mode, reason)
+    seat = seat or POOLS[pool_id]["seat"]
+    return "row", _voter(family, seat, pool_id, s, now, effort, mode, reason, slug)
+
+
+def _grok_voter(states, s, now, skip_ahead=False):
+    """The Grok voter, paced and capped by Cursor Models: it runs on cursor-agent."""
+    return _other_voter("grok", "cursor_models", states, s, now, skip_ahead,
+                        seat="grok", slug=GROK_VOTER_SLUG)
 
 
 def _lineup_mode(chair, builder, voters, weaker):
@@ -3193,7 +3208,7 @@ def _collect_voters(states, s, now, excluded_vendor, skipped=None):
         if spec["family"] == "fable":
             status, payload = _fable_voter(states, s, now, required)
         elif spec["family"] == "grok":
-            status, payload = _other_voter("grok", "grok", states, s, now)
+            status, payload = _grok_voter(states, s, now)
         elif spec["family"] == "wonder-full":
             status, payload = _muse_voter(states, s, now, skip_ahead=False)
         else:
@@ -3302,7 +3317,8 @@ def _emit_lineup(s, now, states, chair_row, builder_row, voters, rule):
 REVIEW_ROSTER = (
     {"family": "fable", "seat": "claude", "vendor": "anthropic", "model": "fable", "pick": "fable"},
     {"family": "astra", "seat": "chatgpt", "vendor": "openai", "model": "gpt-6-astra", "pick": "pool", "pool": "codex"},
-    {"family": "grok", "seat": "grok", "vendor": "xai", "model": "grok", "pick": "pool", "pool": "grok"},
+    {"family": "grok", "seat": "grok", "vendor": "xai", "model": "grok", "slug": GROK_VOTER_SLUG,
+     "pick": "pool", "pool": "cursor_models"},
     {"family": "argon", "seat": "google", "vendor": "google", "model": "gemini-4-argon-high", "pick": "argon"},
     {"family": "wonder", "seat": "muse", "vendor": "meta", "model": "wonder", "pick": "muse",
      "contributor_mode": "off"},
@@ -3430,7 +3446,7 @@ def _review_unknown_code(why):
     return "unknown"
 
 
-def _review_seat_block(seat, s, failures):
+def _review_seat_block(seat, s, failures, read_seat=None):
     """(code, human) when this seat must not be seated, else None.
 
     A read_state failure code wins over a recent failure. `fresh` and a missing
@@ -3438,9 +3454,9 @@ def _review_seat_block(seat, s, failures):
     failed_recently:<reason>. --exclude-seat with no record is nonzero.
     """
     state = s.get("read_state") if isinstance(s.get("read_state"), dict) else {}
-    code = state.get(seat)
+    code = state.get(read_seat or seat)
     if code in ("token_expired", "rate_limited", "usage_failed"):
-        return f"read_state:{code}", f"{seat} read_state {code}"
+        return f"read_state:{code}", f"{read_seat or seat} read_state {code}"
     reason = failures.get(seat)
     if reason == "credits":
         return "no_credits", f"{seat} out of credits"
@@ -3587,9 +3603,9 @@ def _review_row(spec, metrics, s, now, states, pool_id):
         reason = f"voter effort {effort}"
         age = metrics.get("reading_age_s")
     row = {"role": "voter", "seat": spec["seat"], "family": spec["family"], "vendor": spec["vendor"],
-           "model": spec["model"], "effort": effort, "variant": "-", "mode": mode, "reason": reason,
-           "reading_age_s": age, "pace": metrics["pace"], "headroom": metrics["headroom"],
-           "used_pct": metrics["used_pct"], "pool": metrics.get("pool")}
+           "model": spec["model"], "effort": effort, "variant": _slug_variant(spec.get("slug")),
+           "mode": mode, "reason": reason, "reading_age_s": age, "pace": metrics["pace"],
+           "headroom": metrics["headroom"], "used_pct": metrics["used_pct"], "pool": metrics.get("pool")}
     if spec.get("contributor_mode"):
         row["contributor_mode"] = spec["contributor_mode"]
     if spec["family"] == "fable" and spec["seat"] != "claude":
@@ -3734,7 +3750,7 @@ def _review_candidates(states, s, now, excluded_vendor, runner=None):
                 continue
             pool_id = "muse_week"
         else:
-            block = _review_seat_block(spec["seat"], s, failures)
+            block = _review_seat_block(spec["seat"], s, failures, POOLS[spec["pool"]]["seat"])
             if block:
                 skipped.append(_review_skip(spec, block[1], block[0]))
                 continue
@@ -3988,11 +4004,10 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
             if status == "ask":
                 pid, why = _fable_unknown_pool(states, s)
         elif family == "grok":
-            status, payload = _other_voter("grok", "grok", states, s, now)
+            pid = "cursor_models"
+            status, payload = _grok_voter(states, s, now)
             if status == "ask":
-                pid, why = "grok", states["grok"][1]
-            elif status == "skip":
-                pid = "grok"
+                why = states[pid][1]
         elif family == "wonder-full":
             status, payload = _muse_voter(states, s, now, skip_ahead=False)
             if status == "ask":
@@ -4009,7 +4024,7 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
             continue
         if status == "row":
             seat = payload.get("seat") or spec["seat"]
-            block = _read_state_block(seat, s)
+            block = _read_state_block(POOLS[pid]["seat"] if family == "grok" else seat, s)
             if block:
                 skipped.append(_mixed_skip(family, seat, block[1], block[0]))
                 continue
@@ -4018,6 +4033,8 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
         if status == "ask":
             seat = POOLS[pid]["seat"] if pid in POOLS else spec["seat"]
             block = _read_state_block(seat, s)
+            if family == "grok":
+                seat = spec["seat"]
             if block:
                 skipped.append(_mixed_skip(family, seat, block[1], block[0]))
                 continue
@@ -4030,7 +4047,7 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
             skipped.append(_mixed_skip(family, seat, reason, code))
             continue
         if status == "skip":
-            seat = POOLS[pid]["seat"] if pid in POOLS else spec["seat"]
+            seat = spec["seat"] if family == "grok" else POOLS[pid]["seat"] if pid in POOLS else spec["seat"]
             label = _ask_label(pid, s) if pid in POOLS else family
             why_c = states[pid][1] if pid in states else None
             skipped.append(_mixed_skip(family, seat, _capped_skip_text(label, why_c), "capped"))
@@ -4362,8 +4379,8 @@ def _ask_one(spec, states, s, now):
             return None
         pool = "fable" if payload["seat"] == "claude" else "cursor_other"
     elif family == "grok":
-        status, payload = _other_voter("grok", "grok", states, s, now, skip_ahead=False)
-        pool = "grok"
+        status, payload = _grok_voter(states, s, now)
+        pool = "cursor_models"
     elif family == "wonder-full":
         status, payload = _muse_voter(states, s, now, skip_ahead=True)
         pool = "muse_week"
