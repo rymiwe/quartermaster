@@ -4370,7 +4370,7 @@ def _ask_one(spec, states, s, now):
 
     Unknown and capped families are left out. The route still returns the
     others. Muse is left out when either window is over pace. Grok is not:
-    an ahead Grok pool ranks lower and can still answer a question.
+    an ahead Cursor Models pool ranks it lower and it can still answer a question.
     """
     family = spec["family"]
     if family == "fable":
