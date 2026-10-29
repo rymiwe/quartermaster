@@ -590,6 +590,72 @@ def f6_older_fresh_as_of_keeps_base():
 
 
 @test
+def chatgpt_live_read_stamps_as_of_and_a_failed_one_is_not_shown_live():
+    # BLD, 2026-10-29: the line read "plus (live)" while as_of.chatgpt stayed hours old.
+    # A failed live call fell back to an older local rollout, the merge kept the
+    # newer cached reading and its old "(live)" line, and recorded no failure.
+    import urllib.error
+    saved = (su.SUMMARY, su.HISTORY, su.H, su.get)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            su.H, su.HISTORY = d, os.path.join(d, "history.jsonl")
+            os.makedirs(f"{d}/.codex/sessions/2026/10/29")
+            with open(f"{d}/.codex/auth.json", "w") as f:
+                json.dump({"tokens": {"access_token": "fixture-access", "account_id": "acct"}}, f)
+            roll = f"{d}/.codex/sessions/2026/10/29/rollout.jsonl"
+            with open(roll, "w") as f:
+                f.write(json.dumps({"payload": {"rate_limits": {
+                    "limit_id": "codex", "plan_type": "plus",
+                    "primary": {"used_percent": 9, "resets_at": su.NOW + 3600, "window_minutes": 300},
+                    "secondary": {"used_percent": 11, "resets_at": su.NOW + 3 * 86400, "window_minutes": 10080},
+                }}}, separators=(",", ":")) + "\n")
+            os.utime(roll, (su.NOW - 6 * 3600, su.NOW - 6 * 3600))
+            cached_at = su.NOW - 3.5 * 3600
+            base = {"v": 1, "ts": cached_at, "as_of": {"chatgpt": cached_at}, "codex": 13,
+                    "lines": ["chatgpt  | plus (live) | weekly 13%: on pace, resets in 2.0d"]}
+
+            def live(url, hdr, timeout=8):
+                if "wham/usage" in url:
+                    return {"plan_type": "plus", "rate_limit": {
+                        "primary_window": {"used_percent": 0, "reset_at": su.NOW + 4 * 3600,
+                                           "limit_window_seconds": 18000},
+                        "secondary_window": {"used_percent": 14, "reset_at": su.NOW + 3 * 86400,
+                                             "limit_window_seconds": 604800}}}
+                raise urllib.error.HTTPError(url, 404, "not found", None, None)
+
+            def expired(url, hdr, timeout=8):
+                raise urllib.error.HTTPError(url, 401, "Unauthorized", None, None)
+
+            def read(getter):
+                su.get = getter
+                su.SUMMARY = {"ts": su.NOW, "as_of": {}, "v": 1}
+                lines = su.codex()
+                fresh = dict(su.SUMMARY, lines=lines)
+                return su.merge_summary(base, fresh, ["chatgpt"], now=su.NOW)
+
+            ok = read(live)
+            assert ok["as_of"]["chatgpt"] == su.NOW and ok["codex"] == 14, (ok["as_of"], ok.get("codex"))
+            assert ok.get("read_state", {}).get("chatgpt") == "fresh", ok.get("read_state")
+            line = [ln for ln in ok["lines"] if ln.startswith("chatgpt")]
+            assert len(line) == 1 and "plus (live)" in line[0] and "14%" in line[0], line
+            assert "chatgpt" not in ok.get("errors", {}), ok.get("errors")
+
+            bad = read(expired)
+            assert bad["as_of"]["chatgpt"] == cached_at and bad["codex"] == 13, (bad["as_of"], bad.get("codex"))
+            assert bad.get("read_state", {}).get("chatgpt") == "token_expired", bad.get("read_state")
+            line = [ln for ln in bad["lines"] if ln.startswith("chatgpt")]
+            assert len(line) == 1 and "(live)" not in line[0], line
+            assert "live call failed: HTTPError 401" in line[0] and "3.5h old" in line[0], line
+            assert "HTTPError 401" in bad.get("errors", {}).get("chatgpt", ""), bad.get("errors")
+            # The route then says why Astra sits out, instead of trusting the kept numbers.
+            row = su.route_lineup(dict(snap(), read_state={"chatgpt": "token_expired"}), NOW, kind="design")
+            astra = next(i for i in row["skipped"] if i["family"] == "astra")
+            assert astra["code"] == "read_state:token_expired", astra
+    finally:
+        su.SUMMARY, su.HISTORY, su.H, su.get = saved
+
+
+@test
 def failed_reread_keeps_numbers_and_takes_the_new_read_state():
     until = NOW + 600
     base = {
