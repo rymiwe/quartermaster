@@ -647,6 +647,20 @@ def chatgpt_live_read_stamps_as_of_and_a_failed_one_is_not_shown_live():
             assert len(line) == 1 and "(live)" not in line[0], line
             assert "live call failed: HTTPError 401" in line[0] and "3.5h old" in line[0], line
             assert "HTTPError 401" in bad.get("errors", {}).get("chatgpt", ""), bad.get("errors")
+            # The next failed run keeps one note, with the new age.
+            su.NOW += 1800
+            try:
+                base = bad
+                again = read(expired)
+            finally:
+                su.NOW -= 1800
+            line = [ln for ln in again["lines"] if ln.startswith("chatgpt")]
+            assert len(line) == 1 and line[0].count("cached reading") == 1 and "4.0h old" in line[0], line
+            assert "(live)" not in line[0] and again["as_of"]["chatgpt"] == cached_at, line
+            # A kept line with no "(live)" tag gets the note once, also on a repeat.
+            plain = su._kept_lines(["chatgpt  | plain"], cached_at, su.NOW, "live call failed: X")
+            twice = su._kept_lines(plain, cached_at, su.NOW + 3600, "live call failed: X")
+            assert twice == ["chatgpt  | plain | cached reading 4.5h old; this run's live call failed: X"], twice
             # The route then says why Astra sits out, instead of trusting the kept numbers.
             row = su.route_lineup(dict(snap(), read_state={"chatgpt": "token_expired"}), NOW, kind="design")
             astra = next(i for i in row["skipped"] if i["family"] == "astra")

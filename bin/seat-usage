@@ -2307,7 +2307,10 @@ def _kept_lines(lines, stamp, now, why):
     """A kept cached reading after this run's read failed: say how old it is, never "live"."""
     age = f"{max(0.0, (now - stamp) / 3600):.1f}h old" if _is_number(stamp) else "age unknown"
     note = f"cached reading {age}; this run's {why}"
-    return [ln.replace("(live)", f"({note})", 1) if "(live)" in ln else f"{ln} | {note}" for ln in lines]
+    # A second failed read in a row rewrites the earlier note instead of adding one.
+    tag = re.compile(r"\((?:live|cached reading [^)]*)\)")
+    return [tag.sub(f"({note})", ln, count=1) if tag.search(ln)
+            else re.sub(r" \| cached reading .*$", "", ln) + f" | {note}" for ln in lines]
 
 def merge_summary(base, fresh, seats, now=None):
     """Replace seats that succeeded in fresh; drop as_of on a failed reread and keep old numbers."""
