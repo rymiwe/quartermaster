@@ -3567,6 +3567,46 @@ def _review_seat_block(seat, s, failures, read_seat=None):
     return None
 
 
+def _review_fable_block(s, failures):
+    """(seat, (code, human)) for claude, else cursor. None when neither is blocked."""
+    for seat in ("claude", "cursor"):
+        block = _review_seat_block(seat, s, failures)
+        if block:
+            return seat, block
+    return None
+
+
+def _review_fable_open(states, s, now, failures):
+    """Best frontier seat that is not blocked and has room. None when there is none."""
+    absent = _fable_slice_absent(states, s)
+    ready, _unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
+
+    def key(pid):
+        used = s.get(POOLS[pid]["used"])
+        if not _is_number(used):
+            used = 101
+        return (_PACE_ORDER.get(states[pid][0], 9), used)
+
+    for pid in sorted(ready, key=key):
+        alt = POOLS[pid]["seat"]
+        if _review_seat_block(alt, s, failures):
+            continue
+        effort, mode, reason = _voter_effort(pid, s, now, states)
+        return _voter("fable", alt, pid, s, now, effort, mode, reason)
+    return None
+
+
+def _review_fable_unblocked(payload, states, s, now, failures):
+    """The Fable row, or another frontier seat that is not blocked. None when all are."""
+    seat = payload.get("seat") or "claude"
+    if not _review_seat_block(seat, s, failures):
+        return payload
+    opened = _review_fable_open(states, s, now, failures)
+    if opened and opened.get("seat") == seat:
+        return None
+    return opened
+
+
 def _review_model_barred(model):
     """Spark models and Muse contributor mode are never review candidates."""
     text = (model or "").casefold()
@@ -3668,10 +3708,36 @@ def _review_row(spec, metrics, s, now, states, pool_id):
            "headroom": metrics["headroom"], "used_pct": metrics["used_pct"], "pool": metrics.get("pool")}
     if spec.get("contributor_mode"):
         row["contributor_mode"] = spec["contributor_mode"]
+    if spec["family"] == "fable" and spec["seat"] != "claude":
+        row["seat"] = spec["seat"]
     return row
 
 
-def _review_candidates(states, s, now, excluded_vendor, runner=None, exclude_vendors=frozenset()):
+# The merge gate's Anthropic row stays Fable, as before Opus took the council
+# voter seat: the gate reviewer is ranked against Fable on the Claude slice or
+# Cursor Other Models, not against the Opus pools.
+_GATE_FABLE_SPEC = {"family": "fable", "seat": "claude", "vendor": "anthropic", "model": "fable", "pick": "fable"}
+
+
+def _review_fable_spec(seat):
+    spec = dict(_GATE_FABLE_SPEC)
+    spec["seat"] = seat
+    return spec
+
+
+def _review_hold(spec, row, s, failures, eligible, skipped):
+    """Keep a ranked row, or skip it when its seat is blocked. The seat on the skip is the row's."""
+    block = _review_seat_block(row.get("seat"), s, failures)
+    if not block:
+        eligible.append(row)
+        return
+    shown = dict(spec)
+    shown["seat"] = row.get("seat")
+    skipped.append(_review_skip(shown, block[1], block[0]))
+
+
+def _review_candidates(states, s, now, excluded_vendor, runner=None, exclude_vendors=frozenset(),
+                       gate=False):
     """Eligible review seats, and every seat that was not eligible.
 
     exclude_vendors is --exclude-vendor. It drops a roster row by its
@@ -3686,10 +3752,14 @@ def _review_candidates(states, s, now, excluded_vendor, runner=None, exclude_ven
     _anthropic_voter, as on design: Fable on the Claude slice, else Opus at
     high on the first opus_order pool that is open and whose seat is not
     blocked. Every Opus pool exhausted is one skip that names them all.
+    gate=True is the merge gate (route_review). Its Anthropic row is
+    _GATE_FABLE_SPEC on the Fable frontier, unchanged from before Opus.
     """
     eligible, skipped = [], []
     failures = load_recent_failures(now)
     for index, spec in enumerate(REVIEW_ROSTER):
+        if gate and spec["pick"] == "opus":
+            spec = _GATE_FABLE_SPEC
         if _review_model_barred(spec.get("model")):
             skipped.append(_review_skip(spec, "spark and contributor models are excluded", "barred_model"))
             continue
@@ -3704,6 +3774,64 @@ def _review_candidates(states, s, now, excluded_vendor, runner=None, exclude_ven
                                         "excluded_vendor"))
             continue
         pick = spec["pick"]
+        if pick == "fable":
+            status, payload = _fable_voter(states, s, now, False)
+            opened = None
+            if status == "row":
+                opened = _review_fable_unblocked(payload, states, s, now, failures)
+            elif _review_fable_block(s, failures):
+                # An ask or a full window must not hide a block, and must not
+                # skip the other frontier seat when that seat is open.
+                opened = _review_fable_open(states, s, now, failures)
+            if opened is None:
+                blocked = _review_fable_block(s, failures)
+                if blocked and status != "row":
+                    seat, block = blocked
+                    shown = dict(spec)
+                    shown["seat"] = seat
+                    skipped.append(_review_skip(shown, block[1], block[0]))
+                    continue
+                if status == "ask":
+                    text = payload if isinstance(payload, str) else "Fable unavailable"
+                    code = "stale" if ("reading " in text and " old" in text) else "unknown"
+                    skipped.append(_review_skip(spec, text, code))
+                    continue
+                if status == "downgrade":
+                    why = payload.get("reason") or "no frontier pool with room"
+                    code = "capped" if "capped" in why or "full" in why else "unknown"
+                    skipped.append(_review_skip(spec, why, code))
+                    continue
+                if status == "row":
+                    seat = payload.get("seat") or "claude"
+                    block = _review_seat_block(seat, s, failures) or ("unknown", "Fable unavailable")
+                    shown = dict(spec)
+                    shown["seat"] = seat
+                    skipped.append(_review_skip(shown, block[1], block[0]))
+                    continue
+                skipped.append(_review_skip(spec, "Fable unavailable", "unknown"))
+                continue
+            payload = opened
+            seat = payload.get("seat") or "claude"
+            pool_id = "cursor_other" if seat == "cursor" else "fable"
+            pace = states[pool_id][0]
+            if pace in ("unknown", "capped"):
+                why = states[pool_id][1]
+                label = "Fable" if pool_id == "fable" else POOLS[pool_id]["label"]
+                if pace == "unknown":
+                    skipped.append(_review_skip(spec, _unknown_text(label, why), _review_unknown_code(why)))
+                else:
+                    skipped.append(_review_skip(spec, f"{label} capped", "capped"))
+                continue
+            used = s.get(POOLS[pool_id]["used"])
+            metrics = _review_metrics(pool_id, pace, used, states, s, now)
+            seated = _review_fable_spec(seat)
+            row = _review_row(seated, metrics, s, now, states, pool_id)
+            row["effort"] = payload.get("effort") or row["effort"]
+            row["mode"] = payload.get("mode") or row["mode"]
+            row["reason"] = payload.get("reason") or row["reason"]
+            row["_index"] = index
+            _review_hold(seated, row, s, failures, eligible, skipped)
+            continue
         if pick == "opus":
             status, payload = _anthropic_voter(
                 states, s, now, lambda seat: _review_seat_block(seat, s, failures))
@@ -3805,7 +3933,8 @@ def _review_why(chosen):
     return "ranked by pace then headroom: " + "; ".join(parts)
 
 
-def _pick_review_seats(states, s, now, excluded_vendor, need, runner=None, exclude_vendors=frozenset()):
+def _pick_review_seats(states, s, now, excluded_vendor, need, runner=None, exclude_vendors=frozenset(),
+                       gate=False):
     """The best `need` seats on distinct vendors. Ask when fewer are eligible.
 
     Rank is the design pace order (under, open, on, ahead, then near_cap),
@@ -3813,7 +3942,7 @@ def _pick_review_seats(states, s, now, excluded_vendor, need, runner=None, exclu
     headroom table the scorer uses. A seat that loses the rank is listed as
     skipped with that reason. The pick log is not read here.
     """
-    eligible, skipped = _review_candidates(states, s, now, excluded_vendor, runner, exclude_vendors)
+    eligible, skipped = _review_candidates(states, s, now, excluded_vendor, runner, exclude_vendors, gate)
     ranked = sorted(eligible, key=_review_rank_key)
     chosen = []
     seen = set()
@@ -3867,7 +3996,7 @@ def route_review(s, now, builder_vendor, runner=None, exclude_vendors=()):
             asked["runner"] = runner
         return asked
     status, why, chosen, skipped = _pick_review_seats(states, s, now, vendor, 1, runner,
-                                                      frozenset(exclude_vendors))
+                                                      frozenset(exclude_vendors), gate=True)
     ages = [row.get("reading_age_s") for row in chosen]
     ages.extend(row.get("reading_age_s") for row in skipped if isinstance(row.get("reading_age_s"), (int, float)))
     known = [age for age in ages if isinstance(age, (int, float)) and not isinstance(age, bool)]
@@ -4382,15 +4511,17 @@ def _ask_one(spec, states, s, now):
     """One seatable ask voter and the pool whose pace ranks it, or None.
 
     Unknown and capped families are left out. The route still returns the
-    others. Muse is left out when either window is over pace. Grok is not:
+    others. The Anthropic row is _anthropic_voter (Opus in opus_order), not Fable. Muse is left out when either window is over pace. Grok is not:
     an ahead Cursor Models pool ranks it lower and it can still answer a question.
     """
     family = spec["family"]
     if family == "fable":
-        status, payload = _fable_voter(states, s, now, required=False)
-        if status != "row" or payload.get("downgraded"):
+        # The Anthropic ask voter is the council's: Opus at high on the first
+        # open opus_order pool. Every Opus pool exhausted leaves it out.
+        status, payload = _anthropic_voter(states, s, now)
+        if status != "row":
             return None
-        pool = "fable" if payload["seat"] == "claude" else "cursor_other"
+        pool = payload["pool"]
     elif family == "grok":
         status, payload = _grok_voter(states, s, now)
         pool = "cursor_models"

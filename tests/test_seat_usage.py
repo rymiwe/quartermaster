@@ -2232,10 +2232,10 @@ def opus_voter_all_exhausted_fails_loud_and_never_seats_fable():
     assert "opus" not in _voter_families(design) and "fable" not in _voter_families(design), design
     skip = next(item for item in design["skipped"] if item["family"] == "opus")
     assert skip["code"] == "capped" and skip["reason"] == want and skip["vendor"] == "anthropic", skip
+    # The merge gate does not use Opus pools, so it never seats Opus.
     gate = su.route_review(capped, NOW, "xai")
-    assert all(r["family"] not in ("opus", "fable") for r in gate["reviewers"]), gate
-    skip = next(item for item in gate["skipped"] if item["family"] == "opus")
-    assert skip["code"] == "capped" and skip["reason"] == want, skip
+    assert all(r["family"] != "opus" for r in gate["reviewers"]), gate
+    assert all(item["family"] != "opus" for item in gate["skipped"]), gate
     blocked = snap(google_claudegpt_week=100, claude_week=100, read_state={"cursor": "token_expired"})
     design = su.route_lineup(blocked, NOW, kind="design")
     skip = next(item for item in design["skipped"] if item["family"] == "opus")
@@ -3045,15 +3045,21 @@ def route_ask_picks_two_vendors_by_headroom():
     r = su.route_ask(snap(cursor_auto_pct=10), NOW)
     assert r["role"] == "ask" and r["mode"] == "default", r
     assert [(v["family"], v["effort"], v["vendor"]) for v in r["voters"]] == [
-        ("fable", "high", "anthropic"),
+        ("opus", "high", "anthropic"),
         ("astra", "high", "openai"),
     ], r
-    assert [v["family"] for v in r["candidates"]] == ["fable", "astra", "grok", "wonder-full"], r
+    assert [v["family"] for v in r["candidates"]] == ["opus", "astra", "grok", "wonder-full"], r
+    opus = r["voters"][0]
+    assert (opus["pool"], opus["model"]) == ("google_opus_week", "claude-opus-5-5-high"), opus
+    assert opus["runner"] == ["agy", "--model", "claude-opus-5-5-high"], opus
+    native = su.route_ask(snap(cursor_auto_pct=10, google_claudegpt_week=100), NOW)
+    assert next(v for v in native["candidates"] if v["family"] == "opus")["pool"] == "claude_week", native
     # Grok stays a candidate. Ask mode does not drop the chair's vendor.
     assert any(v["family"] == "grok" for v in r["candidates"]), r
     full = su.route_ask(snap(fable=100, claude_week=100, claude_5h=100, cursor_api_pct=100, codex=100,
-                          cursor_auto_pct=10), NOW)
+                          google_claudegpt_week=100, cursor_auto_pct=10), NOW)
     assert [v["family"] for v in full["voters"]] == ["grok", "wonder-full"], full
+    assert not {"opus", "fable"} & {v["family"] for v in full["candidates"]}, full
     assert len({v["vendor"] for v in full["voters"]}) == 2, full
     over = su.route_ask(snap(muse_week=90), NOW)
     assert "wonder-full" not in [v["family"] for v in over["candidates"]], over
@@ -4742,9 +4748,12 @@ def exclude_vendor_anthropic_drops_fable_and_opus_on_every_pool():
     assert {"fable", "claude_week", "cursor_other", "google_opus_week"} <= anthropic_pools, anthropic_pools
     for name, s in _exv_opus_fixtures().items():
         for route, row in _exv_routes(s, "xai").items():
-            seated = [v for v in _exv_rows(row) if v["family"] == "opus"]
-            assert seated and seated[0]["pool"] == name, (name, route, _exv_rows(row))
-            assert all(v["family"] != "fable" for v in _exv_rows(row)), (name, route)
+            # The merge gate ("review") keeps its Fable ranking and never seats Opus.
+            family = "fable" if route == "review" else "opus"
+            assert all(v["family"] != ("opus" if family == "fable" else "fable") for v in _exv_rows(row)), (name, route)
+            if family == "opus":
+                seated = [v for v in _exv_rows(row) if v["family"] == "opus"]
+                assert seated and seated[0]["pool"] == name, (name, route, _exv_rows(row))
         for builder, kw in (("xai", {"exclude_vendors": ("anthropic",)}), ("anthropic", {})):
             for route, row in _exv_routes(s, builder, **kw).items():
                 assert row["mode"] != "ask", (name, route, row["reason"])
@@ -4755,7 +4764,8 @@ def exclude_vendor_anthropic_drops_fable_and_opus_on_every_pool():
                 for v in _exv_rows(row):
                     assert v["family"] not in ("fable", "opus"), (name, route, v)
                     assert v.get("pool") not in anthropic_pools, (name, route, v)
-                opus = next(i for i in row["skipped"] if i["family"] == "opus")
+                family = "fable" if route == "review" else "opus"
+                opus = next(i for i in row["skipped"] if i["family"] == family)
                 code = "excluded_vendor" if kw else "builder_vendor"
                 assert opus["code"] == code, (name, builder, route, opus)
                 assert "anthropic" in opus["reason"], (name, route, opus)
@@ -4860,6 +4870,19 @@ def exclude_vendor_review_rule_names_every_excluded_vendor():
 
 
 @test
+def merge_gate_for_xai_builder_ranks_as_before_and_skips_opus_pools():
+    # Open Opus pools change council voters, not the merge gate's pick.
+    busy = dict(fable=60, claude_week=60, claude_5h=60, cursor_api_pct=60, codex=60,
+                cursor_auto_pct=60, grok_pct=60, muse_week=60, muse_5h=60)
+    for s in (_argon(snap(**busy), 20), _argon(snap(google_claudegpt_week=0, **busy), 20)):
+        gate = su.route_review(s, NOW, "xai")
+        assert gate["reviewers"][0]["family"] == "argon", gate
+        assert gate["runner"][:2] == ["agy", "--model"] and "claude-opus" not in " ".join(gate["runner"]), gate
+        assert all(r["family"] != "opus" for r in gate["reviewers"]), gate
+        assert all(item["family"] != "opus" for item in gate["skipped"]), gate
+
+
+@test
 def review_capped_argon_falls_through():
     s = _argon(snap(), 100)
     row = su.route_review(s, NOW, "anthropic")
@@ -4872,11 +4895,10 @@ def review_capped_argon_falls_through():
     assert argon["code"] == "capped", argon
     other = su.route_review(s, NOW, "xai")
     seated = other["reviewers"][0]
-    assert seated["family"] == "opus" and seated["pool"] == "google_opus_week", seated
-    assert seated["model"] == "claude-opus-5-5-high" and seated["effort"] == "high", seated
-    assert seated["runner"] == ["agy", "--model", "claude-opus-5-5-high"], seated
-    assert other["runner"] == seated["runner"], other
-    assert "runner: agy --model claude-opus-5-5-high" in su.format_review(other)
+    # The merge gate keeps its Fable ranking. Opus pools seat council voters only.
+    assert seated["family"] == "fable", seated
+    assert seated["runner"] == ["cursor-agent", "--model", "fable"], seated
+    assert "runner: cursor-agent --model fable" in su.format_review(other)
 
 
 @test
@@ -5140,7 +5162,7 @@ def review_exclusions_are_coded_and_argon_leads_when_healthy():
     # The one-reviewer route shares the exclusion codes and still seats one.
     gate = su.route_review(fresh, NOW, "anthropic")
     assert len(gate["reviewers"]) == 1 and gate["reviewers"][0]["family"] == "argon", gate
-    assert _codes(gate["skipped"])["opus"] == "builder_vendor"
+    assert _codes(gate["skipped"])["fable"] == "builder_vendor"
     # A 365m Muse reading is an exclusion with code stale, in text and json.
     stale = _argon(snap(), 10)
     stale["as_of"] = dict(stale["as_of"])
