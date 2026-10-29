@@ -316,6 +316,7 @@
       "effort_by_role": {"builder": "low", "chair": "high"},
       "burn_effort_by_role": {"builder": "high", "chair": "high"},
       "runner": {"cmd": ["agy", "--model", "Claude Opus 5.5"]},
+      "voter_runner": {"cmd": ["agy", "--model"], "slug": "claude-opus-5-5-{effort}"},
       "usage": {
         "used": "google_claudegpt_week",
         "reset": "google_claudegpt_week_reset_ts",

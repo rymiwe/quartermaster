@@ -1754,9 +1754,10 @@ def load_config(pools_path=None, priors_path=None):
         if raw.get("burn_effort"):
             meta["burn_effort"] = raw["burn_effort"]
         _copy_maps(raw, meta, "effort_by_role", "effort_by_pace", "burn_effort_by_role", "family_by_pace")
-        runner = _runner_record(raw.get("runner"))
-        if runner:
-            meta["runner"] = runner
+        for key in ("runner", "voter_runner"):
+            runner = _runner_record(raw.get(key))
+            if runner:
+                meta[key] = runner
         pools[pid] = meta
         if meta.get("lose_it"):
             burn.append((meta["seat"], meta.get("burn") or meta["label"], meta["used"], meta["reset"], window))
@@ -2855,9 +2856,8 @@ def _opus_members(owner):
     return [owner] + [gate for gate in (POOLS[owner].get("blocked_by") or ()) if gate in POOLS]
 
 
-# Opus headroom bands, best first. Under, on, and open all have room, so they
-# tie and opus_order decides; a 5h gate that reads "on" early in its window
-# must not hand the pick to a pool with no gate.
+# Opus pace bands. They only pick which member of a group names its state;
+# the pick itself is opus_order, first open pool wins.
 _OPUS_BANDS = {"under": 0, "on": 0, "open": 0, "ahead": 1, "near_cap": 2}
 
 
@@ -2878,28 +2878,31 @@ def _opus_group(owner, states):
     return state, pid, _OPUS_BANDS.get(state, 0)
 
 
-def _opus_pick(states):
-    """('pool', owner), ('ask', unknown pool ids), or ('capped', binding pool ids).
+def _opus_pick(states, blocked=None):
+    """('pool', owner), ('ask', unknown pool ids), or ('capped', exhausted pool ids).
 
-    Each pool in OPUS_ORDER (Google agy, Claude Code, Cursor Other Models) is
-    judged with its gates by _opus_group. The best headroom band wins and a
-    tie keeps OPUS_ORDER. Capped groups are skipped. Like _grok_pools, a known
-    uncapped group wins over an unknown one; with none, an unknown group asks.
-    Every group capped is ('capped', ...). Opus never falls back to another family.
+    OPUS_ORDER (Google agy, Claude Pro, Cursor Other Models) is a strict
+    order: the first pool whose group (_opus_group) is not capped, not
+    unknown, and whose seat is not blocked wins, at any pace. blocked is
+    a seat -> (code, human) or None check, for a login that is unavailable.
+    A known open pool later in the order wins over an unknown one; with
+    none, an unknown group asks. Every group capped or blocked is
+    ('capped', ...): the capped binding pool, or the blocked owner.
+    Opus never falls back to another family.
     """
-    best, best_band, unknown, capped = None, None, [], []
+    unknown, capped = [], []
     for owner in OPUS_ORDER:
-        state, pid, band = _opus_group(owner, states)
+        state, pid, _band = _opus_group(owner, states)
         if state == "capped":
             capped.append(pid)
             continue
         if state == "unknown":
             unknown.extend(p for p in _opus_members(owner) if states[p][0] == "unknown")
             continue
-        if best is None or band < best_band:
-            best, best_band = owner, band
-    if best is not None:
-        return "pool", best
+        if blocked is not None and blocked(POOLS[owner]["seat"]):
+            capped.append(owner)
+            continue
+        return "pool", owner
     if unknown:
         return "ask", unknown
     return "capped", capped
@@ -2936,9 +2939,8 @@ def _opus_row(role, s, now, states, prefix):
     """Opus on the Opus pool with the most headroom, or an ask row.
 
     The pick is _opus_pick: Google (agy), then Claude Code, then Cursor Other
-    Models, by the headroom of each pool and its gates, ties in that order. An
-    unknown group loses to a known uncapped one and asks when none is left. All
-    capped asks. There is no other-family fallback. Opus chair at high, Opus
+    Models, the first whose pool and gates are not capped. An unknown group
+    loses to a known uncapped one and asks when none is left. All capped asks. There is no other-family fallback. Opus chair at high, Opus
     builder at low, unless the chosen pool is burning or ahead. A prefix of None
     leaves the ask reason unprefixed.
     """
@@ -3172,6 +3174,59 @@ def _fable_voter(states, s, now, required):
     return "downgrade", {"family": "fable", "reason": _downgrade_prompt(states, s, now)}
 
 
+def _opus_exhausted(states, s, blocked):
+    """(reason, code) when no Opus pool can seat. code is capped, or the first block's code."""
+    parts, code = [], "capped"
+    for owner in OPUS_ORDER:
+        state, pid, _band = _opus_group(owner, states)
+        if state == "capped":
+            parts.append(f"{_ask_label(pid, s)} capped")
+            continue
+        block = blocked(POOLS[owner]["seat"]) if blocked is not None else None
+        if block:
+            parts.append(f"{_ask_label(owner, s)} {block[1]}")
+            if code == "capped":
+                code = block[0]
+    names = "; ".join(parts) or "none configured"
+    return f"all Opus pools exhausted ({names}): {_ASK}", code
+
+
+def _opus_voter_row(owner, s, now):
+    """Opus at high on one opus_order pool, with the argv that launches it.
+
+    The argv is the pool's voter_runner, else its runner, from pools.json.
+    model is the argv value after --model.
+    """
+    effort = "high"
+    meta = POOLS[owner]
+    argv = _expand_runner(meta.get("voter_runner") or meta.get("runner"), effort, False)
+    model = None
+    if argv and "--model" in argv[:-1]:
+        model = argv[argv.index("--model") + 1]
+    row = _voter("opus", meta["seat"], owner, s, now, effort, "default",
+                 f"Opus at {effort} on {_opus_where(owner, s)}")
+    row.update(pool=owner, model=model, runner=argv)
+    return row
+
+
+def _anthropic_voter(states, s, now, blocked=None):
+    """The council's Anthropic voter: Opus at high on the first open opus_order pool.
+
+    Not Fable: Conclave launches every Fable leg on cursor-agent (Cursor
+    Other Models), never the claude CLI, so a Fable seat here would bill
+    that pool. Opus walks opus_order (_opus_pick). blocked is a seat ->
+    (code, human) or None check for a login that is unavailable.
+    Returns ("row", voter), ("ask", (reason, pool id)), or
+    ("skip", (reason, code)) when every Opus pool is capped or blocked.
+    """
+    kind, found = _opus_pick(states, blocked)
+    if kind == "pool":
+        return "row", _opus_voter_row(found, s, now)
+    if kind == "ask":
+        return "ask", (_unknown_pools_reason(found, states, s), found[0])
+    return "skip", _opus_exhausted(states, s, blocked)
+
+
 def _muse_voter(states, s, now, skip_ahead=True):
     """Muse on the weekly pool, when neither window is capped.
 
@@ -3230,19 +3285,20 @@ def _collect_voters(states, s, now, excluded_vendor, skipped=None):
     """Voters outside one excluded vendor. None excludes nobody.
 
     One voter is a degraded lineup. An unknown reading the lineup depends on
-    asks. Fable is required when the excluded vendor is xAI: a full 5h window
-    with no Other Models room asks and names the reopen. Families left out
-    are listed in skipped when a list is passed.
+    asks. The Anthropic voter is _anthropic_voter: Fable on the Claude slice,
+    else Opus at high in opus_order. Every Opus pool exhausted asks.
     """
     excluded = {excluded_vendor} if excluded_vendor else set()
-    required = excluded_vendor == "xai"
     voters = []
     downgrade = None
     for spec in VOTER_ROSTER:
         if FAMILY_VENDOR[spec["family"]] in excluded:
             continue
         if spec["family"] == "fable":
-            status, payload = _fable_voter(states, s, now, required)
+            status, payload = _anthropic_voter(states, s, now)
+            if status != "row":
+                # An unknown reading asks; every Opus pool exhausted fails loud.
+                return "ask", payload[0]
         elif spec["family"] == "grok":
             status, payload = _grok_voter(states, s, now)
         elif spec["family"] == "wonder-full":
@@ -3332,8 +3388,6 @@ def _emit_lineup(s, now, states, chair_row, builder_row, voters, rule):
         weaker = f"one voter ({names})"
     elif chair_row.get("family") != "grok":
         weaker = chair_row.get("reason")
-    elif any(v["family"] == "fable" and v["seat"] != "claude" for v in voters):
-        weaker = "Fable on Other Models"
     reason = rule if not weaker else f"{rule}; weaker: {weaker}"
     ages = [chair_row.get("reading_age_s"), builder_row.get("reading_age_s")]
     ages.extend(v.get("reading_age_s") for v in voters)
@@ -3355,7 +3409,7 @@ def _emit_lineup(s, now, states, chair_row, builder_row, voters, rule):
 # design's usage snapshot stays the same. Muse wonder is the weekly Muse
 # pool with contributor mode off. A spark id or a contributor id is barred.
 REVIEW_ROSTER = (
-    {"family": "fable", "seat": "claude", "vendor": "anthropic", "model": "fable", "pick": "fable"},
+    {"family": "opus", "seat": "claude", "vendor": "anthropic", "model": "opus", "pick": "opus"},
     {"family": "astra", "seat": "chatgpt", "vendor": "openai", "model": "gpt-6-astra", "pick": "pool", "pool": "codex"},
     {"family": "grok", "seat": "grok", "vendor": "xai", "model": "grok", "slug": GROK_VOTER_LABEL,
      "pick": "pool", "pool": "cursor_models"},
@@ -3513,46 +3567,6 @@ def _review_seat_block(seat, s, failures, read_seat=None):
     return None
 
 
-def _review_fable_block(s, failures):
-    """(seat, (code, human)) for claude, else cursor. None when neither is blocked."""
-    for seat in ("claude", "cursor"):
-        block = _review_seat_block(seat, s, failures)
-        if block:
-            return seat, block
-    return None
-
-
-def _review_fable_open(states, s, now, failures):
-    """Best frontier seat that is not blocked and has room. None when there is none."""
-    absent = _fable_slice_absent(states, s)
-    ready, _unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
-
-    def key(pid):
-        used = s.get(POOLS[pid]["used"])
-        if not _is_number(used):
-            used = 101
-        return (_PACE_ORDER.get(states[pid][0], 9), used)
-
-    for pid in sorted(ready, key=key):
-        alt = POOLS[pid]["seat"]
-        if _review_seat_block(alt, s, failures):
-            continue
-        effort, mode, reason = _voter_effort(pid, s, now, states)
-        return _voter("fable", alt, pid, s, now, effort, mode, reason)
-    return None
-
-
-def _review_fable_unblocked(payload, states, s, now, failures):
-    """The Fable row, or another frontier seat that is not blocked. None when all are."""
-    seat = payload.get("seat") or "claude"
-    if not _review_seat_block(seat, s, failures):
-        return payload
-    opened = _review_fable_open(states, s, now, failures)
-    if opened and opened.get("seat") == seat:
-        return None
-    return opened
-
-
 def _review_model_barred(model):
     """Spark models and Muse contributor mode are never review candidates."""
     text = (model or "").casefold()
@@ -3654,26 +3668,7 @@ def _review_row(spec, metrics, s, now, states, pool_id):
            "headroom": metrics["headroom"], "used_pct": metrics["used_pct"], "pool": metrics.get("pool")}
     if spec.get("contributor_mode"):
         row["contributor_mode"] = spec["contributor_mode"]
-    if spec["family"] == "fable" and spec["seat"] != "claude":
-        row["seat"] = spec["seat"]
     return row
-
-
-def _review_fable_spec(seat):
-    spec = dict(REVIEW_ROSTER[0])
-    spec["seat"] = seat
-    return spec
-
-
-def _review_hold(spec, row, s, failures, eligible, skipped):
-    """Keep a ranked row, or skip it when its seat is blocked. The seat on the skip is the row's."""
-    block = _review_seat_block(row.get("seat"), s, failures)
-    if not block:
-        eligible.append(row)
-        return
-    shown = dict(spec)
-    shown["seat"] = row.get("seat")
-    skipped.append(_review_skip(shown, block[1], block[0]))
 
 
 def _review_candidates(states, s, now, excluded_vendor, runner=None, exclude_vendors=frozenset()):
@@ -3681,16 +3676,16 @@ def _review_candidates(states, s, now, excluded_vendor, runner=None, exclude_ven
 
     exclude_vendors is --exclude-vendor. It drops a roster row by its
     family's vendor before any seat or pool is picked, so a family is gone
-    on every pool that serves it (Fable on Claude or Cursor Other Models).
+    on every pool that serves it (Fable on Claude, Opus on any opus_order pool).
 
     Before pace is considered, a seat is excluded when its read_state is a
     failure code, it failed inside the TTL, or --exclude-seat named it.
     An unknown reading (including one older than route_fresh_s) and a capped
     seat are skipped. They do not ask by themselves. The builder's vendor is
-    skipped. Spark and contributor models are skipped. Fable uses the same
-    frontier as the design voter: the Claude slice, or Cursor Other Models
-    when that path is the one with room. A blocked Fable seat tries the other
-    frontier seat before the family is skipped.
+    skipped. Spark and contributor models are skipped. The Anthropic row is
+    _anthropic_voter, as on design: Fable on the Claude slice, else Opus at
+    high on the first opus_order pool that is open and whose seat is not
+    blocked. Every Opus pool exhausted is one skip that names them all.
     """
     eligible, skipped = [], []
     failures = load_recent_failures(now)
@@ -3709,63 +3704,27 @@ def _review_candidates(states, s, now, excluded_vendor, runner=None, exclude_ven
                                         "excluded_vendor"))
             continue
         pick = spec["pick"]
-        if pick == "fable":
-            status, payload = _fable_voter(states, s, now, False)
-            opened = None
-            if status == "row":
-                opened = _review_fable_unblocked(payload, states, s, now, failures)
-            elif _review_fable_block(s, failures):
-                # An ask or a full window must not hide a block, and must not
-                # skip the other frontier seat when that seat is open.
-                opened = _review_fable_open(states, s, now, failures)
-            if opened is None:
-                blocked = _review_fable_block(s, failures)
-                if blocked and status != "row":
-                    seat, block = blocked
-                    shown = dict(spec)
-                    shown["seat"] = seat
-                    skipped.append(_review_skip(shown, block[1], block[0]))
-                    continue
-                if status == "ask":
-                    text = payload if isinstance(payload, str) else "Fable unavailable"
-                    code = "stale" if ("reading " in text and " old" in text) else "unknown"
-                    skipped.append(_review_skip(spec, text, code))
-                    continue
-                if status == "downgrade":
-                    why = payload.get("reason") or "no frontier pool with room"
-                    code = "capped" if "capped" in why or "full" in why else "unknown"
-                    skipped.append(_review_skip(spec, why, code))
-                    continue
-                if status == "row":
-                    seat = payload.get("seat") or "claude"
-                    block = _review_seat_block(seat, s, failures) or ("unknown", "Fable unavailable")
-                    shown = dict(spec)
-                    shown["seat"] = seat
-                    skipped.append(_review_skip(shown, block[1], block[0]))
-                    continue
-                skipped.append(_review_skip(spec, "Fable unavailable", "unknown"))
+        if pick == "opus":
+            status, payload = _anthropic_voter(
+                states, s, now, lambda seat: _review_seat_block(seat, s, failures))
+            if status == "ask":
+                text, pid = payload
+                skipped.append(_review_skip(spec, text, _review_unknown_code(states[pid][1])))
                 continue
-            payload = opened
-            seat = payload.get("seat") or "claude"
-            pool_id = "cursor_other" if seat == "cursor" else "fable"
-            pace = states[pool_id][0]
-            if pace in ("unknown", "capped"):
-                why = states[pool_id][1]
-                label = "Fable" if pool_id == "fable" else POOLS[pool_id]["label"]
-                if pace == "unknown":
-                    skipped.append(_review_skip(spec, _unknown_text(label, why), _review_unknown_code(why)))
-                else:
-                    skipped.append(_review_skip(spec, f"{label} capped", "capped"))
+            if status == "skip":
+                reason, code = payload
+                skipped.append(_review_skip(dict(spec, seat=None), reason, code))
                 continue
-            used = s.get(POOLS[pool_id]["used"])
-            metrics = _review_metrics(pool_id, pace, used, states, s, now)
-            seated = _review_fable_spec(seat)
+            pool_id = payload["pool"]
+            seated = dict(spec, seat=payload["seat"], model=payload["model"])
+            metrics = _review_metrics(pool_id, states[pool_id][0], s.get(POOLS[pool_id]["used"]),
+                                      states, s, now)
             row = _review_row(seated, metrics, s, now, states, pool_id)
-            row["effort"] = payload.get("effort") or row["effort"]
-            row["mode"] = payload.get("mode") or row["mode"]
-            row["reason"] = payload.get("reason") or row["reason"]
+            for key in ("effort", "mode", "reason", "runner"):
+                if payload.get(key):
+                    row[key] = payload[key]
             row["_index"] = index
-            _review_hold(seated, row, s, failures, eligible, skipped)
+            eligible.append(row)
             continue
         if pick == "argon":
             block = _review_seat_block(spec["seat"], s, failures)
@@ -3921,7 +3880,7 @@ def route_review(s, now, builder_vendor, runner=None, exclude_vendors=()):
         if runner is not None:
             row["runner"] = runner
         return row
-    argv = _review_launch(chosen[0].get("model"), chosen[0].get("effort"))
+    argv = chosen[0].get("runner") or _review_launch(chosen[0].get("model"), chosen[0].get("effort"))
     if argv is not None:
         chosen[0]["runner"] = list(argv)
     mode = chosen[0].get("mode") or "default"
@@ -3969,19 +3928,6 @@ def _first_unknown(states, pids):
     for pid in pids:
         if states[pid][0] == "unknown":
             return pid, states[pid][1]
-    return None, None
-
-
-def _fable_unknown_pool(states, s):
-    """The pool _fable_voter would ask on, or (None, None)."""
-    absent = _fable_slice_absent(states, s)
-    if not absent:
-        found = _first_unknown(states, ("fable", "claude_week", "claude_5h"))
-        if found[0]:
-            return found
-    _ready, unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
-    if unknown:
-        return unknown[0]
     return None, None
 
 
@@ -4058,9 +4004,16 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
         pid = None
         why = None
         if family == "fable":
-            status, payload = _fable_voter(states, s, now, excluded_vendor == "xai")
+            status, payload = _anthropic_voter(states, s, now, lambda seat: _read_state_block(seat, s))
             if status == "ask":
-                pid, why = _fable_unknown_pool(states, s)
+                reason, pid = payload
+                code = _review_unknown_code(states[pid][1])
+                skipped.append(_mixed_skip("opus", POOLS[pid]["seat"], reason, code))
+                continue
+            if status == "skip":
+                reason, code = payload
+                skipped.append(_mixed_skip("opus", None, reason, code))
+                continue
         elif family == "grok":
             pid = "cursor_models"
             status, payload = _grok_voter(states, s, now)
@@ -4123,8 +4076,8 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
     Design excludes nobody. Mixed excludes the author, or the caller-passed
     builder when no author was named. With neither, or with `--author human`
     or `--author none`, mixed excludes nobody. Audit excludes the author
-    when one is named. Fable is required when the excluded vendor is xAI,
-    except on kind review.
+    when one is named. The Opus voter is required when the excluded vendor
+    is xAI, except on kind review.
 
     Kind review seats exactly two voters from REVIEW_ROSTER, on two vendors.
     The excluded vendor is the author's, or the caller-passed builder's when
@@ -4563,8 +4516,8 @@ def route_pstack(s, now, model, role="builder"):
     """Where pstack's model runs and how hard. Read-only: never swaps the model.
 
     pstack picks the model; this caps effort and, for Opus, picks the pool.
-    Opus uses _opus_pick (Google agy, Claude Code, Cursor Other Models by
-    headroom). Grok uses the worker pools (_grok_pools; an all-ahead band still
+    Opus uses _opus_pick (Google agy, Claude Code, Cursor Other Models, first
+    one not capped). Grok uses the worker pools (_grok_pools; an all-ahead band still
     seats, since the model is pstack's call). The cap is _effort_for on that
     pool with the requested effort (high when none) as its default, and the
     final effort is the lower of the two. Other families stay unrouted with the

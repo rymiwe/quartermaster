@@ -400,7 +400,7 @@ def cached_lineup_json_names_the_xai_pair():
     assert proc.stderr == "", proc.stderr
     row = json.loads(proc.stdout)[0]
     assert row["role"] == "lineup" and row["mode"] == "default", row
-    assert row["reason"] == "xAI chairs and builds: Fable, Astra, and Wonder full vote", row["reason"]
+    assert row["reason"] == "xAI chairs and builds: Opus, Astra, and Wonder full vote", row["reason"]
     assert row["rule"] == row["reason"], row["rule"]
     chair = row["lineup"]["chair"]
     builder = row["lineup"]["builder"]
@@ -411,7 +411,7 @@ def cached_lineup_json_names_the_xai_pair():
     assert builder["reason"] == chair["reason"], builder
     voters = [(v["role"], v["seat"], v["family"], v["effort"], v["mode"]) for v in row["lineup"]["voters"]]
     assert voters == [
-        ("voter", "claude", "fable", "high", "default"),
+        ("voter", "claude", "opus", "high", "default"),
         ("voter", "chatgpt", "astra", "high", "default"),
         ("voter", "muse", "wonder-full", "high", "default"),
     ], voters
