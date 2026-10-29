@@ -982,10 +982,15 @@ def codex():
             if w: windows.append((key, w.get("used_percent"), w.get("reset_at"), w.get("limit_window_seconds") or 0))
         if not windows: raise KeyError("primary_window")
         SUMMARY["as_of"]["chatgpt"] = NOW
+        _set_read_state("chatgpt", "fresh")
         codex_renewal(hdr)
         return [codex_line(u.get("plan_type", "?"), "live", windows, 0.0)]
     except Exception as e:
         live_err = f"{e.__class__.__name__}" + (f" {e.code}" if hasattr(e, "code") else "")
+        code = getattr(e, "code", None)
+        # The fallback below is an older reading, so the seat's read failed.
+        _set_read_state("chatgpt", "token_expired" if code in (401, 403)
+                        else "rate_limited" if code == 429 else "usage_failed")
     files = sorted(glob.glob(f"{H}/.codex/sessions/*/*/*/*.jsonl"), key=os.path.getmtime)
     last = None
     dec = json.JSONDecoder()
@@ -2287,6 +2292,26 @@ def _take_read_state(out, base, fresh, seats, kept_base):
     else:
         out.pop("rate_limited_until", None)
 
+def _failed_lines(lines):
+    """The reason text of a seat's lines that report a failed read, else ""."""
+    for ln in lines or []:
+        body = ln.split("|", 1)[1].strip() if "|" in ln else ln
+        m = re.search(r"live call failed[^;|)]*", body)
+        if m:
+            return m.group(0).strip()
+        if "failed" in body or "no stored" in body:
+            return body
+    return ""
+
+def _kept_lines(lines, stamp, now, why):
+    """A kept cached reading after this run's read failed: say how old it is, never "live"."""
+    age = f"{max(0.0, (now - stamp) / 3600):.1f}h old" if _is_number(stamp) else "age unknown"
+    note = f"cached reading {age}; this run's {why}"
+    # A second failed read in a row rewrites the earlier note instead of adding one.
+    tag = re.compile(r"\((?:live|cached reading [^)]*)\)")
+    return [tag.sub(f"({note})", ln, count=1) if tag.search(ln)
+            else re.sub(r" \| cached reading .*$", "", ln) + f" | {note}" for ln in lines]
+
 def merge_summary(base, fresh, seats, now=None):
     """Replace seats that succeeded in fresh; drop as_of on a failed reread and keep old numbers."""
     if now is None:
@@ -2328,6 +2353,9 @@ def merge_summary(base, fresh, seats, now=None):
         seen.add(seat)
         if seat in seat_set and seat in fresh_lines and seat not in kept_base:
             merged.extend(fresh_lines[seat])
+        elif seat in kept_base and seat in old_lines and _failed_lines(fresh_lines.get(seat)):
+            merged.extend(_kept_lines(old_lines[seat], out["as_of"].get(seat), now,
+                                      _failed_lines(fresh_lines.get(seat))))
         elif seat in old_lines:
             merged.extend(old_lines[seat])
     for seat, lns in old_lines.items():
@@ -2338,7 +2366,7 @@ def merge_summary(base, fresh, seats, now=None):
     # than "read failed". A seat that read cleanly this run drops its entry.
     errors = dict(base.get("errors") or {})
     for seat in seat_set:
-        if seat in fresh_as_of:
+        if seat in fresh_as_of and not (seat in kept_base and _failed_lines(fresh_lines.get(seat))):
             errors.pop(seat, None)
             continue
         why = [ln.split("|", 1)[1].strip() for ln in fresh_lines.get(seat, []) if "failed" in ln or "no stored" in ln]
