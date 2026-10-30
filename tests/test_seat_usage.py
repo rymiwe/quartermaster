@@ -1726,7 +1726,7 @@ def opus_builder():
 
 
 @test
-def lineup_default_is_xai_with_opus_and_astra():
+def lineup_default_is_xai_with_fable_and_astra():
     r = su.route_lineup(snap(), NOW)
     assert r["mode"] == "default", r
     chair, builder = r["lineup"]["chair"], r["lineup"]["builder"]
@@ -1735,7 +1735,7 @@ def lineup_default_is_xai_with_opus_and_astra():
     assert builder["family"] == "grok" and builder["seat"] == "cursor" and builder["vendor"] == "xai", builder
     assert builder["effort"] == "high", builder
     assert [(v["family"], v["effort"], v["vendor"], v["seat"]) for v in r["lineup"]["voters"]] == [
-        ("opus", "high", "anthropic", "google"),
+        ("fable", "high", "anthropic", "claude"),
         ("astra", "high", "openai", "chatgpt"),
         ("wonder-full", "high", "meta", "muse"),
     ], r["lineup"]["voters"]
@@ -1752,7 +1752,7 @@ def lineup_burn_raises_chair_and_builder_effort_not_voters():
     assert r["lineup"]["chair"]["effort"] == "xhigh", r["lineup"]["chair"]
     assert r["lineup"]["builder"]["effort"] == "xhigh", r["lineup"]["builder"]
     assert [v["effort"] for v in r["lineup"]["voters"]] == ["high", "high", "high"], r["lineup"]["voters"]
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["opus", "astra", "wonder-full"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra", "wonder-full"], r
 
 
 @test
@@ -1761,7 +1761,7 @@ def lineup_cursor_ahead_moves_to_supergrok_while_that_pool_is_under():
     assert r["mode"] == "default", r
     assert r["lineup"]["chair"]["seat"] == "grok" and r["lineup"]["chair"]["effort"] == "high", r
     assert r["lineup"]["builder"]["seat"] == "grok" and r["lineup"]["builder"]["effort"] == "high", r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["opus", "astra", "wonder-full"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra", "wonder-full"], r
 
 
 @test
@@ -1796,12 +1796,12 @@ def lineup_opus_builder_uses_opus_chair_and_grok_voter():
 
 
 @test
-def lineup_cursor_capped_stays_on_supergrok_with_opus_and_astra():
+def lineup_cursor_capped_stays_on_supergrok_with_fable_and_astra():
     r = su.route_lineup(snap(cursor_auto_pct=100), NOW)
     assert r["mode"] == "default", r
     assert r["lineup"]["chair"]["family"] == "grok" and r["lineup"]["chair"]["seat"] == "grok", r
     assert r["lineup"]["builder"]["family"] == "grok" and r["lineup"]["builder"]["seat"] == "grok", r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["opus", "astra", "wonder-full"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "astra", "wonder-full"], r
     assert all(v["effort"] == "high" for v in r["lineup"]["voters"]), r
 
 
@@ -1826,29 +1826,26 @@ def lineup_unknown_cursor_uses_supergrok():
 
 
 @test
-def lineup_unknown_opus_asks_and_a_missing_fable_reading_does_not():
+def lineup_unknown_fable_asks():
     s = snap()
     del s["fable"]
     r = su.route_lineup(s, NOW)
-    assert r["mode"] == "default" and _voter_families(r)[0] == "opus", r
-    dead = without_as_of(snap(claude_week=100, cursor_api_pct=100), "google")
-    r = su.route_lineup(dead, NOW)
     assert r["mode"] == "ask" and r["lineup"] is None, r
-    assert "Google Claude/GPT weekly reading unknown" in r["reason"], r
+    assert "Fable" in r["reason"], r
 
 
 @test
 def lineup_codex_capped_keeps_muse_at_low_when_that_pool_is_ahead():
     r = su.route_lineup(snap(codex=100), NOW)
     assert r["mode"] == "default" and r["lineup"] is not None, r
-    assert [v["family"] for v in r["lineup"]["voters"]] == ["opus", "wonder-full"], r
+    assert [v["family"] for v in r["lineup"]["voters"]] == ["fable", "wonder-full"], r
     ahead = su.route_lineup(snap(codex=100, muse_week=80), NOW)
     assert ahead["mode"] == "suggest" and ahead["lineup"] is not None, ahead
-    assert [v["family"] for v in ahead["lineup"]["voters"]] == ["opus", "wonder-full"], ahead
+    assert [v["family"] for v in ahead["lineup"]["voters"]] == ["fable", "wonder-full"], ahead
     muse = next(v for v in ahead["lineup"]["voters"] if v["family"] == "wonder-full")
     assert muse["effort"] == "low", muse
     capped = su.route_lineup(snap(codex=100, muse_week=100), NOW)
-    assert [v["family"] for v in capped["lineup"]["voters"]] == ["opus"], capped
+    assert [v["family"] for v in capped["lineup"]["voters"]] == ["fable"], capped
     assert "one voter" in capped["reason"], capped
 
 
@@ -2054,7 +2051,7 @@ def cached_route_in_process_does_not_refresh_or_log():
                 su.cmd_route()
             row = json.loads(buf.getvalue())[0]
             assert row["mode"] == "default" and row["lineup"] is not None, row
-            assert [v["family"] for v in row["lineup"]["voters"]] == ["opus", "wonder-full"], row
+            assert [v["family"] for v in row["lineup"]["voters"]] == ["fable", "wonder-full"], row
             assert not os.path.exists(su.ASKS)
             assert not os.path.exists(su.HISTORY)
             assert called == [], called
@@ -2096,9 +2093,7 @@ def usage_age_covers_every_pool_in_the_snapshot():
     asked = snap()
     asked["as_of"] = dict(asked["as_of"])
     asked["as_of"]["grokbot"] = NOW - 590
-    # No Opus pool can seat: Google has no used %, Claude and Other Models are capped.
-    del asked["google_claudegpt_week"]
-    asked.update(claude_week=100, cursor_api_pct=100)
+    del asked["fable"]
     denied = su.route_lineup(asked, NOW)
     assert denied["mode"] == "ask", denied
     assert denied["usage_age_s"] == 590, denied["usage_age_s"]
@@ -2185,62 +2180,30 @@ def live_merge_drops_the_pulled_marker():
     assert "pulled_ts" not in out, sorted(out)
 
 
-def _opus_voter(row):
-    return next(v for v in row["lineup"]["voters"] if v["family"] == "opus")
-
-
 @test
-def opus_voter_walks_opus_order_google_then_claude_then_cursor():
-    # The council's Anthropic voter is Opus at high, never Fable on Other Models.
-    agy = _opus_voter(su.route_lineup(snap(), NOW, kind="design"))
-    assert (agy["seat"], agy["pool"], agy["effort"]) == ("google", "google_opus_week", "high"), agy
-    assert agy["runner"] == ["agy", "--model", "claude-opus-5-5-high"] and agy["model"] == "claude-opus-5-5-high", agy
-    # Order, not pace: an ahead Google pool still goes first.
-    ahead = _opus_voter(su.route_lineup(snap(google_claudegpt_week=80), NOW, kind="design"))
-    assert ahead["pool"] == "google_opus_week", ahead
-    claude = _opus_voter(su.route_lineup(snap(google_claudegpt_week=100), NOW, kind="design"))
-    assert (claude["seat"], claude["pool"], claude["effort"]) == ("claude", "claude_week", "high"), claude
-    assert claude["runner"] == ["claude", "--model", "opus"] and claude["model"] == "opus", claude
-    gate = _opus_voter(su.route_lineup(snap(google_claudegpt_5h=100), NOW, kind="design"))
-    assert gate["pool"] == "claude_week", gate
-    cursor = _opus_voter(su.route_lineup(snap(google_claudegpt_week=100, claude_5h=100), NOW, kind="design"))
-    assert (cursor["seat"], cursor["pool"], cursor["effort"]) == ("cursor", "cursor_other", "high"), cursor
-    assert cursor["runner"] == ["cursor-agent", "--model", "claude-opus-5-5-high"], cursor
-    for kind in ("design", "mixed", "review"):
-        row = su.route_lineup(snap(google_claudegpt_week=100, claude_week=100), NOW, kind=kind)
-        assert all(v["family"] != "fable" for v in row["lineup"]["voters"]), (kind, row)
-
-
-@test
-def opus_voter_skips_a_pool_whose_login_is_unavailable():
-    s = snap(read_state={"google": "token_expired"})
-    seated = _opus_voter(su.route_lineup(s, NOW, kind="design"))
-    assert seated["pool"] == "claude_week", seated
-    both = snap(read_state={"google": "token_expired", "claude": "usage_failed"})
-    seated = _opus_voter(su.route_lineup(both, NOW, kind="design"))
-    assert seated["pool"] == "cursor_other", seated
-
-
-@test
-def opus_voter_all_exhausted_fails_loud_and_never_seats_fable():
-    capped = snap(google_claudegpt_week=100, claude_week=100, cursor_api_pct=100)
-    want = ("all Opus pools exhausted (Google Claude/GPT weekly capped; Claude weekly capped; "
-            "Other Models capped): ask Ryan")
-    plain = su.route_lineup(capped, NOW)
-    assert plain["mode"] == "ask" and plain["lineup"] is None and want in plain["reason"], plain
-    design = su.route_lineup(capped, NOW, kind="design")
-    assert "opus" not in _voter_families(design) and "fable" not in _voter_families(design), design
-    skip = next(item for item in design["skipped"] if item["family"] == "opus")
-    assert skip["code"] == "capped" and skip["reason"] == want and skip["vendor"] == "anthropic", skip
-    # The merge gate does not use Opus pools, so it never seats Opus.
-    gate = su.route_review(capped, NOW, "xai")
-    assert all(r["family"] != "opus" for r in gate["reviewers"]), gate
-    assert all(item["family"] != "opus" for item in gate["skipped"]), gate
-    blocked = snap(google_claudegpt_week=100, claude_week=100, read_state={"cursor": "token_expired"})
-    design = su.route_lineup(blocked, NOW, kind="design")
-    skip = next(item for item in design["skipped"] if item["family"] == "opus")
-    assert skip["code"] == "read_state:token_expired", skip
-    assert "Other Models cursor read_state token_expired" in skip["reason"], skip
+def f2_fable_uses_other_models_when_the_5h_window_is_full():
+    seated = su.route_lineup(snap(claude_5h=100, cursor_api_pct=10), NOW)
+    assert seated["mode"] != "ask" and seated["lineup"] is not None, seated
+    fable = next(v for v in seated["lineup"]["voters"] if v["family"] == "fable")
+    assert fable["seat"] == "cursor" and fable["effort"] == "high", fable
+    assert "weaker:" in seated["reason"], seated
+    soon = NOW + 12 * 3600
+    burning = su.route_lineup(snap(
+        claude_5h=100, cursor_api_pct=10, cursor_auto_pct=50, grok_pct=57,
+        cursor_reset_ts=soon, cursor_window_s=MONTH,
+    ), NOW)
+    # The shared Cursor reset is 12h out on a 30-day window, so elapsed is
+    # about 98%. Cursor Models at 50% is under and burning. SuperGrok at 57%
+    # stays on its default window and is on pace. Other Models at 10% shares
+    # that reset, so it burns, and Fable's effort follows that burn.
+    fable_burn = next(v for v in burning["lineup"]["voters"] if v["family"] == "fable")
+    assert fable_burn["seat"] == "cursor" and fable_burn["effort"] == "xhigh", burning
+    blocked = su.route_lineup(snap(claude_5h=100, cursor_api_pct=100), NOW)
+    assert blocked["mode"] != "ask" and blocked["lineup"] is not None, blocked
+    # Other Models capped conserves: the voter is Opus, not a downgrade prompt.
+    assert "fable" not in [v["family"] for v in blocked["lineup"]["voters"]], blocked
+    assert "opus" in [v["family"] for v in blocked["lineup"]["voters"]], blocked
+    assert "downgrade" not in blocked, blocked
 
 
 @test
@@ -2272,7 +2235,7 @@ def _voter_families(row):
 
 @test
 def lineup_kind_excludes_the_author_not_the_chair():
-    # Claude chairs. Grok built the diff. Opus votes. Grok sits out.
+    # Claude chairs. Grok built the diff. Fable votes. Grok sits out.
     ahead = snap(cursor_auto_pct=80, grok_pct=80)
     review = su.route_lineup(ahead, NOW, builder=grok_builder(), kind="review")
     assert review["mode"] != "ask" and review["lineup"] is not None, review
@@ -2280,17 +2243,17 @@ def lineup_kind_excludes_the_author_not_the_chair():
     assert review["lineup"]["chair"]["family"] == "opus", review["lineup"]["chair"]
     assert review["lineup"]["builder"]["family"] == "grok", review["lineup"]["builder"]
     assert review["lineup"]["builder"]["effort"] == "low", review["lineup"]["builder"]
-    assert _voter_families(review) == ["opus", "astra"], review
+    assert _voter_families(review) == ["fable", "astra"], review
     assert review["author"] == "grok", review
     assert review["excluded"]["vendor"] == "xai", review["excluded"]
     assert review["excluded"]["why"] == "Grok built the diff", review["excluded"]
     assert review["rule"].startswith("review excludes xAI:"), review["rule"]
-    assert "Opus" in review["rule"], review["rule"]
+    assert "Fable" in review["rule"], review["rule"]
     text = su.format_lineup(review)
     assert "excluded: xAI | grok | Grok built the diff" in text, text
 
     mixed = su.route_lineup(ahead, NOW, builder=grok_builder(), kind="mixed")
-    assert _voter_families(mixed) == ["opus", "astra", "wonder-full"], mixed
+    assert _voter_families(mixed) == ["fable", "astra", "wonder-full"], mixed
     assert mixed["excluded"]["why"] == "Grok built the diff", mixed["excluded"]
     assert mixed["rule"].startswith("mixed excludes xAI:"), mixed["rule"]
 
@@ -2304,7 +2267,7 @@ def lineup_kind_excludes_the_author_not_the_chair():
     # Design seats the chair's vendor. Audit seats everybody until an author is named.
     design = su.route_lineup(snap(), NOW, kind="design")
     assert design["lineup"]["chair"]["vendor"] == "xai", design
-    assert _voter_families(design) == ["opus", "astra", "grok", "wonder-full"], design
+    assert _voter_families(design) == ["fable", "astra", "grok", "wonder-full"], design
     named_design = su.route_lineup(snap(), NOW, kind="design", author="grok")
     assert named_design["excluded"]["vendor"] is None, named_design
     assert _voter_families(named_design) == _voter_families(design), named_design
@@ -2315,32 +2278,30 @@ def lineup_kind_excludes_the_author_not_the_chair():
     audit = su.route_lineup(ahead, NOW, kind="audit")
     assert audit["lineup"]["chair"]["family"] == "opus", audit
     assert audit["lineup"]["builder"]["family"] == "opus", audit
-    assert _voter_families(audit) == ["opus", "astra", "grok", "wonder-full"], audit
+    assert _voter_families(audit) == ["fable", "astra", "grok", "wonder-full"], audit
     assert audit["author"] is None and audit["excluded"]["why"] == "audit author unknown", audit
     wrote = su.route_lineup(ahead, NOW, kind="audit", author="grok")
     assert wrote["lineup"]["builder"]["family"] == "opus", wrote
     assert wrote["author"] == "grok" and wrote["excluded"]["vendor"] == "xai", wrote
-    assert _voter_families(wrote) == ["opus", "astra", "wonder-full"], wrote
+    assert _voter_families(wrote) == ["fable", "astra", "wonder-full"], wrote
     assert wrote["excluded"]["why"] == "Grok wrote it", wrote["excluded"]
 
-    # Every Opus pool capped: design records the skip and seats the rest.
-    blocked = snap(google_claudegpt_week=100, claude_5h=100, cursor_api_pct=100, cursor_auto_pct=10)
+    # Fable is required when xAI is excluded, not when xAI chairs.
+    blocked = snap(claude_5h=100, cursor_api_pct=100, cursor_auto_pct=10)
     design_skip = su.route_lineup(blocked, NOW, kind="design")
     assert design_skip["mode"] != "ask" and design_skip["lineup"] is not None, design_skip
-    assert "opus" not in _voter_families(design_skip), design_skip
     assert "fable" not in _voter_families(design_skip), design_skip
-    assert any(item["family"] == "opus" and "all Opus pools exhausted" in item["reason"]
-               for item in design_skip["skipped"]), design_skip
+    assert "opus" in _voter_families(design_skip) and "downgrade" not in design_skip, design_skip
     # No author and no caller builder: the pace-picked builder is not the author.
-    # Opus is still skipped because every Opus pool is full. Grok can vote.
+    # Fable is still skipped because both frontier seats are full. Grok can vote.
     review_ask = su.route_lineup(blocked, NOW, kind="review")
     assert review_ask["mode"] != "ask" and review_ask["lineup"] is not None, review_ask
     assert review_ask["excluded"]["vendor"] is None, review_ask
-    assert "opus" not in _voter_families(review_ask), review_ask
+    assert "fable" not in _voter_families(review_ask), review_ask
     assert "astra" in _voter_families(review_ask), review_ask
     assert "grok" in _voter_families(review_ask), review_ask
     assert "downgrade" not in review_ask, review_ask
-    assert any(item["family"] == "opus" for item in review_ask["skipped"]), review_ask
+    assert any(item["family"] == "fable" for item in review_ask["skipped"]), review_ask
     assert not any(item.get("code") == "builder_vendor" for item in review_ask["skipped"]), review_ask
 
     missing = su.route_lineup(snap(), NOW, kind="review", author="composer")
@@ -2385,7 +2346,7 @@ def review_without_author_or_builder_excludes_nobody():
     mixed_ahead = su.route_lineup(snap(cursor_auto_pct=80, grok_pct=80), NOW, kind="mixed")
     assert mixed_ahead["lineup"]["builder"]["family"] == "opus", mixed_ahead
     assert mixed_ahead["excluded"]["vendor"] is None and mixed_ahead["author"] is None, mixed_ahead
-    assert "opus" in _voter_families(mixed_ahead), mixed_ahead
+    assert "fable" in _voter_families(mixed_ahead), mixed_ahead
 
 
 @test
@@ -2449,7 +2410,7 @@ def mixed_without_author_or_builder_excludes_nobody():
             assert row["lineup"]["builder"]["family"] == builder_family, row
             excl = row["excluded"]
             assert excl == {"vendor": None, "name": None, "family": None, "why": why}, excl
-            assert _voter_families(row) == ["opus", "astra", "grok", "wonder-full"], row
+            assert _voter_families(row) == ["fable", "astra", "grok", "wonder-full"], row
             assert row["rule"].startswith("mixed excludes nobody:"), row["rule"]
             assert f"excluded: none | {why}" in su.format_lineup(row), su.format_lineup(row)
     # A caller-passed builder is still excluded when no author is named.
@@ -2509,13 +2470,19 @@ def _absent_fable(cursor=10, **kw):
 
 
 @test
-def fable_slice_and_plan_do_not_move_the_council_opus_voter():
-    for s in (_absent_fable(), snap(fable=10, cursor_api_pct=80, claude_plan="claude_ai"),
-              snap(fable=80, cursor_api_pct=10, claude_plan="claude_ai"), _absent_fable(cursor=100)):
-        row = su.route_lineup(s, NOW, kind="design")
-        assert row["mode"] != "ask" and "downgrade" not in row, row
-        assert _voter_families(row) == ["opus", "astra", "grok", "wonder-full"], row
-        assert _opus_voter(row)["pool"] == "google_opus_week", row
+def absent_fable_slice_seats_the_optimal_frontier_pool():
+    seated = su.route_lineup(_absent_fable(), NOW, kind="design")
+    assert seated["mode"] != "ask" and seated["lineup"] is not None, seated
+    assert "downgrade" not in seated, seated
+    fable = next(v for v in seated["lineup"]["voters"] if v["family"] == "fable")
+    assert fable["seat"] == "cursor", fable
+    assert _voter_families(seated) == ["fable", "astra", "grok", "wonder-full"], seated
+    native = su.route_lineup(snap(fable=10, cursor_api_pct=20, claude_plan="claude_ai"), NOW, kind="design")
+    native_fable = next(v for v in native["lineup"]["voters"] if v["family"] == "fable")
+    assert native_fable["seat"] == "claude", native_fable
+    other = su.route_lineup(snap(fable=80, cursor_api_pct=10, claude_plan="claude_ai"), NOW, kind="design")
+    other_fable = next(v for v in other["lineup"]["voters"] if v["family"] == "fable")
+    assert other_fable["seat"] == "cursor", other_fable
 
 
 def _off_max(**kw):
@@ -2563,7 +2530,8 @@ def claude_max_flag_from_plan_and_fable_slice():
     absent = _off_max(claude_max=False)
     absent.pop("claude_plan", None)
     lineup = su.route_lineup(absent, NOW, kind="design")   # a pulled copy: flag, no plan name
-    assert _opus_voter(lineup)["pool"] == "google_opus_week", lineup
+    fable = next(v for v in lineup["lineup"]["voters"] if v["family"] == "fable")
+    assert fable["seat"] == "cursor", fable
 
 
 @test
@@ -2575,46 +2543,89 @@ def claude_max_reads_tier_then_plan_before_the_flag():
 
 
 @test
-def opus_voter_passes_a_stale_or_unknown_pool_to_the_next_known_one():
+def absent_fable_slice_prompts_instead_of_a_failed_reading():
+    # Known frontier pools with no room: Other Models capped now conserves to Opus.
+    prompted = su.route_lineup(_absent_fable(cursor=100), NOW, kind="design")
+    assert prompted["mode"] != "ask" and prompted["lineup"] is not None, prompted
+    assert _voter_families(prompted) == ["opus", "astra", "grok", "wonder-full"], prompted
+    assert "downgrade" not in prompted, prompted
     assert su.downgrade_effort("under") == "max"
     assert su.downgrade_effort("ahead") == "high"
-    stale = snap()
+    max_plan = _absent_fable()
+    max_plan["claude_plan"] = "default_claude_max"
+    # A missing Fable percent on Max is still a failed reading. Design skips it.
+    # Audit still asks.
+    skipped_max = su.route_lineup(max_plan, NOW, kind="design")
+    assert skipped_max["mode"] != "ask" and skipped_max["lineup"] is not None, skipped_max
+    assert _voter_families(skipped_max) == ["astra", "grok", "wonder-full"], skipped_max
+    max_skip = next(item for item in skipped_max["skipped"] if item["family"] == "fable")
+    assert max_skip["code"] == "unknown" and "fix the failed reading" in max_skip["reason"], max_skip
+    audit_max = su.route_lineup(max_plan, NOW, kind="audit")
+    assert audit_max["mode"] == "ask" and audit_max["lineup"] is None, audit_max
+    assert "fix the failed reading" in audit_max["reason"], audit_max
+    # A stale non-Max stamp is an absent slice, so Fable sits on Cursor.
+    stale = _absent_fable()
     stale["as_of"] = dict(stale["as_of"])
-    stale["as_of"]["google"] = NOW - 11 * 60
-    row = su.route_lineup(stale, NOW, kind="design")
-    assert _opus_voter(row)["pool"] == "claude_week", row
-    missing = without_as_of(without_as_of(snap(), "google"), "claude")
-    row = su.route_lineup(missing, NOW, kind="design")
-    assert _opus_voter(row)["pool"] == "cursor_other", row
-    # No known open pool: design skips Opus as unknown, audit asks.
-    none = without_as_of(snap(claude_week=100, cursor_api_pct=100), "google")
-    row = su.route_lineup(none, NOW, kind="design")
-    assert row["mode"] != "ask" and "opus" not in _voter_families(row), row
-    skip = next(item for item in row["skipped"] if item["family"] == "opus")
-    assert skip["code"] == "unknown" and "Google Claude/GPT weekly reading unknown" in skip["reason"], skip
-    audit = su.route_lineup(none, NOW, kind="audit")
-    assert audit["mode"] == "ask" and audit["lineup"] is None, audit
-    assert "Google Claude/GPT weekly reading unknown" in audit["reason"], audit
+    stale["as_of"]["claude"] = NOW - 11 * 60
+    stale_row = su.route_lineup(stale, NOW, kind="design")
+    assert stale_row["mode"] != "ask" and stale_row["lineup"] is not None, stale_row
+    stale_fable = next(v for v in stale_row["lineup"]["voters"] if v["family"] == "fable")
+    assert stale_fable["seat"] == "cursor", stale_fable
+    missing = without_as_of(_absent_fable(), "claude")
+    missing_row = su.route_lineup(missing, NOW, kind="design")
+    assert missing_row["mode"] != "ask" and missing_row["lineup"] is not None, missing_row
+    assert "fable" not in _voter_families(missing_row), missing_row
+    missing_skip = next(item for item in missing_row["skipped"] if item["family"] == "fable")
+    assert missing_skip["code"] == "unknown" and "fix the failed reading" in missing_skip["reason"], missing_skip
+    cursor_stale = _absent_fable()
+    cursor_stale["as_of"] = dict(cursor_stale["as_of"])
+    cursor_stale["as_of"]["cursor"] = NOW - 11 * 60
+    cursor_row = su.route_lineup(cursor_stale, NOW, kind="design")
+    assert cursor_row["mode"] != "ask" and cursor_row["lineup"] is not None, cursor_row
+    # A stale Fable pool reading conserves: Opus, not a stale skip.
+    assert _voter_families(cursor_row)[0] == "opus", cursor_row
+    sibling = without_as_of(snap(fable=10, claude_plan="claude_ai"), "cursor")
+    sibling_row = su.route_lineup(sibling, NOW, kind="design")
+    assert sibling_row["mode"] != "ask" and sibling_row["lineup"] is not None, sibling_row
+    # No Cursor reading conserves, even with the Claude slice open.
+    assert _voter_families(sibling_row)[0] == "opus", sibling_row
 
 
 @test
-def design_seats_four_voters_and_a_stale_claude_reading_does_not_skip_opus():
-    """A fresh design seats four voters. A stale Claude reading no longer skips the Anthropic voter."""
+def design_skips_a_stale_unknown_plan_and_seats_non_max_fable_on_cursor():
+    """A fresh design still seats four voters. Stale seats are skipped, not an ask.
+
+    Claude stale and token_expired with claude_max False seats Fable on Cursor
+    when Cursor is fresh. An unknown plan with a stale reading leaves Fable in
+    skipped and seats the other voters.
+    """
     fresh = su.route_lineup(snap(), NOW, kind="design")
     assert fresh["mode"] != "ask" and _voter_families(fresh) == [
-        "opus", "astra", "grok", "wonder-full"], fresh
+        "fable", "astra", "grok", "wonder-full"], fresh
     assert "skipped" not in fresh, fresh
     assert len(su.VOTER_ROSTER) == 4, su.VOTER_ROSTER
+
+    off = snap(claude_max=False)
+    off["as_of"] = dict(off["as_of"])
+    off["as_of"]["claude"] = NOW - 11 * 60
+    off["read_state"] = {"claude": "token_expired"}
+    seated = su.route_lineup(off, NOW, kind="design")
+    assert seated["mode"] != "ask" and seated["lineup"] is not None, seated
+    fable = next(v for v in seated["lineup"]["voters"] if v["family"] == "fable")
+    assert fable["seat"] == "cursor", fable
+    assert _voter_families(seated) == ["fable", "astra", "grok", "wonder-full"], seated
+    assert not any(item["family"] == "fable" for item in seated.get("skipped") or []), seated
 
     unknown = snap(claude_plan="?")
     unknown.pop("claude_max", None)
     unknown["as_of"] = dict(unknown["as_of"])
     unknown["as_of"]["claude"] = NOW - 11 * 60
-    unknown["read_state"] = {"claude": "token_expired"}
     held = su.route_lineup(unknown, NOW, kind="design")
     assert held["mode"] != "ask" and held["lineup"] is not None, held
-    assert _voter_families(held) == ["opus", "astra", "grok", "wonder-full"], held
-    assert _opus_voter(held)["pool"] == "google_opus_week", held
+    assert _voter_families(held) == ["astra", "grok", "wonder-full"], held
+    item = next(x for x in held["skipped"] if x["family"] == "fable")
+    assert item["code"] == "stale" and item["seat"] == "claude", item
+    assert "11m old" in item["reason"], item
 
 
 @test
@@ -2652,7 +2663,7 @@ def lineup_kind_flags_reject_a_bad_kind_before_a_refresh():
         row = json.loads(ok.stdout)[0]
         assert row["lineup"]["chair"]["family"] == "opus", row
         assert row["lineup"]["builder"]["family"] == "grok", row
-        assert [v["family"] for v in row["lineup"]["voters"]] == ["opus", "astra"], row
+        assert [v["family"] for v in row["lineup"]["voters"]] == ["fable", "astra"], row
         assert row["excluded"]["vendor"] == "xai", row
 
 
@@ -3015,9 +3026,9 @@ def muse_pools_seat_a_voter_and_do_not_change_launch_routes():
         assert su.POOLS["muse_week"].get("strengths", {}).get(role) is None
         assert su.route(role, snap(), NOW)["family"] not in ("wonder-full", "wonder")
     seated = su.route_lineup(snap(), NOW)
-    assert [v["family"] for v in seated["lineup"]["voters"]] == ["opus", "astra", "wonder-full"], seated
+    assert [v["family"] for v in seated["lineup"]["voters"]] == ["fable", "astra", "wonder-full"], seated
     ahead = su.route_lineup(snap(muse_5h=80), NOW)
-    assert [v["family"] for v in ahead["lineup"]["voters"]] == ["opus", "astra", "wonder-full"], ahead
+    assert [v["family"] for v in ahead["lineup"]["voters"]] == ["fable", "astra", "wonder-full"], ahead
     muse = next(v for v in ahead["lineup"]["voters"] if v["family"] == "wonder-full")
     assert muse["effort"] == "high", muse
     week = su.route_lineup(snap(muse_week=80), NOW)
@@ -3045,21 +3056,16 @@ def route_ask_picks_two_vendors_by_headroom():
     r = su.route_ask(snap(cursor_auto_pct=10), NOW)
     assert r["role"] == "ask" and r["mode"] == "default", r
     assert [(v["family"], v["effort"], v["vendor"]) for v in r["voters"]] == [
-        ("opus", "high", "anthropic"),
+        ("fable", "high", "anthropic"),
         ("astra", "high", "openai"),
     ], r
-    assert [v["family"] for v in r["candidates"]] == ["opus", "astra", "grok", "wonder-full"], r
-    opus = r["voters"][0]
-    assert (opus["pool"], opus["model"]) == ("google_opus_week", "claude-opus-5-5-high"), opus
-    assert opus["runner"] == ["agy", "--model", "claude-opus-5-5-high"], opus
-    native = su.route_ask(snap(cursor_auto_pct=10, google_claudegpt_week=100), NOW)
-    assert next(v for v in native["candidates"] if v["family"] == "opus")["pool"] == "claude_week", native
+    assert [v["family"] for v in r["candidates"]] == ["fable", "astra", "grok", "wonder-full"], r
     # Grok stays a candidate. Ask mode does not drop the chair's vendor.
     assert any(v["family"] == "grok" for v in r["candidates"]), r
     full = su.route_ask(snap(fable=100, claude_week=100, claude_5h=100, cursor_api_pct=100, codex=100,
-                          google_claudegpt_week=100, cursor_auto_pct=10), NOW)
+                          google_claudegpt_week=100,
+                          cursor_auto_pct=10), NOW)
     assert [v["family"] for v in full["voters"]] == ["grok", "wonder-full"], full
-    assert not {"opus", "fable"} & {v["family"] for v in full["candidates"]}, full
     assert len({v["vendor"] for v in full["voters"]}) == 2, full
     over = su.route_ask(snap(muse_week=90), NOW)
     assert "wonder-full" not in [v["family"] for v in over["candidates"]], over
@@ -4570,7 +4576,7 @@ def review_roster_excludes_spark_and_muse_contributor():
     assert not su._review_model_barred("wonder")
     assert not su._review_model_barred("gpt-6-astra")
     families = [spec["family"] for spec in su.REVIEW_ROSTER]
-    assert families == ["opus", "astra", "grok", "argon", "wonder"], families
+    assert families == ["fable", "astra", "grok", "argon", "wonder"], families
     assert "wonder-full" not in families
     muse = next(spec for spec in su.REVIEW_ROSTER if spec["family"] == "wonder")
     assert muse["contributor_mode"] == "off" and muse["model"] == "wonder", muse
@@ -4583,7 +4589,7 @@ def review_lineup_picks_two_by_pace_and_skips_unknown():
     fresh = _argon(snap(codex=50), 40)
     row = su.route_lineup(fresh, NOW, builder=grok_builder(), kind="review")
     assert row["mode"] != "ask" and len(row["lineup"]["voters"]) == 2, row
-    assert _voter_families(row) == ["opus", "wonder"], row
+    assert _voter_families(row) == ["fable", "wonder"], row
     vendors = [v["vendor"] for v in row["lineup"]["voters"]]
     assert len(set(vendors)) == 2 and "xai" not in vendors, row
     assert all(v["pace"] == "under" and v["headroom"] == 1.0 for v in row["lineup"]["voters"]), row
@@ -4591,31 +4597,28 @@ def review_lineup_picks_two_by_pace_and_skips_unknown():
     skipped = {item["family"]: item["reason"] for item in row["skipped"]}
     assert "grok" in skipped and "builder vendor" in skipped["grok"], skipped
     assert "argon" in skipped and "astra" in skipped, skipped
-    # Stale Opus readings with no known open pool are skipped. The other seats still fill the council.
-    stale = _argon(snap(cursor_api_pct=100), 80)
+    # A stale Fable reading is skipped. The other seats still fill the council.
+    stale = _argon(snap(), 80)
     stale["as_of"] = dict(stale["as_of"])
     stale["as_of"]["claude"] = NOW - 222 * 60
-    stale["as_of"]["google"] = NOW - 222 * 60
     held = su.route_lineup(stale, NOW, builder_vendor="xai", kind="review")
     assert held["mode"] != "ask", held
-    assert "opus" not in _voter_families(held) and "fable" not in _voter_families(held), held
+    assert "fable" not in _voter_families(held), held
     assert _voter_families(held) == ["astra", "wonder"], held
-    opus_skip = next(item for item in held["skipped"] if item["family"] == "opus")
-    assert "222m old" in opus_skip["reason"], opus_skip
+    fable_skip = next(item for item in held["skipped"] if item["family"] == "fable")
+    assert "222m old" in fable_skip["reason"], fable_skip
     # Ask only when fewer than two eligible seats remain.
     dead = snap(codex=100, muse_week=100, muse_5h=100, google_argon_week=100,
                 google_argon_week_reset_ts=NOW + 3 * 86400)
     dead["as_of"] = dict(dead["as_of"])
     dead["as_of"]["claude"] = NOW - 222 * 60
-    dead["as_of"]["google"] = NOW - 222 * 60
-    dead["cursor_api_pct"] = 100
     asked = su.route_lineup(dead, NOW, kind="review", builder_vendor="grok")
     assert asked["mode"] == "ask" and asked["lineup"] is None, asked
     assert asked["builder_vendor"] == "xai", asked
     assert "need 2" in asked["reason"], asked
     # grok is an alias for xai. Design output does not grow an Argon voter.
     design = su.route_lineup(fresh, NOW, kind="design")
-    assert _voter_families(design) == ["opus", "astra", "grok", "wonder-full"], design
+    assert _voter_families(design) == ["fable", "astra", "grok", "wonder-full"], design
     assert "skipped" not in design and "why" not in design, design
     text = su.format_lineup(design)
     assert "pace " not in text and "skipped:" not in text, text
@@ -4623,7 +4626,7 @@ def review_lineup_picks_two_by_pace_and_skips_unknown():
 
 @test
 def review_gate_picks_one_other_vendor():
-    fresh = _argon(snap(cursor_api_pct=80, fable=80, google_claudegpt_week=80), 5)
+    fresh = _argon(snap(cursor_api_pct=80, fable=80), 5)
     row = su.route_review(fresh, NOW, "xai")
     assert row["role"] == "review" and row["mode"] != "ask", row
     assert len(row["reviewers"]) == 1, row
@@ -4641,8 +4644,8 @@ def review_gate_picks_one_other_vendor():
                                 cursor_api_pct=100, claude_5h=100), NOW, "anthropic")
     # grok may still be eligible; this only checks the ask shape when forced empty below.
     capped = snap(codex=100, muse_week=100, muse_5h=100, fable=100, cursor_api_pct=100,
-                  claude_5h=100, grok_pct=100, google_argon_week=100,
-                  google_argon_week_reset_ts=NOW + 86400, google_claudegpt_week=100)
+                  claude_5h=100, google_claudegpt_week=100, grok_pct=100, google_argon_week=100,
+                  google_argon_week_reset_ts=NOW + 86400)
     asked = su.route_review(capped, NOW, "xai")
     assert asked["mode"] == "ask" and asked["reviewers"] == [], asked
 
@@ -4732,44 +4735,25 @@ def _exv_routes(s, builder, **kw):
             "lineup-review": su.route_lineup(s, NOW, kind="review", builder_vendor=builder, **kw)}
 
 
-def _exv_opus_fixtures():
-    """One snapshot per Opus pool, in opus_order: the earlier pools capped."""
-    base = _argon(snap(codex=80, cursor_auto_pct=70, muse_week=60, muse_5h=20), 80)
-    return {
-        "google_opus_week": base,
-        "claude_week": dict(base, google_claudegpt_week=100),
-        "cursor_other": dict(base, google_claudegpt_week=100, claude_week=100, cursor_api_pct=5),
-    }
-
-
 @test
 def exclude_vendor_anthropic_drops_fable_and_opus_on_every_pool():
     anthropic_pools = _exv_vendor_pools("anthropic")
     assert {"fable", "claude_week", "cursor_other", "google_opus_week"} <= anthropic_pools, anthropic_pools
-    for name, s in _exv_opus_fixtures().items():
-        for route, row in _exv_routes(s, "xai").items():
-            # The merge gate ("review") keeps its Fable ranking and never seats Opus.
-            family = "fable" if route == "review" else "opus"
-            assert all(v["family"] != ("opus" if family == "fable" else "fable") for v in _exv_rows(row)), (name, route)
-            if family == "opus":
-                seated = [v for v in _exv_rows(row) if v["family"] == "opus"]
-                assert seated and seated[0]["pool"] == name, (name, route, _exv_rows(row))
-        for builder, kw in (("xai", {"exclude_vendors": ("anthropic",)}), ("anthropic", {})):
-            for route, row in _exv_routes(s, builder, **kw).items():
-                assert row["mode"] != "ask", (name, route, row["reason"])
-                vendors = [v["vendor"] for v in _exv_rows(row)]
-                assert "anthropic" not in vendors, (name, builder, route, vendors)
-                if route == "lineup-review":
-                    assert len(set(vendors)) == len(vendors) == 2, (name, builder, vendors)
-                for v in _exv_rows(row):
-                    assert v["family"] not in ("fable", "opus"), (name, route, v)
-                    assert v.get("pool") not in anthropic_pools, (name, route, v)
-                family = "fable" if route == "review" else "opus"
-                opus = next(i for i in row["skipped"] if i["family"] == family)
-                code = "excluded_vendor" if kw else "builder_vendor"
-                assert opus["code"] == code, (name, builder, route, opus)
-                assert "anthropic" in opus["reason"], (name, route, opus)
-                assert row["builder_vendor"] == builder, (name, route, row["builder_vendor"])
+    for name, s in _exv_fixtures().items():
+        if name != "antigravity":
+            for route, row in _exv_routes(s, "xai").items():
+                seated = [v for v in _exv_rows(row) if v["family"] == "fable"]
+                assert seated and seated[0]["pool"] == name.replace("claude", "fable"), (name, route, seated)
+        for route, row in _exv_routes(s, "xai", exclude_vendors=("anthropic",)).items():
+            assert row["mode"] != "ask", (name, route, row["reason"])
+            for v in _exv_rows(row):
+                assert v["vendor"] != "anthropic", (name, route, v)
+                assert v["family"] not in ("fable", "opus"), (name, route, v)
+                assert v.get("pool") not in anthropic_pools, (name, route, v)
+            fable = next(i for i in row["skipped"] if i["family"] == "fable")
+            assert fable["code"] == "excluded_vendor", (name, route, fable)
+            assert "anthropic" in fable["reason"], (name, route, fable)
+            assert row["builder_vendor"] == "xai", (name, route, row["builder_vendor"])
 
 
 @test
@@ -4870,19 +4854,6 @@ def exclude_vendor_review_rule_names_every_excluded_vendor():
 
 
 @test
-def merge_gate_for_xai_builder_ranks_as_before_and_skips_opus_pools():
-    # Open Opus pools change council voters, not the merge gate's pick.
-    busy = dict(fable=60, claude_week=60, claude_5h=60, cursor_api_pct=60, codex=60,
-                cursor_auto_pct=60, grok_pct=60, muse_week=60, muse_5h=60)
-    for s in (_argon(snap(**busy), 20), _argon(snap(google_claudegpt_week=0, **busy), 20)):
-        gate = su.route_review(s, NOW, "xai")
-        assert gate["reviewers"][0]["family"] == "argon", gate
-        assert gate["runner"][:2] == ["agy", "--model"] and "claude-opus" not in " ".join(gate["runner"]), gate
-        assert all(r["family"] != "opus" for r in gate["reviewers"]), gate
-        assert all(item["family"] != "opus" for item in gate["skipped"]), gate
-
-
-@test
 def review_capped_argon_falls_through():
     s = _argon(snap(), 100)
     row = su.route_review(s, NOW, "anthropic")
@@ -4895,7 +4866,6 @@ def review_capped_argon_falls_through():
     assert argon["code"] == "capped", argon
     other = su.route_review(s, NOW, "xai")
     seated = other["reviewers"][0]
-    # The merge gate keeps its Fable ranking. Opus pools seat council voters only.
     assert seated["family"] == "fable", seated
     assert seated["runner"] == ["cursor-agent", "--model", "fable"], seated
     assert "runner: cursor-agent --model fable" in su.format_review(other)
@@ -4904,15 +4874,15 @@ def review_capped_argon_falls_through():
 @test
 def review_asks_when_no_seat_is_eligible():
     capped = snap(codex=100, muse_week=100, muse_5h=100, fable=100, cursor_api_pct=100,
-                  claude_5h=100, grok_pct=100, google_argon_week=100,
-                  google_argon_week_reset_ts=NOW + 86400, google_claudegpt_week=100)
+                  claude_5h=100, google_claudegpt_week=100, grok_pct=100, google_argon_week=100,
+                  google_argon_week_reset_ts=NOW + 86400)
     asked = su.route_review(capped, NOW, "xai")
     assert asked["mode"] == "ask" and asked["reviewers"] == [], asked
     assert "need 1" in asked["reason"] and "0 eligible" in asked["reason"], asked["reason"]
     assert "  runner:" not in su.format_review(asked)
     only_builder = snap(codex=100, muse_week=100, muse_5h=100, fable=100, cursor_api_pct=100,
-                        claude_5h=100, google_argon_week=100,
-                        google_argon_week_reset_ts=NOW + 86400, google_claudegpt_week=100)
+                        claude_5h=100, google_claudegpt_week=100, google_argon_week=100,
+                        google_argon_week_reset_ts=NOW + 86400)
     alone = su.route_review(only_builder, NOW, "xai")
     assert alone["mode"] == "ask" and alone["reviewers"] == [], alone
     assert all(r.get("vendor") != "xai" for r in alone["reviewers"])
@@ -4949,17 +4919,16 @@ def review_argon_matches_pool_pace_and_vendor_flag_wins():
     pace, why, _used = su._argon_reading(hot, NOW)
     assert pace == "near_cap" and why is None, (pace, why)
     row = su.route_lineup(hot, NOW, kind="review", builder_vendor="xai")
-    assert [v["family"] for v in row["lineup"]["voters"]] == ["opus", "astra"], row["why"]
+    assert [v["family"] for v in row["lineup"]["voters"]] == ["fable", "astra"], row["why"]
     expired = _argon(snap(), 100, reset=NOW - 60)
     pace, why, _used = su._argon_reading(expired, NOW)
     assert pace == "unknown" and why == "reset passed", (pace, why)
     named = su.route_lineup(snap(), NOW, kind="review", author="argon", builder_vendor="openai")
     assert named["mode"] != "ask", named
     assert named["excluded"]["vendor"] == "openai" and named["excluded"]["family"] is None, named["excluded"]
-    stale = _argon(snap(codex=80, cursor_api_pct=100), 6)
+    stale = _argon(snap(codex=80), 6)
     stale["as_of"] = dict(stale["as_of"])
     stale["as_of"]["claude"] = NOW - 222 * 60
-    del stale["google_claudegpt_week"]
     shown = su.route_lineup(stale, NOW, kind="review", builder_vendor="xai")
     assert [v["family"] for v in shown["lineup"]["voters"]] == ["argon", "wonder"], shown["why"]
     assert "Argon" in shown["rule"] and "Wonder" in shown["rule"], shown["rule"]
@@ -5153,11 +5122,10 @@ def review_exclusions_are_coded_and_argon_leads_when_healthy():
     wonder = next(v for v in row["lineup"]["voters"] if v["family"] == "wonder")
     assert wonder["contributor_mode"] == "off" and wonder["model"] == "wonder", wonder
     codes = _codes(row["skipped"])
-    assert codes["opus"] == "builder_vendor", codes
-    assert "fable" not in codes, codes
+    assert codes["fable"] == "builder_vendor", codes
     assert codes.get("astra") == "lower_rank", codes
     text = su.format_lineup(row)
-    assert "skipped: opus | builder_vendor |" in text, text
+    assert "skipped: fable | builder_vendor |" in text, text
     assert "skipped: argon" not in text, text
     # The one-reviewer route shares the exclusion codes and still seats one.
     gate = su.route_review(fresh, NOW, "anthropic")
@@ -5181,15 +5149,13 @@ def review_exclusions_are_coded_and_argon_leads_when_healthy():
     limited = _argon(snap(), 8)
     limited["read_state"] = {"claude": "rate_limited", "google": "fresh"}
     limited["cursor_api_pct"] = 100
-    limited["google_claudegpt_week"] = 100
     limited_row = su.route_lineup(limited, NOW, kind="review", builder_vendor="xai")
-    opus = next(item for item in limited_row["skipped"] if item["family"] == "opus")
-    assert opus["code"] == "read_state:rate_limited", opus
-    assert "Google Claude/GPT weekly capped; Claude weekly claude read_state rate_limited" in opus["reason"], opus
-    assert "opus" not in [v["family"] for v in limited_row["lineup"]["voters"]], limited_row["why"]
-    # A cache with no read_state still seats Opus. The field is optional.
+    fable = next(item for item in limited_row["skipped"] if item["family"] == "fable")
+    assert fable["code"] == "read_state:rate_limited", fable
+    assert "fable" not in [v["family"] for v in limited_row["lineup"]["voters"]], limited_row["why"]
+    # A cache with no read_state still seats Fable. The field is optional.
     bare = su.route_lineup(_argon(snap(), 8), NOW, kind="review", builder_vendor="xai")
-    assert "opus" in [v["family"] for v in bare["lineup"]["voters"]], bare["why"]
+    assert "fable" in [v["family"] for v in bare["lineup"]["voters"]], bare["why"]
     assert "read_state" not in json.dumps(bare["lineup"]["voters"])
 
 
@@ -5252,8 +5218,7 @@ def review_failure_record_round_trip_and_expiry():
         # credits on the cursor seat is no_credits, and a spark model is never a voter.
         credits = run(["--record-failure", "cursor", "--reason", "credits"])
         assert credits.returncode == 0, credits.stderr
-        cursor_body = _shift_snap(now, fable=100, cursor_api_pct=10, claude_week=100,
-                                  google_claudegpt_week=100,
+        cursor_body = _shift_snap(now, fable=100, cursor_api_pct=10,
                                   google_argon_week=6, google_argon_week_reset_ts=now + 3 * 86400)
         with open(cache, "w") as handle:
             json.dump(cursor_body, handle)
@@ -5264,8 +5229,8 @@ def review_failure_record_round_trip_and_expiry():
                       "--builder-vendor", "xai"])
         assert seated.returncode == 0, seated.stderr
         cursor_row = json.loads(seated.stdout)[0]
-        opus = next(item for item in cursor_row["skipped"] if item["family"] == "opus")
-        assert opus["code"] == "no_credits" and "all Opus pools exhausted" in opus["reason"], opus
+        fable = next(item for item in cursor_row["skipped"] if item["family"] == "fable")
+        assert fable["code"] == "no_credits", fable
         assert all("spark" not in (v.get("model") or "") for v in (cursor_row["lineup"] or {}).get("voters") or [])
         # An expired line does not exclude. TTL is 1s and the stamp is an hour old.
         with open(fail, "w") as handle:
@@ -5287,43 +5252,45 @@ def review_failure_record_round_trip_and_expiry():
         assert unknown.returncode == 2 and "not-a-seat" not in unknown.stderr
 
 
-def _opus_outcome(row):
-    voters = [v for v in (row.get("lineup") or {}).get("voters") or [] if v["family"] == "opus"]
-    skipped = [item for item in row.get("skipped") or [] if item["family"] == "opus"]
+def _fable_outcome(row):
+    voters = [v for v in (row.get("lineup") or {}).get("voters") or [] if v["family"] == "fable"]
+    skipped = [item for item in row.get("skipped") or [] if item["family"] == "fable"]
     return voters, skipped
 
 
 @test
-def review_blocked_opus_falls_through_and_an_ask_is_not_graded():
-    # A stale Google reading plus a block must not hide a healthy Claude seat.
-    stale = snap()
+def review_blocked_fable_falls_through_and_an_ask_is_not_graded():
+    # A stale Claude reading plus a block must not hide a healthy Cursor seat.
+    stale = snap(cursor_api_pct=10)
     stale["as_of"] = dict(stale["as_of"])
-    stale["as_of"]["google"] = NOW - 400 * 60
-    stale["read_state"] = {"google": "rate_limited"}
-    voters, skipped = _opus_outcome(su.route_lineup(stale, NOW, kind="review", builder_vendor="xai"))
+    stale["as_of"]["claude"] = NOW - 400 * 60
+    stale["read_state"] = {"claude": "rate_limited"}
+    voters, skipped = _fable_outcome(su.route_lineup(stale, NOW, kind="review", builder_vendor="xai"))
     if voters:
-        assert voters[0]["seat"] == "claude", voters
+        assert voters[0]["seat"] == "cursor", voters
     else:
-        assert skipped and skipped[0]["code"] == "lower_rank" and skipped[0].get("seat") == "claude", skipped
+        assert skipped and skipped[0]["code"] == "lower_rank" and skipped[0].get("seat") == "cursor", skipped
     assert all(item.get("code") not in ("stale", "unknown") for item in skipped), skipped
-    # Every Opus pool closed: the block code wins over the stale ask.
-    shut = snap(google_claudegpt_week=100, claude_week=100, cursor_api_pct=10)
-    shut["read_state"] = {"cursor": "rate_limited"}
-    held_voters, held_skipped = _opus_outcome(su.route_lineup(shut, NOW, kind="review", builder_vendor="xai"))
+    # Both frontier seats closed: the block code wins over the stale ask.
+    shut = snap(cursor_api_pct=100, fable=100, claude_week=100, claude_5h=100)
+    shut["as_of"] = dict(shut["as_of"])
+    shut["as_of"]["claude"] = NOW - 400 * 60
+    shut["read_state"] = {"claude": "rate_limited"}
+    held_voters, held_skipped = _fable_outcome(su.route_lineup(shut, NOW, kind="review", builder_vendor="xai"))
     assert not held_voters, held_voters
     assert held_skipped and held_skipped[0]["code"] == "read_state:rate_limited", held_skipped
     # --exclude-seat is the same block when the reading itself is stale.
-    aged = snap()
+    aged = snap(cursor_api_pct=10)
     aged["as_of"] = dict(aged["as_of"])
-    aged["as_of"]["google"] = NOW - 400 * 60
-    su._REVIEW_FORCE_EXCLUDE.add("google")
+    aged["as_of"]["claude"] = NOW - 400 * 60
+    su._REVIEW_FORCE_EXCLUDE.add("claude")
     try:
-        forced_voters, forced_skipped = _opus_outcome(
+        forced_voters, forced_skipped = _fable_outcome(
             su.route_lineup(aged, NOW, kind="review", builder_vendor="xai"))
     finally:
         su._REVIEW_FORCE_EXCLUDE.clear()
     if forced_voters:
-        assert forced_voters[0]["seat"] == "claude", forced_voters
+        assert forced_voters[0]["seat"] == "cursor", forced_voters
     else:
         assert forced_skipped and forced_skipped[0]["code"] == "lower_rank", forced_skipped
     assert all(item.get("code") not in ("stale", "unknown") for item in forced_skipped), forced_skipped
@@ -5911,28 +5878,21 @@ def grok_voter_label_is_display_only_and_never_a_launch_id():
     assert label not in pools
 
 
-def _opus_stale(s, now=NOW, age=650):
-    """Google and Claude readings stale and Other Models capped: no Opus pool can seat."""
-    s = dict(s, cursor_api_pct=100)
-    s["as_of"] = dict(s["as_of"])
-    s["as_of"]["google"] = now - age
-    s["as_of"]["claude"] = now - age
-    return s
-
-
 @test
 def mixed_skips_stale_and_unknown_and_asks_only_when_short():
-    stale = _opus_stale(snap())
+    stale = snap()
+    stale["as_of"] = dict(stale["as_of"])
+    stale["as_of"]["claude"] = NOW - 650
     row = su.route_lineup(stale, NOW, kind="mixed")
     assert row["mode"] != "ask" and row["lineup"] is not None, row
-    assert "opus" not in _voter_families(row) and "fable" not in _voter_families(row), row
+    assert "fable" not in _voter_families(row), row
     assert _voter_families(row) == ["astra", "grok", "wonder-full"], row
-    opus = next(item for item in row["skipped"] if item["family"] == "opus")
-    assert opus["code"] == "stale" and opus["seat"] == "google", opus
-    assert opus["vendor"] == "anthropic", opus
-    assert "10m old" in opus["reason"], opus
+    fable = next(item for item in row["skipped"] if item["family"] == "fable")
+    assert fable["code"] == "stale" and fable["seat"] == "claude", fable
+    assert fable["vendor"] == "anthropic", fable
+    assert "10m old" in fable["reason"], fable
     text = su.format_lineup(row)
-    assert "skipped: opus | stale |" in text, text
+    assert "skipped: fable | stale |" in text, text
     assert "ask |" not in text.splitlines()[0], text
     # Audit and a lineup with no kind still ask on the first unknown.
     # Design skips it, the same way mixed does. This snap has no plan flag.
@@ -5946,8 +5906,8 @@ def mixed_skips_stale_and_unknown_and_asks_only_when_short():
     design_stale = su.route_lineup(stale, NOW, kind="design")
     assert design_stale["mode"] != "ask" and design_stale["lineup"] is not None, design_stale
     assert _voter_families(design_stale) == ["astra", "grok", "wonder-full"], design_stale
-    design_opus = next(item for item in design_stale["skipped"] if item["family"] == "opus")
-    assert design_opus["code"] == "stale" and design_opus["seat"] == "google", design_opus
+    design_fable = next(item for item in design_stale["skipped"] if item["family"] == "fable")
+    assert design_fable["code"] == "stale" and design_fable["seat"] == "claude", design_fable
     # Muse with no reading is skipped, code unknown, and the others still sit.
     mute = without_as_of(snap(), "muse")
     muse_row = su.route_lineup(mute, NOW, kind="mixed")
@@ -5957,15 +5917,16 @@ def mixed_skips_stale_and_unknown_and_asks_only_when_short():
     assert muse["code"] == "unknown" and muse["seat"] == "muse", muse
     assert muse["reason"] == "muse: no usage source", muse
     # One eligible voter after skips asks, and the reason lists seats and codes.
-    thin = _opus_stale(without_as_of(snap(codex=100), "muse"))
+    thin = without_as_of(snap(codex=100), "muse")
+    thin["as_of"]["claude"] = NOW - 650
     short = su.route_lineup(thin, NOW, kind="mixed")
     assert short["mode"] == "ask" and short["lineup"] is None, short
     codes = {item["seat"]: item["code"] for item in short["skipped"]}
-    assert codes["google"] == "stale" and codes["muse"] == "unknown", short["skipped"]
+    assert codes["claude"] == "stale" and codes["muse"] == "unknown", short["skipped"]
     assert codes["chatgpt"] == "capped" and "grok" not in codes, short["skipped"]
-    assert "google/stale" in short["reason"] and "muse/unknown" in short["reason"], short["reason"]
+    assert "claude/stale" in short["reason"] and "muse/unknown" in short["reason"], short["reason"]
     assert "chatgpt/capped" in short["reason"] and "ask Ryan" in short["reason"], short["reason"]
-    assert "skipped: opus | stale |" in su.format_lineup(short), su.format_lineup(short)
+    assert "skipped: fable | stale |" in su.format_lineup(short), su.format_lineup(short)
     # Two eligible voters on one vendor ask. Caps are not what made it short.
     saved_vendor = su.FAMILY_VENDOR.get("astra")
     try:
@@ -5985,14 +5946,14 @@ def mixed_skips_stale_and_unknown_and_asks_only_when_short():
     assert excluded["mode"] == "ask", excluded
     assert excluded["excluded"]["vendor"] == "anthropic", excluded
     assert "outside Anthropic" in excluded["reason"], excluded["reason"]
-    assert all(item["family"] not in ("fable", "opus") for item in excluded["skipped"]), excluded["skipped"]
+    assert all(item["family"] != "fable" for item in excluded["skipped"]), excluded["skipped"]
     assert "claude/" not in excluded["reason"], excluded["reason"]
     seated = [item["family"] for item in excluded["skipped"]]
     assert "astra" in seated and "grok" in seated, excluded["skipped"]
     # Caps alone still produce the one-voter weaker lineup.
     capped = snap(codex=100, cursor_auto_pct=100, muse_week=100, muse_5h=100)
     weaker = su.route_lineup(capped, NOW, kind="mixed")
-    assert weaker["mode"] != "ask" and _voter_families(weaker) == ["opus"], weaker
+    assert weaker["mode"] != "ask" and _voter_families(weaker) == ["fable"], weaker
     assert "weaker:" in weaker["reason"], weaker["reason"]
     cap_codes = {item["family"]: item["code"] for item in weaker["skipped"]}
     assert cap_codes == {"astra": "capped", "grok": "capped", "wonder-full": "capped"}, cap_codes
@@ -6034,7 +5995,9 @@ def mixed_skips_stale_and_unknown_and_asks_only_when_short():
 def mixed_json_lists_skipped_and_review_still_skips_its_own_way():
     now = time.time()
     with tempfile.TemporaryDirectory() as d:
-        body = _opus_stale(_shift_snap(now), now=now)
+        body = _shift_snap(now)
+        body["as_of"] = dict(body["as_of"])
+        body["as_of"]["claude"] = now - 650
         body["as_of"].pop("muse", None)
         with open(os.path.join(d, "latest.json"), "w") as handle:
             json.dump(body, handle)
@@ -6054,17 +6017,17 @@ def mixed_json_lists_skipped_and_review_still_skips_its_own_way():
         assert row["mode"] != "ask" and row["kind"] == "mixed", row
         assert "lineup" in row and row["lineup"]["voters"], row
         codes = {item["family"]: item["code"] for item in row["skipped"]}
-        assert codes["opus"] == "stale" and codes["wonder-full"] == "unknown", row["skipped"]
+        assert codes["fable"] == "stale" and codes["wonder-full"] == "unknown", row["skipped"]
         for item in row["skipped"]:
             assert set(item) >= {"family", "seat", "vendor", "reason", "code"}, item
         text = subprocess.run(
             [sys.executable, str(BIN), "--route", "lineup", "--cached", "--kind", "mixed"],
             capture_output=True, text=True, env=env, timeout=20,
         )
-        assert "skipped: opus | stale |" in text.stdout, text.stdout
+        assert "skipped: fable | stale |" in text.stdout, text.stdout
         assert "skipped: wonder-full | unknown |" in text.stdout, text.stdout
         # Review's own skip list is unchanged by the mixed path. Muse is put
-        # back so two vendors remain and the stale Opus skip is the check.
+        # back so two vendors remain and the stale Fable skip is the check.
         review_body = json.loads(json.dumps(body))
         review_body["as_of"]["muse"] = now
         with open(os.path.join(d, "latest.json"), "w") as handle:
@@ -6077,8 +6040,8 @@ def mixed_json_lists_skipped_and_review_still_skips_its_own_way():
         assert review.returncode == 0, review.stderr
         reviewed = json.loads(review.stdout)[0]
         assert reviewed["mode"] != "ask", reviewed
-        assert any(item["family"] == "opus" and item["code"] == "stale" for item in reviewed["skipped"]), reviewed
-        assert "opus" not in _voter_families(reviewed) and "fable" not in _voter_families(reviewed)
+        assert any(item["family"] == "fable" and item["code"] == "stale" for item in reviewed["skipped"]), reviewed
+        assert "fable" not in _voter_families(reviewed)
 
 
 def _drop_muse_percents(summary):
@@ -6567,7 +6530,8 @@ def test_opus_all_capped_asks_with_no_other_family():
     s = snap(google_claudegpt_week=100, claude_week=100, cursor_api_pct=100)
     states = _opus_states(s)
     assert su._opus_pick(states)[0] == "capped"
-    want = "all Opus pools capped (Google Claude/GPT weekly, Claude weekly, Other Models): ask Ryan"
+    # Other Models is capped, so conserving leaves it out of the walk.
+    want = "all Opus pools capped (Google Claude/GPT weekly, Claude weekly): ask Ryan"
     row = su._opus_row("builder", s, NOW, states, "x")
     assert row["mode"] == "ask" and row["reason"] == f"x: {want}", row
     worker = su._constrained_worker("opus", "builder", s, NOW, states)
@@ -6660,7 +6624,7 @@ def test_fable_seats_on_work_code_and_the_old_work_flag_is_inert():
             p = su.route_pstack(s, NOW, model, "bounded-question")
             assert "work repo" not in p["reason"] and "work" not in p, p
         design = su.route_lineup(s, NOW, kind="design")
-        assert "opus" in [v["family"] for v in design["lineup"]["voters"]], design
+        assert "fable" in [v["family"] for v in design["lineup"]["voters"]], design
         assert not any(k.get("code") == "work" for k in design.get("skipped", [])), design
     finally:
         if old is None:
@@ -6731,6 +6695,134 @@ def test_hook_prints_pstack_advisory_for_an_opus_cursor_launch():
 sys.path.insert(0, str(HERE))
 import test_properties  # noqa: E402
 TESTS.extend(test_properties.TESTS)
+
+
+def _opus_voter(row):
+    return next(v for v in row["lineup"]["voters"] if v["family"] == "opus")
+
+
+TERM = 31 * 86400
+
+
+def _conserving(used, elapsed, **kw):
+    """Other Models at used percent, elapsed share of a 31-day term gone."""
+    kw.setdefault("cursor_auto_pct", 10)
+    return snap(cursor_api_pct=used, cursor_window_s=TERM,
+                cursor_reset_ts=NOW + (1 - elapsed) * TERM, **kw)
+
+
+@test
+def conserve_trigger_is_projection_past_budget_not_the_pace_band():
+    cons = su.fable_conserve(_conserving(94.4, 0.297), NOW)
+    assert cons["active"] and cons["keep"] == 0.025 and cons["keep_seats"] == [], cons
+    assert cons["projected_pct"] == 317.8, cons
+    at_pace = su.fable_conserve(_conserving(29.0, 0.297), NOW)
+    assert not at_pace["active"] and len(at_pace["keep_seats"]) == 3 and at_pace["skip"] == [], at_pace
+    # Inside the pace band but projecting over budget: only the projection sees it.
+    early = _conserving(20, 0.10)
+    assert su.pace_code(20, early["cursor_reset_ts"], TERM, NOW) == "on"
+    assert su.fable_conserve(early, NOW)["active"], early
+
+
+@test
+def conserve_nov_15_row_is_on_pace_and_still_conserves():
+    s = _conserving(94.4, 0.844)
+    assert su.pace_code(94.4, s["cursor_reset_ts"], TERM, NOW) == "on"
+    cons = su.fable_conserve(s, NOW)
+    assert cons["active"] and cons["keep"] == 0.321 and cons["projected_pct"] == 111.8, cons
+    assert cons["keep_seats"] == [], cons   # 0.321 is under one 1/3 share
+    v = _opus_voter(su.route_lineup(s, NOW, kind="design"))
+    assert v["pool"] == "google_opus_week" and v["fable_conserved"] is True, v
+    # A little later the judge's share fits, and voters and the gate stay on Opus.
+    later = su.fable_conserve(_conserving(94.4, 0.85), NOW)
+    assert later["keep_seats"] == ["judge_builder"], later
+
+
+@test
+def conserve_seats_fall_in_value_order():
+    assert su.fable_conserve(_conserving(70, 0.5), NOW)["keep_seats"] == ["judge_builder"]
+    assert su.fable_conserve(_conserving(59, 0.5), NOW)["keep_seats"] == ["judge_builder", "gate_reviewer"]
+
+
+@test
+def conserve_stale_or_unknown_reading_is_keep_zero():
+    stale = _conserving(5, 0.5)
+    stale["as_of"] = dict(stale["as_of"], cursor=NOW - 3600)
+    missing = _conserving(5, 0.5)
+    del missing["cursor_api_pct"]
+    for s in (stale, missing):
+        cons = su.fable_conserve(s, NOW)
+        assert cons["active"] and cons["keep"] == 0.0 and cons["keep_seats"] == [], cons
+        assert cons["state"] == "unknown", cons
+    row = su.route_lineup(stale, NOW, kind="design")
+    assert "fable" not in _voter_families(row) and "opus" in _voter_families(row), row
+
+
+@test
+def conserve_walks_google_then_claude_and_never_other_models():
+    v = _opus_voter(su.route_lineup(_conserving(94.4, 0.297), NOW, kind="design"))
+    assert v["pool"] == "google_opus_week" and v["effort"] == "high", v
+    assert v["runner"] == ["agy", "--model", "claude-opus-5-5-high"], v
+    v = _opus_voter(su.route_lineup(_conserving(94.4, 0.297, google_claudegpt_week=100), NOW, kind="design"))
+    assert v["pool"] == "claude_week", v
+    v = _opus_voter(su.route_lineup(_conserving(94.4, 0.297), NOW, kind="design", prompt_bytes=150001))
+    assert v["pool"] == "claude_week", v
+    v = _opus_voter(su.route_lineup(_conserving(94.4, 0.297), NOW, kind="design", prompt_bytes=150000))
+    assert v["pool"] == "google_opus_week", v
+
+
+@test
+def conserve_all_capped_asks_on_every_route_that_would_seat_fable():
+    s = _conserving(94.4, 0.297, google_claudegpt_week=100, claude_week=100)
+    for kind in ("design", "mixed", "audit"):
+        row = su.route_lineup(s, NOW, kind=kind)
+        assert row["mode"] == "ask" and row["lineup"] is None, (kind, row)
+        assert "all Opus pools exhausted" in row["reason"], (kind, row)
+    unknown = _conserving(94.4, 0.297, claude_week=100)
+    unknown["as_of"] = dict(unknown["as_of"], google=NOW - 3600)
+    assert su.route_lineup(unknown, NOW, kind="design")["mode"] == "ask"
+
+
+@test
+def conserve_gate_keeps_a_non_fable_pick_and_moves_a_fable_pick():
+    normal = su.route_review(_argon(_conserving(94.4, 0.297), 5), NOW, "xai")
+    assert normal["reviewers"][0]["family"] == "argon", normal
+    assert normal["fable_conserve"]["active"], normal
+    big = su.route_review(_argon(_conserving(94.4, 0.297), 5), NOW, "xai",
+                          exclude_vendors=("google",), prompt_bytes=240838)
+    row = big["reviewers"][0]
+    assert row["family"] == "opus" and row["seat"] == "claude", big
+    assert big["runner"] == ["claude", "--model", "opus"], big
+    none = _argon(_conserving(94.4, 0.297, claude_week=100, codex=100, muse_week=100, grok_pct=100,
+                              cursor_auto_pct=100), 5)
+    asked = su.route_review(none, NOW, "xai", exclude_vendors=("google",), prompt_bytes=240838)
+    assert asked["mode"] == "ask" and asked["reviewers"] == [], asked
+
+
+@test
+def conserve_config_is_where_the_tunables_live():
+    cfg = su.FABLE_CONSERVE
+    assert cfg["pool"] == "cursor_other" and cfg["budget_pct"] == 100 and cfg["agy_max_bytes"] == 150000
+    assert cfg["seat_value_order"] == ["voter", "gate_reviewer", "judge_builder"]
+    assert abs(cfg["seat_share"] - 1 / 3) < 1e-6 and "prior" in cfg["seat_share_reason"]
+
+
+@test
+def fable_burn_log_appends_one_line_per_seated_fable_leg():
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "fable-burn.jsonl")
+        os.environ["SEAT_USAGE_FABLE_LOG"] = path
+        try:
+            rows = [su.route_lineup(snap(), NOW, kind="design")]
+            su._log_fable_seats(rows, snap(), NOW, "run-1")
+            su._log_fable_seats(rows, snap(), NOW, "run-2")
+            su._log_fable_seats([su.route_lineup(_conserving(94.4, 0.297), NOW, kind="design")],
+                                snap(), NOW, "run-3")
+        finally:
+            del os.environ["SEAT_USAGE_FABLE_LOG"]
+        lines = [json.loads(line) for line in Path(path).read_text().splitlines()]
+    assert [(r["run_id"], r["seat"], r["pool"], r["used_pct"]) for r in lines] == [
+        ("run-1", "voter", "cursor_other", 10), ("run-2", "voter", "cursor_other", 10)], lines
 
 
 def main():

@@ -52,7 +52,7 @@ no Muse or agy ask, and no cache write. Output says "pull-only" and the cache
 age. For a VM that only renders a reader host's pushed copy.
 Sources are documented in the Delegation Routing section of ~/.claude/CLAUDE.md.
 """
-import base64, fcntl, glob, json, os, re, shlex, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+import base64, fcntl, glob, json, os, re, shlex, shutil, signal, socket, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 from datetime import datetime, timezone
 
 H = os.path.expanduser("~")
@@ -1417,6 +1417,7 @@ POOL_ORDER = ()
 # Opus pools that own a runner, in tie-break order (pools.json "opus_order").
 # A config without the key keeps the one Claude pool Opus used before.
 OPUS_ORDER = ("claude_week",)
+FABLE_CONSERVE = {}
 # Launch argv for review models, from pools.json "review_runners".
 # REVIEW_RUNNERS is only the --runner filter, not these commands.
 REVIEW_LAUNCH = {}
@@ -1669,6 +1670,7 @@ def load_config(pools_path=None, priors_path=None):
     """
     global POOLS, ROLES, POOL_ORDER, SCORING, PRIORS, BURN_POOLS, BURN_HOURS, BURN_GAP, NEAR_CAP
     global FAMILY_VENDOR, _FAMILY_NAME, ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S, GOOGLE_FAMILIES, OPUS_ORDER
+    global FABLE_CONSERVE
     global REVIEW_LAUNCH
     ROUTE_FRESH_S, ROUTE_FRESH_PULLED_S = (ROUTE_FRESHNESS_DEFAULT_S["live"], ROUTE_FRESHNESS_DEFAULT_S["pulled"])
     path = pools_path or pools_file()
@@ -1786,6 +1788,8 @@ def load_config(pools_path=None, priors_path=None):
         OPUS_ORDER = tuple(pid for pid in order if pid in pools)
     else:
         OPUS_ORDER = tuple(pid for pid in ("claude_week",) if pid in pools)
+    conserve = data.get("fable_conserve")
+    FABLE_CONSERVE = conserve if isinstance(conserve, dict) and conserve.get("pool") in pools else {}
     BURN_POOLS = tuple(burn)
     FAMILY_VENDOR = dict(data.get("vendors") or {})
     _FAMILY_NAME = dict(data.get("family_names") or {})
@@ -2878,13 +2882,14 @@ def _opus_group(owner, states):
     return state, pid, _OPUS_BANDS.get(state, 0)
 
 
-def _opus_pick(states, blocked=None):
+def _opus_pick(states, blocked=None, skip=()):
     """('pool', owner), ('ask', unknown pool ids), or ('capped', exhausted pool ids).
 
     OPUS_ORDER (Google agy, Claude Pro, Cursor Other Models) is a strict
     order: the first pool whose group (_opus_group) is not capped, not
     unknown, and whose seat is not blocked wins, at any pace. blocked is
     a seat -> (code, human) or None check, for a login that is unavailable.
+    skip is pools left out of the walk, from fable_conserve.
     A known open pool later in the order wins over an unknown one; with
     none, an unknown group asks. Every group capped or blocked is
     ('capped', ...): the capped binding pool, or the blocked owner.
@@ -2892,6 +2897,8 @@ def _opus_pick(states, blocked=None):
     """
     unknown, capped = [], []
     for owner in OPUS_ORDER:
+        if owner in skip:
+            continue
         state, pid, _band = _opus_group(owner, states)
         if state == "capped":
             capped.append(pid)
@@ -2945,7 +2952,7 @@ def _opus_row(role, s, now, states, prefix):
     leaves the ask reason unprefixed.
     """
     lead = f"{prefix}: " if prefix else ""
-    kind, found = _opus_pick(states)
+    kind, found = _opus_pick(states, skip=_opus_skip(s, now, states))
     if kind == "ask":
         return _ask_row(role, s, now, f"{lead}{_unknown_pools_reason(found, states, s)}")
     if kind == "capped":
@@ -3006,7 +3013,7 @@ def _constrained_worker(family, role, s, now, states, keep_ahead=False):
         return _xai_worker(role, s, now, states, keep_ahead=keep_ahead)
     if family == "opus":
         # The unknown ask keeps its old unprefixed wording.
-        unknown = _opus_pick(states)[0] == "ask"
+        unknown = _opus_pick(states, skip=_opus_skip(s, now, states))[0] == "ask"
         return _opus_row(role, s, now, states, None if unknown else "builder family opus")
     return _ask_row(role, s, now, f"builder family {family} is not a capable builder: {_ASK}")
 
@@ -3174,10 +3181,74 @@ def _fable_voter(states, s, now, required):
     return "downgrade", {"family": "fable", "reason": _downgrade_prompt(states, s, now)}
 
 
-def _opus_exhausted(states, s, blocked):
+def fable_conserve(s, now, states=None, prompt_bytes=None, exclude_vendors=()):
+    """How much of the Fable pool's current burn fits in what is left of the term.
+
+    keep = allowed burn / current burn, with allowed = (budget - used) /
+    (1 - elapsed) and current = used / elapsed. keep < 1 means the pool
+    projects past budget_pct, and that is the only trigger. Highest-value
+    seat classes that fit in keep hold Fable; the rest move to Opus. An
+    unknown or stale reading is keep 0: no reading, no Fable.
+
+    skip is the Opus pools a conserving walk leaves out: the Fable pool
+    itself, and agy pools when the prompt is over agy_max_bytes or the
+    caller excluded Google. Empty skip with active False means no conservation.
+    """
+    cfg = FABLE_CONSERVE
+    if not cfg:
+        return {"active": False, "keep": None, "keep_seats": list(_CONSERVE_SEATS), "skip": []}
+    pool = cfg["pool"]
+    meta = POOLS[pool]
+    states = states or {pool: pool_status(pool, s, now)}
+    state, why = states[pool]
+    budget = cfg.get("budget_pct", 100)
+    used, reset, window = s.get(meta["used"]), s.get(meta["reset"]), _window(meta, s)
+    keep = elapsed = projected = None
+    if state == "unknown" or not all(_is_number(v) for v in (used, reset, window)) or window <= 0:
+        keep = 0.0
+    else:
+        elapsed = min(max(1 - (reset - now) / window, 1e-9), 1 - 1e-9)
+        projected = used / elapsed
+        allowed = max(0.0, budget - used) / (1 - elapsed)
+        keep = allowed / projected if used > 0 else None
+    active = keep is not None and keep < 1
+    seats = list(_CONSERVE_SEATS)
+    if active:
+        share, total, seats = cfg.get("seat_share", 1 / 3), 0.0, []
+        for seat in reversed(cfg.get("seat_value_order") or _CONSERVE_SEATS):
+            if total + share <= keep:
+                seats.append(seat)
+                total += share
+    skip = []
+    if active:
+        agy_out = "google" in exclude_vendors or (
+            _is_number(prompt_bytes) and prompt_bytes > cfg.get("agy_max_bytes", 150000))
+        skip = [pid for pid in OPUS_ORDER if pid == pool or (agy_out and "agy" in (POOLS[pid].get("only") or ()))]
+    return {"active": active, "pool": pool, "state": state, "why": why, "used": used,
+            "elapsed_pct": None if elapsed is None else round(100 * elapsed, 1),
+            "projected_pct": None if projected is None else round(projected, 1),
+            "budget_pct": budget, "keep": None if keep is None else round(keep, 3),
+            "keep_seats": seats, "skip": skip}
+
+
+_CONSERVE_SEATS = ("voter", "gate_reviewer", "judge_builder")
+
+
+def _opus_skip(s, now, states):
+    return fable_conserve(s, now, states)["skip"]
+
+
+def _fable_kept(cons, seat):
+    """Whether this seat class holds Fable. cons None is no conservation."""
+    return cons is None or seat in cons["keep_seats"]
+
+
+def _opus_exhausted(states, s, blocked, skip=()):
     """(reason, code) when no Opus pool can seat. code is capped, or the first block's code."""
     parts, code = [], "capped"
     for owner in OPUS_ORDER:
+        if owner in skip:
+            continue
         state, pid, _band = _opus_group(owner, states)
         if state == "capped":
             parts.append(f"{_ask_label(pid, s)} capped")
@@ -3187,7 +3258,7 @@ def _opus_exhausted(states, s, blocked):
             parts.append(f"{_ask_label(owner, s)} {block[1]}")
             if code == "capped":
                 code = block[0]
-    names = "; ".join(parts) or "none configured"
+    names = "; ".join(parts) or "none usable"
     return f"all Opus pools exhausted ({names}): {_ASK}", code
 
 
@@ -3209,22 +3280,23 @@ def _opus_voter_row(owner, s, now):
     return row
 
 
-def _anthropic_voter(states, s, now, blocked=None):
-    """The council's Anthropic voter: Opus at high on the first open opus_order pool.
+def _anthropic_voter(states, s, now, cons, blocked=None):
+    """The Opus voter for a seat fable_conserve moved off Fable.
 
-    Not Fable: Conclave launches every Fable leg on cursor-agent (Cursor
-    Other Models), never the claude CLI, so a Fable seat here would bill
-    that pool. Opus walks opus_order (_opus_pick). blocked is a seat ->
-    (code, human) or None check for a login that is unavailable.
+    Opus walks opus_order (_opus_pick) past cons["skip"]. blocked is a seat
+    -> (code, human) or None check for a login that is unavailable.
     Returns ("row", voter), ("ask", (reason, pool id)), or
-    ("skip", (reason, code)) when every Opus pool is capped or blocked.
+    ("skip", (reason, code)) when every usable Opus pool is capped or blocked.
     """
-    kind, found = _opus_pick(states, blocked)
+    skip = cons["skip"]
+    kind, found = _opus_pick(states, blocked, skip)
     if kind == "pool":
-        return "row", _opus_voter_row(found, s, now)
+        row = _opus_voter_row(found, s, now)
+        row["fable_conserved"] = True
+        return "row", row
     if kind == "ask":
         return "ask", (_unknown_pools_reason(found, states, s), found[0])
-    return "skip", _opus_exhausted(states, s, blocked)
+    return "skip", _opus_exhausted(states, s, blocked, skip)
 
 
 def _muse_voter(states, s, now, skip_ahead=True):
@@ -3281,24 +3353,30 @@ def _lineup_mode(chair, builder, voters, weaker):
     return "default"
 
 
-def _collect_voters(states, s, now, excluded_vendor, skipped=None):
+def _collect_voters(states, s, now, excluded_vendor, skipped=None, cons=None):
     """Voters outside one excluded vendor. None excludes nobody.
 
     One voter is a degraded lineup. An unknown reading the lineup depends on
-    asks. The Anthropic voter is _anthropic_voter: Fable on the Claude slice,
-    else Opus at high in opus_order. Every Opus pool exhausted asks.
+    asks. Fable is required when the excluded vendor is xAI: a full 5h window
+    with no Other Models room asks and names the reopen. Families left out
+    are listed in skipped when a list is passed. A voter fable_conserve moves
+    off Fable is Opus (_anthropic_voter), and no Opus pool left asks.
     """
     excluded = {excluded_vendor} if excluded_vendor else set()
+    required = excluded_vendor == "xai"
     voters = []
     downgrade = None
     for spec in VOTER_ROSTER:
         if FAMILY_VENDOR[spec["family"]] in excluded:
             continue
         if spec["family"] == "fable":
-            status, payload = _anthropic_voter(states, s, now)
-            if status != "row":
-                # An unknown reading asks; every Opus pool exhausted fails loud.
-                return "ask", payload[0]
+            if _fable_kept(cons, "voter"):
+                status, payload = _fable_voter(states, s, now, required)
+            else:
+                status, payload = _anthropic_voter(states, s, now, cons)
+                if status != "row":
+                    # Conserving, so no silent Fable: unknown or exhausted asks.
+                    return "ask", payload[0]
         elif spec["family"] == "grok":
             status, payload = _grok_voter(states, s, now)
         elif spec["family"] == "wonder-full":
@@ -3388,6 +3466,8 @@ def _emit_lineup(s, now, states, chair_row, builder_row, voters, rule):
         weaker = f"one voter ({names})"
     elif chair_row.get("family") != "grok":
         weaker = chair_row.get("reason")
+    elif any(v["family"] == "fable" and v["seat"] != "claude" for v in voters):
+        weaker = "Fable on Other Models"
     reason = rule if not weaker else f"{rule}; weaker: {weaker}"
     ages = [chair_row.get("reading_age_s"), builder_row.get("reading_age_s")]
     ages.extend(v.get("reading_age_s") for v in voters)
@@ -3409,7 +3489,7 @@ def _emit_lineup(s, now, states, chair_row, builder_row, voters, rule):
 # design's usage snapshot stays the same. Muse wonder is the weekly Muse
 # pool with contributor mode off. A spark id or a contributor id is barred.
 REVIEW_ROSTER = (
-    {"family": "opus", "seat": "claude", "vendor": "anthropic", "model": "opus", "pick": "opus"},
+    {"family": "fable", "seat": "claude", "vendor": "anthropic", "model": "fable", "pick": "fable"},
     {"family": "astra", "seat": "chatgpt", "vendor": "openai", "model": "gpt-6-astra", "pick": "pool", "pool": "codex"},
     {"family": "grok", "seat": "grok", "vendor": "xai", "model": "grok", "slug": GROK_VOTER_LABEL,
      "pick": "pool", "pool": "cursor_models"},
@@ -3713,14 +3793,12 @@ def _review_row(spec, metrics, s, now, states, pool_id):
     return row
 
 
-# The merge gate's Anthropic row stays Fable, as before Opus took the council
-# voter seat: the gate reviewer is ranked against Fable on the Claude slice or
-# Cursor Other Models, not against the Opus pools.
-_GATE_FABLE_SPEC = {"family": "fable", "seat": "claude", "vendor": "anthropic", "model": "fable", "pick": "fable"}
+# The review row a fable_conserve seat takes in place of Fable.
+_REVIEW_OPUS_SPEC = {"family": "opus", "seat": "claude", "vendor": "anthropic", "model": "opus", "pick": "opus"}
 
 
 def _review_fable_spec(seat):
-    spec = dict(_GATE_FABLE_SPEC)
+    spec = dict(REVIEW_ROSTER[0])
     spec["seat"] = seat
     return spec
 
@@ -3737,29 +3815,29 @@ def _review_hold(spec, row, s, failures, eligible, skipped):
 
 
 def _review_candidates(states, s, now, excluded_vendor, runner=None, exclude_vendors=frozenset(),
-                       gate=False):
+                       cons=None, seat_class="voter"):
     """Eligible review seats, and every seat that was not eligible.
 
     exclude_vendors is --exclude-vendor. It drops a roster row by its
     family's vendor before any seat or pool is picked, so a family is gone
-    on every pool that serves it (Fable on Claude, Opus on any opus_order pool).
+    on every pool that serves it (Fable on Claude or Cursor Other Models).
 
     Before pace is considered, a seat is excluded when its read_state is a
     failure code, it failed inside the TTL, or --exclude-seat named it.
     An unknown reading (including one older than route_fresh_s) and a capped
     seat are skipped. They do not ask by themselves. The builder's vendor is
-    skipped. Spark and contributor models are skipped. The Anthropic row is
-    _anthropic_voter, as on design: Fable on the Claude slice, else Opus at
-    high on the first opus_order pool that is open and whose seat is not
-    blocked. Every Opus pool exhausted is one skip that names them all.
-    gate=True is the merge gate (route_review). Its Anthropic row is
-    _GATE_FABLE_SPEC on the Fable frontier, unchanged from before Opus.
+    skipped. Spark and contributor models are skipped. Fable uses the same
+    frontier as the design voter: the Claude slice, or Cursor Other Models
+    when that path is the one with room. A blocked Fable seat tries the other
+    frontier seat before the family is skipped. When cons does not keep
+    seat_class on Fable the row is _anthropic_voter's Opus instead, and every
+    usable Opus pool exhausted is one skip that names them.
     """
     eligible, skipped = [], []
     failures = load_recent_failures(now)
     for index, spec in enumerate(REVIEW_ROSTER):
-        if gate and spec["pick"] == "opus":
-            spec = _GATE_FABLE_SPEC
+        if spec["pick"] == "fable" and not _fable_kept(cons, seat_class):
+            spec = _REVIEW_OPUS_SPEC
         if _review_model_barred(spec.get("model")):
             skipped.append(_review_skip(spec, "spark and contributor models are excluded", "barred_model"))
             continue
@@ -3834,7 +3912,7 @@ def _review_candidates(states, s, now, excluded_vendor, runner=None, exclude_ven
             continue
         if pick == "opus":
             status, payload = _anthropic_voter(
-                states, s, now, lambda seat: _review_seat_block(seat, s, failures))
+                states, s, now, cons, lambda seat: _review_seat_block(seat, s, failures))
             if status == "ask":
                 text, pid = payload
                 skipped.append(_review_skip(spec, text, _review_unknown_code(states[pid][1])))
@@ -3934,7 +4012,31 @@ def _review_why(chosen):
 
 
 def _pick_review_seats(states, s, now, excluded_vendor, need, runner=None, exclude_vendors=frozenset(),
-                       gate=False):
+                       cons=None, seat_class="voter"):
+    """The ranked pick, with fable_conserve applied to the seat Fable would take.
+
+    Ranking stays as it is unless Fable wins a seat or nothing fills it, so
+    conserving never moves a seat Fable was not in. Then Opus takes the place
+    in the ranking. No Opus pool left for a seat Fable would have held asks:
+    no silent Fable, and no quiet swap to a seat the ranking did not pick.
+    """
+    base = _rank_review_seats(states, s, now, excluded_vendor, need, runner, exclude_vendors)
+    if _fable_kept(cons, seat_class):
+        return base
+    if base[0] == "ok" and not any(row["family"] == "fable" for row in base[2]):
+        return base
+    result = _rank_review_seats(states, s, now, excluded_vendor, need, runner, exclude_vendors,
+                                cons, seat_class)
+    if result[0] == "ok" and base[0] == "ok" and not any(row["family"] == "opus" for row in result[2]):
+        opus_out = next((item for item in result[3] if item.get("family") == "opus"
+                         and item.get("code") not in ("lower_rank", "vendor_seated")), None)
+        if opus_out:
+            return "ask", opus_out["reason"], [], result[3]
+    return result
+
+
+def _rank_review_seats(states, s, now, excluded_vendor, need, runner=None, exclude_vendors=frozenset(),
+                       cons=None, seat_class="voter"):
     """The best `need` seats on distinct vendors. Ask when fewer are eligible.
 
     Rank is the design pace order (under, open, on, ahead, then near_cap),
@@ -3942,7 +4044,8 @@ def _pick_review_seats(states, s, now, excluded_vendor, need, runner=None, exclu
     headroom table the scorer uses. A seat that loses the rank is listed as
     skipped with that reason. The pick log is not read here.
     """
-    eligible, skipped = _review_candidates(states, s, now, excluded_vendor, runner, exclude_vendors, gate)
+    eligible, skipped = _review_candidates(states, s, now, excluded_vendor, runner, exclude_vendors,
+                                           cons, seat_class)
     ranked = sorted(eligible, key=_review_rank_key)
     chosen = []
     seen = set()
@@ -3967,15 +4070,15 @@ def _pick_review_seats(states, s, now, excluded_vendor, need, runner=None, exclu
     return "ok", _review_why(chosen), chosen, skipped
 
 
-def _collect_review_voters(states, s, now, excluded_vendor, exclude_vendors=frozenset()):
+def _collect_review_voters(states, s, now, excluded_vendor, exclude_vendors=frozenset(), cons=None):
     status, why, chosen, skipped = _pick_review_seats(states, s, now, excluded_vendor, 2,
-                                                      exclude_vendors=exclude_vendors)
+                                                      exclude_vendors=exclude_vendors, cons=cons)
     if status == "ask":
         return "ask", (why, skipped)
     return "ok", (chosen, skipped, why)
 
 
-def route_review(s, now, builder_vendor, runner=None, exclude_vendors=()):
+def route_review(s, now, builder_vendor, runner=None, exclude_vendors=(), prompt_bytes=None):
     """One merge-gate reviewer whose vendor is not the builder's, nor any exclude_vendors vendor.
 
     Unknown and capped seats are skipped. Ask only when none remain. With a
@@ -3984,6 +4087,7 @@ def route_review(s, now, builder_vendor, runner=None, exclude_vendors=()):
     field is that argv, unless --runner named a filter, which stays the name.
     """
     states = {pid: pool_status(pid, s, now) for pid in POOLS}
+    cons = fable_conserve(s, now, states, prompt_bytes, exclude_vendors)
     vendor = _normalize_vendor(builder_vendor)
     if vendor is None:
         asked = _lineup_ask(s, now, states, f"builder vendor {builder_vendor} is unknown: {_ASK}", [])
@@ -3992,11 +4096,12 @@ def route_review(s, now, builder_vendor, runner=None, exclude_vendors=()):
         asked["builder_vendor"] = None
         asked["reviewers"] = []
         asked["skipped"] = []
+        asked["fable_conserve"] = cons
         if runner is not None:
             asked["runner"] = runner
         return asked
     status, why, chosen, skipped = _pick_review_seats(states, s, now, vendor, 1, runner,
-                                                      frozenset(exclude_vendors), gate=True)
+                                                      frozenset(exclude_vendors), cons, "gate_reviewer")
     ages = [row.get("reading_age_s") for row in chosen]
     ages.extend(row.get("reading_age_s") for row in skipped if isinstance(row.get("reading_age_s"), (int, float)))
     known = [age for age in ages if isinstance(age, (int, float)) and not isinstance(age, bool)]
@@ -4005,7 +4110,7 @@ def route_review(s, now, builder_vendor, runner=None, exclude_vendors=()):
         row = {"role": "review", "mode": "ask", "reason": why, "why": why,
                "builder_vendor": vendor, "reviewers": [], "skipped": skipped,
                "reading_age_s": seated, "usage": _usage_snapshot(states, s),
-               "usage_age_s": _snapshot_age(s, now)}
+               "usage_age_s": _snapshot_age(s, now), "fable_conserve": cons}
         if runner is not None:
             row["runner"] = runner
         return row
@@ -4016,7 +4121,7 @@ def route_review(s, now, builder_vendor, runner=None, exclude_vendors=()):
     row = {"role": "review", "mode": mode, "reason": why, "why": why,
            "builder_vendor": vendor, "reviewers": chosen, "skipped": skipped,
            "reading_age_s": seated, "usage": _usage_snapshot(states, s),
-           "usage_age_s": _snapshot_age(s, now)}
+           "usage_age_s": _snapshot_age(s, now), "fable_conserve": cons}
     # A filter name stays the string the merge gate checks. No filter means
     # the same launch argv the seated reviewer carries.
     if runner is not None:
@@ -4057,6 +4162,19 @@ def _first_unknown(states, pids):
     for pid in pids:
         if states[pid][0] == "unknown":
             return pid, states[pid][1]
+    return None, None
+
+
+def _fable_unknown_pool(states, s):
+    """The pool _fable_voter would ask on, or (None, None)."""
+    absent = _fable_slice_absent(states, s)
+    if not absent:
+        found = _first_unknown(states, ("fable", "claude_week", "claude_5h"))
+        if found[0]:
+            return found
+    _ready, unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
+    if unknown:
+        return unknown[0]
     return None, None
 
 
@@ -4113,7 +4231,7 @@ def _mixed_finish(voters, skipped, downgrade, excluded_vendor):
     return "ok", (voters, skipped)
 
 
-def _collect_mixed_voters(states, s, now, excluded_vendor):
+def _collect_mixed_voters(states, s, now, excluded_vendor, cons=None):
     """Design and mixed voters. Stale, unknown, and failed read_state seats are skipped.
 
     The council needs two voters from two vendors, neither of them the
@@ -4122,6 +4240,7 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
     vendor. Capped seats are listed and do not by themselves turn a
     one-voter lineup into an ask. The excluded vendor is not counted and
     is not a skip row. Recent failures and --exclude-seat are not applied.
+    A voter fable_conserve moves off Fable is Opus, and no Opus pool left asks.
     """
     excluded = {excluded_vendor} if excluded_vendor else set()
     voters, skipped = [], []
@@ -4133,15 +4252,18 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
         pid = None
         why = None
         if family == "fable":
-            status, payload = _anthropic_voter(states, s, now, lambda seat: _read_state_block(seat, s))
-            if status == "ask":
-                reason, pid = payload
-                code = _review_unknown_code(states[pid][1])
-                skipped.append(_mixed_skip("opus", POOLS[pid]["seat"], reason, code))
-                continue
-            if status == "skip":
-                reason, code = payload
-                skipped.append(_mixed_skip("opus", None, reason, code))
+            if _fable_kept(cons, "voter"):
+                status, payload = _fable_voter(states, s, now, excluded_vendor == "xai")
+                if status == "ask":
+                    pid, why = _fable_unknown_pool(states, s)
+            else:
+                status, payload = _anthropic_voter(states, s, now, cons,
+                                                   lambda seat: _read_state_block(seat, s))
+                if status != "row":
+                    reason = payload[0]
+                    skipped.append(_mixed_skip("opus", None, reason, "capped" if status == "skip" else "unknown"))
+                    return "ask", (reason, skipped)
+                voters.append(payload)
                 continue
         elif family == "grok":
             pid = "cursor_models"
@@ -4194,7 +4316,8 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
     return _mixed_finish(voters, skipped, downgrade, excluded_vendor)
 
 
-def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=None, exclude_vendors=()):
+def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=None, exclude_vendors=(),
+                 prompt_bytes=None):
     """One lineup, or ask.
 
     With no kind, chair and builder come from one vendor and that vendor does
@@ -4205,8 +4328,8 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
     Design excludes nobody. Mixed excludes the author, or the caller-passed
     builder when no author was named. With neither, or with `--author human`
     or `--author none`, mixed excludes nobody. Audit excludes the author
-    when one is named. The Opus voter is required when the excluded vendor
-    is xAI, except on kind review.
+    when one is named. Fable is required when the excluded vendor is xAI,
+    except on kind review. fable_conserve can move the Fable voter to Opus.
 
     Kind review seats exactly two voters from REVIEW_ROSTER, on two vendors.
     The excluded vendor is the author's, or the caller-passed builder's when
@@ -4300,7 +4423,8 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
     review_skipped = None
     mixed_skipped = None
     if kind == "review":
-        status, payload = _collect_review_voters(states, s, now, excluded_vendor, frozenset(exclude_vendors))
+        status, payload = _collect_review_voters(states, s, now, excluded_vendor, frozenset(exclude_vendors),
+                                                 fable_conserve(s, now, states, prompt_bytes, exclude_vendors))
         if status == "ask":
             why, review_skipped = payload
             asked = _lineup_ask(s, now, states, why, [])
@@ -4312,7 +4436,8 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
         voters, review_skipped, review_why = payload
         downgrade = None
     elif kind in ("mixed", "design"):
-        status, payload = _collect_mixed_voters(states, s, now, excluded_vendor)
+        status, payload = _collect_mixed_voters(states, s, now, excluded_vendor,
+                                                fable_conserve(s, now, states, prompt_bytes))
         if status == "ask":
             why, mixed_skipped = payload
             asked = _lineup_ask(s, now, states, why, [])
@@ -4330,7 +4455,8 @@ def route_lineup(s, now, builder=None, kind=None, author=None, builder_vendor=No
             voters, mixed_skipped = payload
     else:
         mixed_skipped = []
-        status, payload = _collect_voters(states, s, now, excluded_vendor, mixed_skipped)
+        status, payload = _collect_voters(states, s, now, excluded_vendor, mixed_skipped,
+                                          fable_conserve(s, now, states, prompt_bytes))
         if status == "ask":
             asked = _lineup_ask(s, now, states, payload, [])
             if mixed_skipped:
@@ -4511,17 +4637,22 @@ def _ask_one(spec, states, s, now):
     """One seatable ask voter and the pool whose pace ranks it, or None.
 
     Unknown and capped families are left out. The route still returns the
-    others. The Anthropic row is _anthropic_voter (Opus in opus_order), not Fable. Muse is left out when either window is over pace. Grok is not:
+    others. A conserved Anthropic row is Opus (_anthropic_voter). Muse is left out when either window is over pace. Grok is not:
     an ahead Cursor Models pool ranks it lower and it can still answer a question.
     """
     family = spec["family"]
     if family == "fable":
-        # The Anthropic ask voter is the council's: Opus at high on the first
-        # open opus_order pool. Every Opus pool exhausted leaves it out.
-        status, payload = _anthropic_voter(states, s, now)
-        if status != "row":
-            return None
-        pool = payload["pool"]
+        cons = fable_conserve(s, now, states)
+        if _fable_kept(cons, "voter"):
+            status, payload = _fable_voter(states, s, now, required=False)
+            if status != "row" or payload.get("downgraded"):
+                return None
+            pool = "fable" if payload["seat"] == "claude" else "cursor_other"
+        else:
+            status, payload = _anthropic_voter(states, s, now, cons)
+            if status != "row":
+                return None
+            pool = payload["pool"]
     elif family == "grok":
         status, payload = _grok_voter(states, s, now)
         pool = "cursor_models"
@@ -4667,7 +4798,7 @@ def route_pstack(s, now, model, role="builder"):
 
     pid = None
     if family == "opus":
-        kind, found = _opus_pick(states)
+        kind, found = _opus_pick(states, skip=_opus_skip(s, now, states))
         if kind == "ask":
             return ask(_unknown_pools_reason(found, states, s))
         if kind == "capped":
@@ -4919,6 +5050,14 @@ def cmd_route():
                 print(f"unknown vendor {raw}; vendors: {_review_vendors_text()}", file=sys.stderr)
                 raise SystemExit(2)
             exclude_vendors.append(vendor)
+    prompt_bytes = None
+    if "--prompt-bytes" in argv:
+        raw = _opt(argv, "--prompt-bytes")
+        if role not in ("review", "lineup") or not raw.isdigit():
+            print("--prompt-bytes takes a byte count on --route review and --route lineup", file=sys.stderr)
+            raise SystemExit(2)
+        prompt_bytes = int(raw)
+    run_id = _opt(argv, "--run-id") if "--run-id" in argv else None
     global _REVIEW_FORCE_EXCLUDE
     _REVIEW_FORCE_EXCLUDE = set()
     if "--exclude-seat" in argv:
@@ -4968,9 +5107,10 @@ def cmd_route():
         now = _ROUTE_NOW if _ROUTE_NOW is not None else time.time()
     if role == "lineup":
         rows = [route_lineup(summary, now, builder=builder, kind=kind, author=author,
-                             builder_vendor=builder_vendor, exclude_vendors=exclude_vendors)]
+                             builder_vendor=builder_vendor, exclude_vendors=exclude_vendors,
+                             prompt_bytes=prompt_bytes)]
     elif role == "review":
-        rows = [route_review(summary, now, builder_vendor, runner, exclude_vendors)]
+        rows = [route_review(summary, now, builder_vendor, runner, exclude_vendors, prompt_bytes)]
     elif role == "host":
         rows = [route_host(summary, now)]
     elif role == "ask":
@@ -4978,11 +5118,17 @@ def cmd_route():
     else:
         chosen = tuple(ROLES) if role is None else (role,)
         rows = [route(name, summary, now) for name in chosen]
+    if role in ("lineup", "ask"):
+        for row in rows:
+            row["fable_conserve"] = fable_conserve(summary, now, prompt_bytes=prompt_bytes,
+                                                   exclude_vendors=exclude_vendors)
     # A cached poll must not append the ask log, the usage history, or the cache.
     if not cached:
         log_asks(rows, summary, now)
     for row in rows:
         _log_review_pick(row, repo, pr, ballot)
+    if run_id or not cached:
+        _log_fable_seats(rows, summary, now, run_id or uuid.uuid4().hex)
     if as_json:
         json.dump(rows, sys.stdout)
         sys.stdout.write("\n")
@@ -5024,6 +5170,42 @@ def cmd_route_pstack(argv, as_json):
         sys.stdout.write("\n")
     else:
         print(format_pstack(row))
+
+
+def fable_log_path():
+    return os.environ.get("SEAT_USAGE_FABLE_LOG") or f"{H}/.local/state/seat-usage/fable-burn.jsonl"
+
+
+def _log_fable_seats(rows, s, now, run_id):
+    """Append one line per seated Fable leg. Append-only, and never fails a route.
+
+    No per-seat token count exists, so used_pct is the pool's percent at the
+    seat. The change between lines for one pool is the burn; seat_share in
+    fable_conserve can move off its prior once that is measured.
+    """
+    pool = FABLE_CONSERVE.get("pool")
+    if not pool:
+        return
+    lines = []
+    for row in rows:
+        lineup = row.get("lineup") or {}
+        role_seats = [(role, lineup.get(role) or {}) for role in ("chair", "builder")]
+        role_seats += [("voter", v) for v in lineup.get("voters") or []]
+        role_seats += [("gate_reviewer", v) for v in row.get("reviewers") or []]
+        for seat, leg in role_seats:
+            if leg.get("family") == "fable":
+                lines.append(json.dumps({"ts": int(now), "run_id": run_id, "seat": seat,
+                                         "harness": leg.get("seat"), "pool": pool,
+                                         "used_pct": s.get(POOLS[pool]["used"])}))
+    if not lines:
+        return
+    path = fable_log_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as f:
+            f.write("".join(line + "\n" for line in lines))
+    except OSError:
+        pass
 
 
 def log_asks(rows, s, now):
