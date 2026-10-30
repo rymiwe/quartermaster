@@ -5183,20 +5183,22 @@ def _log_fable_seats(rows, s, now, run_id):
     seat. The change between lines for one pool is the burn; seat_share in
     fable_conserve can move off its prior once that is measured.
     """
-    pool = FABLE_CONSERVE.get("pool")
-    if not pool:
+    if not FABLE_CONSERVE.get("pool"):
         return
     lines = []
     for row in rows:
         lineup = row.get("lineup") or {}
         role_seats = [(role, lineup.get(role) or {}) for role in ("chair", "builder")]
         role_seats += [("voter", v) for v in lineup.get("voters") or []]
+        role_seats += [("voter", v) for v in row.get("voters") or []]
         role_seats += [("gate_reviewer", v) for v in row.get("reviewers") or []]
         for seat, leg in role_seats:
             if leg.get("family") == "fable":
+                pool = _pool_for(leg.get("seat"), "fable", leg.get("pool"))
+                used = POOLS[pool]["used"] if pool in POOLS else None
                 lines.append(json.dumps({"ts": int(now), "run_id": run_id, "seat": seat,
                                          "harness": leg.get("seat"), "pool": pool,
-                                         "used_pct": s.get(POOLS[pool]["used"])}))
+                                         "used_pct": s.get(used)}))
     if not lines:
         return
     path = fable_log_path()

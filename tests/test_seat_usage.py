@@ -6822,7 +6822,49 @@ def fable_burn_log_appends_one_line_per_seated_fable_leg():
             del os.environ["SEAT_USAGE_FABLE_LOG"]
         lines = [json.loads(line) for line in Path(path).read_text().splitlines()]
     assert [(r["run_id"], r["seat"], r["pool"], r["used_pct"]) for r in lines] == [
-        ("run-1", "voter", "cursor_other", 10), ("run-2", "voter", "cursor_other", 10)], lines
+        ("run-1", "voter", "fable", 10), ("run-2", "voter", "fable", 10)], lines
+
+
+def _fable_log_lines(rows, s):
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "fable-burn.jsonl")
+        os.environ["SEAT_USAGE_FABLE_LOG"] = path
+        try:
+            su._log_fable_seats(rows, s, NOW, "run-1")
+        finally:
+            del os.environ["SEAT_USAGE_FABLE_LOG"]
+        if not os.path.exists(path):
+            return []
+        return [json.loads(line) for line in Path(path).read_text().splitlines()]
+
+
+@test
+def fable_burn_log_records_the_pool_the_leg_sits_on():
+    s = _conserving(18, 0.297, fable=7)
+    row = su.route_lineup(s, NOW, kind="design")
+    assert [v["seat"] for v in row["lineup"]["voters"] if v["family"] == "fable"] == ["claude"], row
+    lines = _fable_log_lines([row], s)
+    assert [(r["seat"], r["harness"], r["pool"], r["used_pct"]) for r in lines] == [
+        ("voter", "claude", "fable", 7)], lines
+    s = _conserving(18, 0.297, fable=95)
+    row = su.route_lineup(s, NOW, kind="design")
+    assert [v["seat"] for v in row["lineup"]["voters"] if v["family"] == "fable"] == ["cursor"], row
+    lines = _fable_log_lines([row], s)
+    assert [(r["seat"], r["harness"], r["pool"], r["used_pct"]) for r in lines] == [
+        ("voter", "cursor", "cursor_other", 18)], lines
+
+
+@test
+def fable_burn_log_records_a_seated_ask_voter_but_not_a_candidate():
+    s = _conserving(18, 0.297, fable=7, codex=90, muse_week=90, grok_pct=90)
+    seated = su.route_ask(s, NOW)
+    assert [v["family"] for v in seated["voters"]].count("fable") == 1, seated
+    lines = _fable_log_lines([seated], s)
+    assert [(r["seat"], r["harness"], r["pool"], r["used_pct"]) for r in lines] == [
+        ("voter", "claude", "fable", 7)], lines
+    unseated = dict(seated, voters=[v for v in seated["voters"] if v["family"] != "fable"])
+    assert any(c["family"] == "fable" for c in unseated["candidates"]), unseated
+    assert _fable_log_lines([unseated], s) == []
 
 
 def main():
