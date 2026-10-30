@@ -2,6 +2,14 @@
   "version": 1,
   "route_freshness_s": {"live": 600, "pulled": 1200},
   "opus_order": ["google_opus_week", "claude_week", "cursor_other"],
+  "fable_conserve": {
+    "pool": "cursor_other",
+    "budget_pct": 100,
+    "seat_value_order": ["voter", "gate_reviewer", "judge_builder"],
+    "seat_share": 0.3333333333,
+    "seat_share_reason": "A prior, not a measurement: no per-seat Fable burn exists yet, so each seat class gets an equal third. Replace it from fable-burn.jsonl once that log has enough runs.",
+    "agy_max_bytes": 150000
+  },
   "review_runners": {
     "gemini-4-argon-high": {"cmd": ["agy", "--model", "gemini-4-argon-high"]},
     "fable": {"cmd": ["cursor-agent", "--model", "fable"]},
@@ -316,6 +324,7 @@
       "effort_by_role": {"builder": "low", "chair": "high"},
       "burn_effort_by_role": {"builder": "high", "chair": "high"},
       "runner": {"cmd": ["agy", "--model", "Claude Opus 5.5"]},
+      "voter_runner": {"cmd": ["agy", "--model"], "slug": "claude-opus-5-5-{effort}"},
       "usage": {
         "used": "google_claudegpt_week",
         "reset": "google_claudegpt_week_reset_ts",
