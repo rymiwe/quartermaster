@@ -6800,6 +6800,26 @@ def conserve_gate_keeps_a_non_fable_pick_and_moves_a_fable_pick():
 
 
 @test
+def conserve_review_lineup_row_carries_fable_conserved():
+    row = su.route_lineup(_conserving(94.4, 0.297), NOW, kind="review", builder_vendor="xai")
+    assert row["mode"] != "ask", row
+    v = _opus_voter(row)
+    assert v["fable_conserved"] is True, v
+    others = [r for r in row["lineup"]["voters"] if r["family"] != "opus"]
+    assert others and not any("fable_conserved" in r for r in others), row
+
+
+@test
+def conserve_gate_pick_carries_fable_conserved():
+    s = _argon(_conserving(94.4, 0.297), 5)
+    row = su.route_review(s, NOW, "xai", exclude_vendors=("google",), prompt_bytes=240838)
+    assert row["reviewers"][0]["family"] == "opus", row
+    assert row["reviewers"][0]["fable_conserved"] is True, row
+    argon = su.route_review(s, NOW, "xai")["reviewers"][0]
+    assert argon["family"] == "argon" and "fable_conserved" not in argon, argon
+
+
+@test
 def conserve_config_is_where_the_tunables_live():
     cfg = su.FABLE_CONSERVE
     assert cfg["pool"] == "cursor_other" and cfg["budget_pct"] == 100 and cfg["agy_max_bytes"] == 150000

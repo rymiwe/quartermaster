@@ -3926,7 +3926,7 @@ def _review_candidates(states, s, now, excluded_vendor, runner=None, exclude_ven
             metrics = _review_metrics(pool_id, states[pool_id][0], s.get(POOLS[pool_id]["used"]),
                                       states, s, now)
             row = _review_row(seated, metrics, s, now, states, pool_id)
-            for key in ("effort", "mode", "reason", "runner"):
+            for key in ("effort", "mode", "reason", "runner", "fable_conserved"):
                 if payload.get(key):
                     row[key] = payload[key]
             row["_index"] = index
