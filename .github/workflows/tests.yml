@@ -15,6 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      - name: Install Pillow and faketime
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pil faketime
+
       - name: Run the test suite
         run: |
           set -eu
@@ -28,23 +33,7 @@ jobs:
           run_suite tests/test_update.py
           run_suite tests/test_install.py
           run_suite tests/test_seat_usage_push.py
-
-      - name: Install Pillow and faketime
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-pil faketime
-
-      - name: Debug the seat-meters 5h track
-        run: |
-          set -eu
-          base64 -d << 'B64' | python3 -
-          aW1wb3J0IGltcG9ydGxpYi51dGlsLCBvcywgdGltZSwgdGVtcGZpbGUsIGdsb2IKcHJpbnQoIlBJTCIsIF9faW1wb3J0X18oIlBJTCIpLl9fdmVyc2lvbl9fKQpwcmludCgiVFoiLCBvcy5lbnZpcm9uLmdldCgiVFoiKSwgIkxBTkciLCBvcy5lbnZpcm9uLmdldCgiTEFORyIpLCAiTENfQUxMIiwgb3MuZW52aXJvbi5nZXQoIkxDX0FMTCIpKQpkZWYgZmluZChuYW1lcyk6CiAgICBmb3IgbiBpbiBuYW1lczoKICAgICAgICBoaXQgPSBzb3J0ZWQoZ2xvYi5nbG9iKCIvdXNyL3NoYXJlL2ZvbnRzLyoqLyIgKyBuLCByZWN1cnNpdmU9VHJ1ZSkpCiAgICAgICAgaWYgaGl0OgogICAgICAgICAgICByZXR1cm4gaGl0WzBdCiAgICByZXR1cm4gTm9uZQpwcmludCgiU0FOUyIsIGZpbmQoWyJJQk1QbGV4U2Fucy1TZW1pQm9sZC50dGYiLCAiRGVqYVZ1U2Fucy50dGYiXSkpCnByaW50KCJNT05PIiwgZmluZChbIkpldEJyYWluc01vbm8tUmVndWxhci50dGYiLCAiRGVqYVZ1U2Fuc01vbm8udHRmIl0pKQpzcGVjID0gaW1wb3J0bGliLnV0aWwuc3BlY19mcm9tX2ZpbGVfbG9jYXRpb24oIm1ldGVycyIsICJ0ZXN0cy90ZXN0X3NlYXRfbWV0ZXJzLnB5IikKbSA9IGltcG9ydGxpYi51dGlsLm1vZHVsZV9mcm9tX3NwZWMoc3BlYykKc3BlYy5sb2FkZXIuZXhlY19tb2R1bGUobSkKYmVmb3JlID0gW2sgZm9yIGsgaW4gc29ydGVkKHZhcnMobSkpIGlmIGsuc3RhcnRzd2l0aCgidGVzdF8iKSBhbmQgayA8ICJ0ZXN0X3Bob25lXzVoX3RyYWNrX2hhc19ub190ZXh0X2Jlc2lkZV9pdCJdCnQwID0gdGltZS50aW1lKCkKZm9yIG5hbWUgaW4gYmVmb3JlOgogICAgZ2V0YXR0cihtLCBuYW1lKSgpCnByaW50KCJwcmlvciIsIGxlbihiZWZvcmUpLCAicmVhbF9zIiwgcm91bmQodGltZS50aW1lKCkgLSB0MCwgMyksICJhZ2UiLCByb3VuZCh0aW1lLnRpbWUoKSAtIG0uTk9XLCAzKSkKY2FjaGUgPSB7InRzIjogbS5OT1csICJnb29nbGVfZ2VtaW5pX3dlZWsiOiA1LCAiZ29vZ2xlX2dlbWluaV93ZWVrX3Jlc2V0X3RzIjogbS5OT1cgKyA4NjQwMCwKICAgICAgICAgImdvb2dsZV9nZW1pbmlfNWgiOiAyMCwgImdvb2dsZV9nZW1pbmlfNWhfcmVzZXRfdHMiOiBtLk5PVyArIDMgKiAzNjAwfQp3aXRoIHRlbXBmaWxlLlRlbXBvcmFyeURpcmVjdG9yeSgpIGFzIHRkOgogICAgciwgb3V0ID0gbS5yZW5kZXIodGQsIGNhY2hlLCBOb25lKQogICAgaW0gPSBfX2ltcG9ydF9fKCJQSUwuSW1hZ2UiLCBmcm9tbGlzdD1bIkltYWdlIl0pLm9wZW4ob3V0KS5jb252ZXJ0KCJSR0IiKQogICAgdywgaCA9IGltLnNpemUKICAgIHRyYWNrID0gbS5vdmVyKG0uT19JTkssIG0ub3ZlcigoMHg1NCwgMHg2OCwgMHhmMCksIG0uT19QQU5FTDIsIDAuMDkpLCAwLjE0KQogICAgaXNfYmFyID0gbGFtYmRhIHA6IG0ubmVhcihwLCB0cmFjaykgb3IgcCBpbiAobS5CTFVFLCBtLlJFRCkKICAgIHJvd3MgPSBbeSBmb3IgeSBpbiByYW5nZShoKSBpZiBtLmhhc19ydW4oW2ltLmdldHBpeGVsKCh4LCB5KSkgZm9yIHggaW4gcmFuZ2UodyldLCBpc19iYXIpXQogICAgYmFuZHMgPSBbW3Jvd3NbMF1dXSBpZiByb3dzIGVsc2UgW10KICAgIGZvciB5IGluIHJvd3NbMTpdOgogICAgICAgIChiYW5kc1stMV0uYXBwZW5kKHkpIGlmIHkgLSBiYW5kc1stMV1bLTFdIDw9IDEgZWxzZSBiYW5kcy5hcHBlbmQoW3ldKSkKICAgIGZpdmUgPSBiYW5kc1sxXQogICAgbG8sIGhpID0gaW50KG0uUEhPTkVfQ1gwICogMykgKyAxMiwgdyAtIGludChtLlBIT05FX0NYMCAqIDMpCiAgICBkZWYgZGltX3RleHQocCk6CiAgICAgICAgcmV0dXJuIChub3QgaXNfYmFyKHApIGFuZCBub3QgbS5uZWFyKHAsIG0uT19JTkssIDgpCiAgICAgICAgICAgICAgICBhbmQgbWF4KHApIC0gbWluKHApIDwgNDggYW5kIHN1bShwKSAvIDMgPiA5MCkKICAgIHRpY2sgPSBbeCBmb3IgeCBpbiByYW5nZShsbywgaGkpIGlmIGFsbChtLm5lYXIoaW0uZ2V0cGl4ZWwoKHgsIHkpKSwgbS5PX0lOSywgOCkgZm9yIHkgaW4gZml2ZSldCiAgICBpbmsgPSBzb3J0ZWQoe3ggZm9yIHkgaW4gZml2ZSBmb3IgeCBpbiByYW5nZShsbywgaGkpCiAgICAgICAgICAgICAgICAgIGlmIGRpbV90ZXh0KGltLmdldHBpeGVsKCh4LCB5KSkpIGFuZCBub3QgYW55KGFicyh4IC0gdHQpIDw9IDQgZm9yIHR0IGluIHRpY2spfSkKICAgIHByaW50KCJzaXplIiwgdywgaCwgInRpY2siLCB0aWNrWzo4XSwgImluayIsIGlua1s6OF0pCiAgICBmb3IgeCBpbiBpbmtbOjNdOgogICAgICAgIHByaW50KCJjb2wiLCB4LCBbaW0uZ2V0cGl4ZWwoKHgsIHkpKSBmb3IgeSBpbiBmaXZlXSkKICAgICAgICBtaWQgPSBmaXZlW2xlbihmaXZlKSAvLyAyXQogICAgICAgIHByaW50KCJyb3ciLCBbKG54LCBpbS5nZXRwaXhlbCgobngsIG1pZCkpKSBmb3IgbnggaW4gcmFuZ2UoeCAtIDgsIHggKyA5KV0pCiAgICBwcmludCgic3RhdHMiLCBtLnBob25lX3RleHQodGQsIGNhY2hlKVsiY2FyZHMiXVsxXVsicG9vbHMiXVswXVsic3RhdHMiXSkK
-          B64
-
-      - name: Run seat-meters under a slowed clock
-        run: |
-          set -eu
-          mkdir -p /tmp/emptyhome
-          # The 5h fill edge moves with wall clock. After ~12s one antialiased
-          # pixel is classified as dim text. A 10x slow clock keeps that edge still.
+          # The 5h fill edge moves with the wall clock. After about 12s one
+          # antialiased pixel is classified as dim text beside the track.
+          # A 10x slow clock keeps that edge where a fast machine sees it.
           env -i PATH=/usr/bin:/bin HOME=/tmp/emptyhome PYTHONDONTWRITEBYTECODE=1 faketime -f '2000-01-01 00:00:00 x0.1' python3 tests/test_seat_meters.py
