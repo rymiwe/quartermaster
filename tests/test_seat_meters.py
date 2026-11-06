@@ -189,8 +189,9 @@ def test_google_group_is_its_own_color():
 
 def test_phone_5h_track_has_no_text_beside_it():
     """The 5h figure moved to the stats line under the bars, so no text shares the 5h track's rows."""
-    cache = {"ts": NOW, "google_gemini_week": 5, "google_gemini_week_reset_ts": NOW + 86400,
-             "google_gemini_5h": 20, "google_gemini_5h_reset_ts": NOW + 3 * 3600}
+    now = time.time() - 13  # a slow run reaches the case this long after import-time NOW
+    cache = {"ts": now, "google_gemini_week": 5, "google_gemini_week_reset_ts": now + 86400,
+             "google_gemini_5h": 20, "google_gemini_5h_reset_ts": now + 3 * 3600}
     with tempfile.TemporaryDirectory() as t:
         r, out = render(t, cache, None)
         assert r.returncode == 0, r.stderr
