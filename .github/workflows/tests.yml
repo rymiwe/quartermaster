@@ -15,10 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - name: Install Pillow and faketime
+      - name: Install Pillow
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pil faketime
+          sudo apt-get install -y python3-pil
 
       - name: Run the test suite
         run: |
@@ -33,7 +33,4 @@ jobs:
           run_suite tests/test_update.py
           run_suite tests/test_install.py
           run_suite tests/test_seat_usage_push.py
-          # The 5h fill edge moves with the wall clock. After about 12s one
-          # antialiased pixel is classified as dim text beside the track.
-          # A 10x slow clock keeps that edge where a fast machine sees it.
-          env -i PATH=/usr/bin:/bin HOME=/tmp/emptyhome PYTHONDONTWRITEBYTECODE=1 faketime -f '2000-01-01 00:00:00 x0.1' python3 tests/test_seat_meters.py
+          run_suite tests/test_seat_meters.py
