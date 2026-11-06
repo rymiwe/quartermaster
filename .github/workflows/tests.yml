@@ -29,6 +29,66 @@ jobs:
           run_suite tests/test_install.py
           run_suite tests/test_seat_usage_push.py
 
-      - name: Skip list
+      - name: Debug the seat-meters 5h track
         run: |
-          printf '%s\n' 'tests/test_seat_meters.py pre-existing failure: FAIL test_phone_5h_track_has_no_text_beside_it [1898]'
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y python3-pil faketime
+          sed 's/^          //' << 'PY' | python3 -
+          import glob, os, sys, time, tempfile
+          print("python", sys.version)
+          print("PIL", __import__("PIL").__version__)
+          print("TZ", os.environ.get("TZ"), "LANG", os.environ.get("LANG"), "LC_ALL", os.environ.get("LC_ALL"))
+          def find(names):
+              roots = ["/usr/share/fonts", "/usr/local/share/fonts"]
+              for n in names:
+                  for r in roots:
+                      hit = sorted(glob.glob(os.path.join(r, "**", n), recursive=True))
+                      if hit:
+                          return hit[0]
+              return None
+          print("SANS", find(["IBMPlexSans-SemiBold.ttf", "DejaVuSans.ttf"]))
+          print("MONO", find(["JetBrainsMono-Regular.ttf", "DejaVuSansMono.ttf"]))
+          import importlib.util
+          spec = importlib.util.spec_from_file_location("meters", "tests/test_seat_meters.py")
+          m = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(m)
+          before = [k for k in sorted(n for n in vars(m) if n.startswith("test_")) if k < "test_phone_5h_track_has_no_text_beside_it"]
+          t0 = time.time()
+          for name in before:
+              getattr(m, name)()
+          print("prior_tests", len(before), "real_s", round(time.time() - t0, 3), "age", round(time.time() - m.NOW, 3))
+          cache = {"ts": m.NOW, "google_gemini_week": 5, "google_gemini_week_reset_ts": m.NOW + 86400,
+                   "google_gemini_5h": 20, "google_gemini_5h_reset_ts": m.NOW + 3 * 3600}
+          with tempfile.TemporaryDirectory() as t:
+              r, out = m.render(t, cache, None)
+              im = __import__("PIL.Image", fromlist=["Image"]).open(out).convert("RGB")
+              w, h = im.size
+              print("size", w, h, "rc", r.returncode)
+              track = m.over(m.O_INK, m.over((0x54, 0x68, 0xf0), m.O_PANEL2, 0.09), 0.14)
+              is_bar = lambda p: m.near(p, track) or p in (m.BLUE, m.RED)
+              rows = [y for y in range(h) if m.has_run([im.getpixel((x, y)) for x in range(w)], is_bar)]
+              bands = [[rows[0]]] if rows else []
+              for y in rows[1:]:
+                  (bands[-1].append(y) if y - bands[-1][-1] <= 1 else bands.append([y]))
+              print("bands", [(b[0], b[-1]) for b in bands])
+              five = bands[1]
+              lo, hi = int(m.PHONE_CX0 * 3) + 12, w - int(m.PHONE_CX0 * 3)
+              def dim_text(p):
+                  return not is_bar(p) and not m.near(p, m.O_INK, 8) and max(p) - min(p) < 48 and sum(p) / 3 > 90
+              tick = {x for x in range(lo, hi) if all(m.near(im.getpixel((x, y)), m.O_INK, 8) for y in five)}
+              ink = sorted({x for y in five for x in range(lo, hi) if dim_text(im.getpixel((x, y))) and not any(abs(x - t) <= 4 for t in tick)})
+              print("tick", sorted(tick)[:12], "ink", ink[:8])
+              for x in ink[:4]:
+                  print("col", x, [(y, im.getpixel((x, y))) for y in five])
+                  print("neighbors", [(nx, im.getpixel((nx, five[len(five)//2]))) for nx in range(x - 6, x + 7)])
+              print("stats", m.phone_text(t, cache)["cards"][1]["pools"][0]["stats"])
+          PY
+          echo "plain file:"
+          set +e
+          env -i PATH=/usr/bin:/bin HOME=/tmp/emptyhome PYTHONDONTWRITEBYTECODE=1 python3 tests/test_seat_meters.py
+          echo "plain_exit $?"
+          echo "slow clock:"
+          env -i PATH=/usr/bin:/bin HOME=/tmp/emptyhome PYTHONDONTWRITEBYTECODE=1 faketime -f '2000-01-01 00:00:00 x0.1' python3 tests/test_seat_meters.py
+          echo "slow_exit $?"
+          set -e
