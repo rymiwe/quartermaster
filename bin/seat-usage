@@ -3147,11 +3147,11 @@ def _pool_reset_phrase(pid, s, now):
 
 
 def _fable_blocking_pool(states, s):
+    pid, _why = _fable_unknown_pool(states, s)
+    if pid:
+        return pid
     absent = _fable_slice_absent(states, s)
     ids = _fable_frontier_ids(absent)
-    unknown = [pid for pid in ids if states[pid][0] == "unknown"]
-    if unknown:
-        return unknown[0]
     if states["claude_5h"][0] == "capped":
         return "claude_5h"
     blocked = [pid for pid in ids if not _has_room(pid, states, s)] or list(ids)
