@@ -2696,23 +2696,17 @@ def claude_week_unknown_beside_capped_fable_is_unknown():
 
 
 @test
-def claude_5h_unknown_beside_capped_other_models_is_unknown():
-    # A real 5h window treats a missing percent as open. This call uses the
-    # weekly shape so the reading is unknown, then puts the window back.
-    facts = su.POOLS["claude_5h"]["facts"]
-    saved = facts["window"]
-    facts["window"] = "7d"
-    try:
-        s = snap(claude_max=True, fable=10, cursor_api_pct=100)
-        s.pop("claude_5h", None)
-        assert su.pool_status("claude_5h", s, NOW) == ("unknown", "no used %"), su.pool_status("claude_5h", s, NOW)
-        skip = _fable_skip(su.route_review(s, NOW, "xai"))
-        assert skip["code"] == "unknown", skip
-        assert skip["reason"] == (
-            "claude 5h reading unknown: fix the failed reading, then ask Ryan"
-        ), skip
-    finally:
-        facts["window"] = saved
+def stale_claude_stamp_beside_capped_other_models_names_that_pool():
+    s = snap(claude_max=True, cursor_api_pct=100)
+    s["as_of"] = dict(s["as_of"])
+    s["as_of"]["claude"] = NOW - 11 * 60
+    assert su.pool_status("cursor_other", s, NOW)[0] == "capped"
+    st, why = su.pool_status("fable", s, NOW)
+    assert (st, why) == ("unknown", "reading 11m old"), (st, why)
+    assert su.pool_status("claude_5h", s, NOW) == (st, why)
+    skip = _fable_skip(su.route_review(s, NOW, "xai"))
+    assert skip["code"] == su._review_unknown_code(why) == "stale", skip
+    assert skip["reason"] == "Fable reading 11m old, resets in 3.0d: ask Ryan", skip
 
 
 @test
