@@ -6837,13 +6837,7 @@ def _chair_catalog(model_ids):
     return "\n".join(lines) + "\n"
 
 
-def _run_chair(summary, base, models="fail", as_json=True):
-    """Run the chair model route against a synthetic cache.
-
-    models is a fake `cursor-agent models` catalog (a list of ids), or "fail"
-    when that command exits 1.
-    The run is cached so a build without the route cannot refresh a seat.
-    """
+def _run_chair(summary, base, model_ids=(), as_json=True, models_fail=False):
     now = time.time()
     with tempfile.TemporaryDirectory() as home_s:
         home = Path(home_s)
@@ -6854,10 +6848,10 @@ def _run_chair(summary, base, models="fail", as_json=True):
         before = cache_path.read_bytes()
         bindir = home / "bin"
         bindir.mkdir()
-        if models == "fail":
+        if models_fail:
             script = "#!/bin/sh\necho 'model list unavailable' >&2\nexit 1\n"
         else:
-            script = "#!/bin/sh\ncat <<'END'\n" + _chair_catalog(models) + "END\n"
+            script = "#!/bin/sh\ncat <<'END'\n" + _chair_catalog(model_ids) + "END\n"
         exe = bindir / "cursor-agent"
         exe.write_text(script)
         exe.chmod(0o755)
@@ -6883,8 +6877,8 @@ def _run_chair(summary, base, models="fail", as_json=True):
     return proc, unchanged, wrote_asks
 
 
-def _chair_row(summary, base, models="fail", as_json=True):
-    proc, unchanged, wrote_asks = _run_chair(summary, base, models, as_json)
+def _chair_row(summary, base, model_ids=(), as_json=True, models_fail=False):
+    proc, unchanged, wrote_asks = _run_chair(summary, base, model_ids, as_json, models_fail)
     assert proc.returncode == 0, (proc.returncode, proc.stderr, proc.stdout)
     got = json.loads(proc.stdout)
     assert isinstance(got, dict), proc.stdout
@@ -6949,7 +6943,7 @@ def chair_over_included_or_on_demand_uses_the_non_fast_model():
 
 @test
 def chair_under_pace_keeps_the_fast_model():
-    got = _chair_row(_fresh_chair(cursor_auto_pct=15), CHAIR_FAST, "fail")
+    got = _chair_row(_fresh_chair(cursor_auto_pct=15), CHAIR_FAST, models_fail=True)
     assert got["model"] == CHAIR_FAST, got
     assert got["pool_state"] == "under" and got["pace"] == "under", got
     assert got["model_list_source"] is None, got
@@ -6958,7 +6952,7 @@ def chair_under_pace_keeps_the_fast_model():
 
 @test
 def chair_on_pace_keeps_the_fast_model():
-    got = _chair_row(_fresh_chair(cursor_auto_pct=50), CHAIR_FAST, "fail")
+    got = _chair_row(_fresh_chair(cursor_auto_pct=50), CHAIR_FAST, models_fail=True)
     assert got["model"] == CHAIR_FAST, got
     assert got["pool_state"] == "on" and got["pace"] == "on", got
     assert got["model_list_source"] is None, got
@@ -6967,7 +6961,7 @@ def chair_on_pace_keeps_the_fast_model():
 
 @test
 def chair_unknown_reading_keeps_the_fast_model():
-    got = _chair_row(_unread_chair(cursor_auto_pct=80), CHAIR_FAST, "fail")
+    got = _chair_row(_unread_chair(cursor_auto_pct=80), CHAIR_FAST, models_fail=True)
     assert got["model"] == CHAIR_FAST, got
     assert got["pool_state"] == "unknown" and got["reading_age"] is None, got
     assert got["model_list_source"] is None, got
@@ -6977,7 +6971,7 @@ def chair_unknown_reading_keeps_the_fast_model():
 
 @test
 def chair_stale_reading_keeps_the_fast_model():
-    got = _chair_row(_aged_chair(11 * 60, cursor_auto_pct=80), CHAIR_FAST, "fail")
+    got = _chair_row(_aged_chair(11 * 60, cursor_auto_pct=80), CHAIR_FAST, models_fail=True)
     assert got["model"] == CHAIR_FAST, got
     assert got["pool_state"] == "unknown", got
     assert isinstance(got["reading_age"], (int, float)) and not isinstance(got["reading_age"], bool), got
@@ -6999,7 +6993,7 @@ def chair_missing_non_fast_id_keeps_the_fast_model():
 
 @test
 def chair_unreadable_model_list_keeps_the_fast_model():
-    got = _chair_row(_fresh_chair(cursor_auto_pct=80), CHAIR_FAST, "fail")
+    got = _chair_row(_fresh_chair(cursor_auto_pct=80), CHAIR_FAST, models_fail=True)
     assert got["model"] == CHAIR_FAST, got
     assert got["model_list_source"] == "cursor-agent models", got
     assert "could not" in got["reason"].lower() and "read" in got["reason"].lower(), got
@@ -7007,7 +7001,7 @@ def chair_unreadable_model_list_keeps_the_fast_model():
 
 @test
 def chair_base_without_fast_suffix_stays_unchanged():
-    got = _chair_row(_fresh_chair(cursor_auto_pct=80), CHAIR_NONFAST, "fail")
+    got = _chair_row(_fresh_chair(cursor_auto_pct=80), CHAIR_NONFAST, models_fail=True)
     assert got["model"] == CHAIR_NONFAST, got
     assert got["model_list_source"] is None, got
     assert "fast" in got["reason"].lower(), got
