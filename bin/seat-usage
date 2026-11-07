@@ -3215,19 +3215,15 @@ def _fable_voter(states, s, now, required):
     before later families are scored. required is unused: a full window is
     not a failed reading.
     """
-    watched = ("fable", "claude_week", "claude_5h")
+    pid, why = _fable_unknown_pool(states, s)
+    if pid:
+        return "ask", _fable_ask_text(pid, why, s, now)
     absent = _fable_slice_absent(states, s)
-    if not absent and any(states[pid][0] == "unknown" for pid in watched):
-        pid = next(pid for pid in watched if states[pid][0] == "unknown")
-        return "ask", _fable_ask_text(pid, states[pid][1], s, now)
-    ready, unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
+    ready, _unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
     if ready:
         pid = _pick_optimal(ready, states, s)
         effort, mode, reason = _voter_effort(pid, s, now, states)
         return "row", _voter("fable", POOLS[pid]["seat"], pid, s, now, effort, mode, reason)
-    if unknown:
-        pid, why = unknown[0]
-        return "ask", _fable_ask_text(pid, why, s, now)
     approved = s.get("downgrade_approved")
     if isinstance(approved, str) and approved in POOLS:
         return "row", _downgrade_row(approved, states, s, now)
@@ -4039,8 +4035,8 @@ def _fable_unknown_pool(states, s):
         found = _first_unknown(states, ("fable", "claude_week", "claude_5h"))
         if found[0]:
             return found
-    _ready, unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
-    if unknown:
+    ready, unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
+    if unknown and not ready:
         return unknown[0]
     return None, None
 
