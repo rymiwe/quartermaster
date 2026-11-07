@@ -2550,7 +2550,7 @@ def absent_fable_slice_prompts_instead_of_a_failed_reading():
     assert prompted["mode"] != "ask" and prompted["lineup"] is not None, prompted
     assert _voter_families(prompted) == ["astra", "grok", "wonder-full"], prompted
     assert prompted["downgrade"]["family"] == "fable", prompted
-    assert "approve a downgraded leg" in prompted["downgrade"]["reason"], prompted
+    assert prompted["downgrade"]["reason"] == "Fable exhausted: Other Models 100%, resets in 15.0d", prompted
     assert "fix the failed reading" not in prompted["downgrade"]["reason"], prompted
     more = _absent_fable(cursor=100)
     more["downgrade_approved"] = "grok"

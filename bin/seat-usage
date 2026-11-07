@@ -2641,12 +2641,20 @@ def _voter_state(spec, states):
 
 
 def _usage_snapshot(states, s):
+    """SUMMARY["fable"] is a different field and is not touched here."""
+    absent = _fable_slice_absent(states, s)
+    carrier = _fable_substitute() if absent else None
     out = {}
     for pid, meta in POOLS.items():
+        if absent and pid == "fable":
+            continue
         state, why = states[pid]
         if state == "capped" and isinstance(why, str) and why.startswith("ended "):
             state = "ended"
-        out[pid] = {"state": state, "used_pct": s.get(meta["used"])}
+        row = {"state": state, "used_pct": s.get(meta["used"])}
+        if pid == carrier:
+            row["label"] = f"{meta['label']} (Fable)"
+        out[pid] = row
     return out
 
 
@@ -3134,12 +3142,68 @@ def _downgrade_row(pool_id, states, s, now):
     return row
 
 
-def _downgrade_prompt(states, s, now):
-    """Known frontier pools, none with room. Not a failed reading."""
+def _pool_reset_phrase(pid, s, now):
+    return _reopen(s.get(POOLS[pid]["reset"]), now)
+
+
+def _fable_blocking_pool(states, s):
+    absent = _fable_slice_absent(states, s)
+    ids = _fable_frontier_ids(absent)
+    unknown = [pid for pid in ids if states[pid][0] == "unknown"]
+    if unknown:
+        return unknown[0]
     if states["claude_5h"][0] == "capped":
-        when = _reopen(s.get("claude_5h_reset_ts"), now)
+        return "claude_5h"
+    blocked = [pid for pid in ids if not _has_room(pid, states, s)] or list(ids)
+    if not blocked:
+        return "cursor_other"
+
+    def rank(pid):
+        order = {"capped": 0, "near_cap": 1}.get(states[pid][0], 2)
+        used = s.get(POOLS[pid]["used"])
+        used_n = used if _is_number(used) else -1
+        return (order, -used_n, ids.index(pid) if pid in ids else len(ids))
+
+    return min(blocked, key=rank)
+
+
+def _fable_block_code(states, s):
+    pid = _fable_blocking_pool(states, s)
+    st, why = states[pid]
+    if st == "unknown":
+        return _review_unknown_code(why)
+    return st
+
+
+def _fable_no_room_text(states, s, now):
+    if states["claude_5h"][0] == "capped":
+        when = _reopen(s.get(POOLS["claude_5h"]["reset"]), now)
         return f"claude 5h full, Other Models has no room, {when}: approve a downgraded leg"
+    pid = _fable_blocking_pool(states, s)
+    meta = POOLS[pid]
+    st = states[pid][0]
+    used = s.get(meta["used"])
+    if st == "capped":
+        pct = _fmt_pct(used) if _is_number(used) else "?"
+        return f"Fable exhausted: {meta['label']} {pct}%, {_pool_reset_phrase(pid, s, now)}"
+    if st == "near_cap" and _is_number(used):
+        return f"no room, near cap ({_fmt_pct(used)}%)"
     return "no frontier pool with room: approve a downgraded leg"
+
+
+def _fable_ask_text(pid, why, s, now):
+    label = "Fable" if pid == "fable" else POOLS[pid]["label"]
+    if isinstance(why, str) and why.startswith("reading ") and why.endswith(" old"):
+        return f"{label} {why}, {_reopen(s.get(POOLS[pid]['reset']), now)}: {_ASK}"
+    if why == "reset passed":
+        age = _reading_age(pid, s, now)
+        shown = "reading age unknown" if age is None else f"reading {int(age // 60)}m old"
+        return f"{label} {_reopen(s.get(POOLS[pid]['reset']), now)}, {shown}: {_FIX_ASK}"
+    return _unknown_text(label, why)
+
+
+def _downgrade_prompt(states, s, now):
+    return _fable_no_room_text(states, s, now)
 
 
 def _fable_voter(states, s, now, required):
@@ -3155,8 +3219,7 @@ def _fable_voter(states, s, now, required):
     absent = _fable_slice_absent(states, s)
     if not absent and any(states[pid][0] == "unknown" for pid in watched):
         pid = next(pid for pid in watched if states[pid][0] == "unknown")
-        label = "Fable" if pid == "fable" else POOLS[pid]["label"]
-        return "ask", _unknown_text(label, states[pid][1])
+        return "ask", _fable_ask_text(pid, states[pid][1], s, now)
     ready, unknown = _frontier_ready(_fable_frontier_ids(absent), states, s)
     if ready:
         pid = _pick_optimal(ready, states, s)
@@ -3164,8 +3227,7 @@ def _fable_voter(states, s, now, required):
         return "row", _voter("fable", POOLS[pid]["seat"], pid, s, now, effort, mode, reason)
     if unknown:
         pid, why = unknown[0]
-        label = "Fable" if pid == "fable" else POOLS[pid]["label"]
-        return "ask", _unknown_text(label, why)
+        return "ask", _fable_ask_text(pid, why, s, now)
     approved = s.get("downgrade_approved")
     if isinstance(approved, str) and approved in POOLS:
         return "row", _downgrade_row(approved, states, s, now)
@@ -3728,13 +3790,11 @@ def _review_candidates(states, s, now, excluded_vendor, runner=None, exclude_ven
                     continue
                 if status == "ask":
                     text = payload if isinstance(payload, str) else "Fable unavailable"
-                    code = "stale" if ("reading " in text and " old" in text) else "unknown"
-                    skipped.append(_review_skip(spec, text, code))
+                    skipped.append(_review_skip(spec, text, _fable_block_code(states, s)))
                     continue
                 if status == "downgrade":
-                    why = payload.get("reason") or "no frontier pool with room"
-                    code = "capped" if "capped" in why or "full" in why else "unknown"
-                    skipped.append(_review_skip(spec, why, code))
+                    why = payload.get("reason") or _fable_no_room_text(states, s, now)
+                    skipped.append(_review_skip(spec, why, _fable_block_code(states, s)))
                     continue
                 if status == "row":
                     seat = payload.get("seat") or "claude"
@@ -4079,6 +4139,10 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
                 why = states[pid][1]
         if status == "downgrade":
             downgrade = payload
+            if family == "fable":
+                skipped.append(_mixed_skip(
+                    family, spec["seat"], payload.get("reason") or "",
+                    _fable_block_code(states, s)))
             continue
         if status == "row":
             seat = payload.get("seat") or spec["seat"]
@@ -4096,7 +4160,10 @@ def _collect_mixed_voters(states, s, now, excluded_vendor):
             if block:
                 skipped.append(_mixed_skip(family, seat, block[1], block[0]))
                 continue
-            if pid in POOLS and why is not None:
+            if family == "fable" and pid in POOLS and why is not None:
+                reason = _fable_ask_text(pid, why, s, now)
+                code = _review_unknown_code(why)
+            elif pid in POOLS and why is not None:
                 reason = _unknown_text(_mixed_unknown_label(family, pid, s), why)
                 code = _review_unknown_code(why)
             else:
