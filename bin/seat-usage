@@ -4703,6 +4703,102 @@ def format_pstack(row):
     return "\n".join(lines)
 
 
+def parse_cursor_agent_models(text):
+    found = []
+    seen = set()
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line == "Available models" or line.startswith("Tip:"):
+            continue
+        if " - " not in line:
+            continue
+        model_id = line.split(" - ", 1)[0].strip()
+        if not model_id or model_id in seen:
+            continue
+        seen.add(model_id)
+        found.append(model_id)
+    return found
+
+
+def read_cursor_agent_models():
+    try:
+        proc = subprocess.run(
+            ["cursor-agent", "models"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("cursor-agent models failed") from exc
+    if proc.returncode != 0:
+        raise RuntimeError("cursor-agent models failed")
+    return parse_cursor_agent_models(proc.stdout)
+
+
+def _chair_nonfast(base):
+    if not isinstance(base, str) or not base.endswith("-fast"):
+        return None
+    trimmed = base[:-len("-fast")]
+    return trimmed or None
+
+
+def route_chair(s, now, base):
+    base = base.strip() if isinstance(base, str) else ""
+    meta = POOLS["cursor_models"]
+    state, why = pool_status("cursor_models", s, now)
+    pace = pace_code(s.get(meta["used"]), s.get(meta["reset"]), _window(meta, s), now)
+    age = _reading_age("cursor_models", s, now)
+
+    def pack(model, reason, source):
+        return {
+            "model": model,
+            "base": base,
+            "reason": reason,
+            "pool_state": state,
+            "pace": pace,
+            "reading_age": age,
+            "model_list_source": source,
+        }
+
+    nonfast = _chair_nonfast(base)
+    if nonfast is None:
+        return pack(base, "The base model has no fast suffix, so the chair keeps it.", None)
+    if state == "unknown":
+        if _review_unknown_code(why) == "stale":
+            minutes = int(age // 60) if _is_number(age) else 0
+            unit = "minute" if minutes == 1 else "minutes"
+            reason = (f"The Cursor Models reading is stale at {minutes} {unit}, "
+                      f"so the chair keeps the fast model.")
+        else:
+            reason = "The Cursor Models reading is unknown, so the chair keeps the fast model."
+        return pack(base, reason, None)
+    on_demand = _is_number(s.get("cursor_ondemand")) and s.get("cursor_ondemand") > 0
+    if state == "capped" or on_demand or pace == "ahead" or state == "ahead":
+        source = "cursor-agent models"
+        try:
+            ids = read_cursor_agent_models()
+        except (OSError, subprocess.SubprocessError, RuntimeError):
+            return pack(base, "The Cursor model list could not be read, so the chair keeps the fast model.", source)
+        if nonfast not in ids:
+            return pack(
+                base,
+                f"The non-fast model {nonfast} is not in the Cursor model list, so the chair keeps the fast model.",
+                source,
+            )
+        if state == "capped":
+            reason = "Cursor Models is over its included usage, so the chair uses the non-fast model."
+        elif on_demand:
+            reason = "The Cursor account is on demand, so the chair uses the non-fast model."
+        else:
+            reason = "Cursor Models is ahead of pace, so the chair uses the non-fast model."
+        return pack(nonfast, reason, source)
+    if pace == "under":
+        reason = "Cursor Models is under pace, so the chair keeps the fast model."
+    elif pace == "on" or state == "on":
+        reason = "Cursor Models is on pace, so the chair keeps the fast model."
+    else:
+        reason = "Cursor Models is not over or ahead of pace, so the chair keeps the fast model."
+    return pack(base, reason, None)
+
+
 def format_ask(row):
     age = row.get("reading_age_s")
     shown = "unknown" if age is None else f"{int(age // 60)}m"
@@ -4843,6 +4939,11 @@ def cmd_route():
     if role is not None and role not in known:
         print(f"unknown role {role}; roles: {', '.join(known)}", file=sys.stderr)
         raise SystemExit(2)
+    if "--chair-base" in argv:
+        if role != "chair":
+            print("--chair-base applies to --route chair", file=sys.stderr)
+            raise SystemExit(2)
+        return cmd_route_chair(argv)
     if role == "pstack":
         return cmd_route_pstack(argv, as_json)
     builder = None
@@ -5003,6 +5104,16 @@ def cmd_route_pstack(argv, as_json):
         sys.stdout.write("\n")
     else:
         print(format_pstack(row))
+
+
+def cmd_route_chair(argv):
+    base = _opt(argv, "--chair-base") if "--chair-base" in argv else None
+    if not base or not base.strip():
+        print("--route chair needs --chair-base", file=sys.stderr)
+        raise SystemExit(2)
+    row = route_chair(_load_cache(), time.time(), base.strip())
+    json.dump(row, sys.stdout)
+    sys.stdout.write("\n")
 
 
 def log_asks(rows, s, now):
