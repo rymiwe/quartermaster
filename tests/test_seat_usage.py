@@ -2550,7 +2550,7 @@ def absent_fable_slice_prompts_instead_of_a_failed_reading():
     assert prompted["mode"] != "ask" and prompted["lineup"] is not None, prompted
     assert _voter_families(prompted) == ["astra", "grok", "wonder-full"], prompted
     assert prompted["downgrade"]["family"] == "fable", prompted
-    assert "approve a downgraded leg" in prompted["downgrade"]["reason"], prompted
+    assert prompted["downgrade"]["reason"] == "Fable exhausted: Other Models 100%, resets in 15.0d", prompted
     assert "fix the failed reading" not in prompted["downgrade"]["reason"], prompted
     more = _absent_fable(cursor=100)
     more["downgrade_approved"] = "grok"
@@ -2606,6 +2606,125 @@ def absent_fable_slice_prompts_instead_of_a_failed_reading():
     assert sibling_row["mode"] != "ask" and sibling_row["lineup"] is not None, sibling_row
     sibling_fable = next(v for v in sibling_row["lineup"]["voters"] if v["family"] == "fable")
     assert sibling_fable["seat"] == "claude", sibling_fable
+
+
+def _fable_skip(row):
+    for item in row.get("skipped") or []:
+        if item.get("family") == "fable":
+            return item
+    raise AssertionError(row.get("skipped"))
+
+
+@test
+def spent_fable_on_other_models_is_capped_with_its_reset():
+    reset = NOW + 9 * 86400
+    s = _absent_fable(cursor=100, cursor_reset_ts=reset)
+    skip = _fable_skip(su.route_review(s, NOW, "xai"))
+    assert skip["code"] == "capped", skip
+    assert skip["reason"] == "Fable exhausted: Other Models 100%, resets in 9.0d", skip
+
+
+@test
+def spent_fable_slice_on_max_uses_the_slice_reset():
+    s = snap(claude_max=True, fable=100, fable_reset_ts=NOW + 2 * 86400,
+             cursor_api_pct=100, cursor_reset_ts=NOW + 20 * 86400)
+    skip = _fable_skip(su.route_review(s, NOW, "xai"))
+    assert skip["code"] == "capped", skip
+    assert skip["reason"] == "Fable exhausted: Fable 100%, resets in 2.0d", skip
+    assert "20.0d" not in skip["reason"], skip
+
+
+@test
+def fable_near_cap_is_not_exhausted():
+    s = _absent_fable(cursor=97, cursor_reset_ts=NOW + 9 * 86400)
+    skip = _fable_skip(su.route_review(s, NOW, "xai"))
+    assert skip["code"] == "near_cap", skip
+    assert skip["reason"] == "no room, near cap (97%)", skip
+    assert "exhausted" not in skip["reason"], skip
+
+
+@test
+def stale_fable_reading_stays_stale_and_shows_its_reset():
+    aged = _absent_fable(cursor=40, cursor_reset_ts=NOW + 9 * 86400)
+    aged["as_of"] = dict(aged["as_of"])
+    aged["as_of"]["cursor"] = NOW - 11 * 60
+    skip = _fable_skip(su.route_review(aged, NOW, "xai"))
+    assert skip["code"] == "stale", skip
+    assert skip["reason"] == "Other Models reading 11m old, resets in 9.0d: ask Ryan", skip
+    assert "exhausted" not in skip["reason"], skip
+    passed = _absent_fable(cursor=100, cursor_reset_ts=NOW - 3600)
+    held = _fable_skip(su.route_review(passed, NOW, "xai"))
+    assert held["code"] == "unknown", held
+    assert held["reason"] == (
+        "Other Models reset already passed, reading 0m old: fix the failed reading, then ask Ryan"
+    ), held
+    assert "exhausted" not in held["reason"], held
+
+
+@test
+def claude_5h_full_downgrade_text_stays():
+    s = snap(claude_5h=100, cursor_api_pct=100)
+    skip = _fable_skip(su.route_review(s, NOW, "xai"))
+    assert skip["code"] == "capped", skip
+    assert skip["reason"] == (
+        "claude 5h full, Other Models has no room, resets in 4.0h: approve a downgraded leg"
+    ), skip
+
+
+@test
+def absent_fable_slice_drops_the_usage_row_and_labels_other_models():
+    s = _absent_fable(cursor=10)
+    row = su.route_lineup(s, NOW, kind="design")
+    assert "fable" not in row["usage"], sorted(row["usage"])
+    assert row["usage"]["cursor_other"]["label"] == "Other Models (Fable)", row["usage"]["cursor_other"]
+    kept = snap(claude_max=True, fable=40)
+    kept_row = su.route_lineup(kept, NOW, kind="design")
+    assert kept["fable"] == 40 and "fable" in kept_row["usage"], kept_row["usage"]
+    assert "label" not in kept_row["usage"]["fable"], kept_row["usage"]["fable"]
+    assert "label" not in kept_row["usage"]["cursor_other"], kept_row["usage"]["cursor_other"]
+
+
+@test
+def claude_week_unknown_beside_capped_fable_is_unknown():
+    s = snap(claude_max=True, fable=100)
+    s.pop("claude_week", None)
+    skip = _fable_skip(su.route_review(s, NOW, "xai"))
+    assert skip["code"] == "unknown", skip
+    assert skip["reason"] == (
+        "claude weekly all reading unknown: fix the failed reading, then ask Ryan"
+    ), skip
+
+
+@test
+def stale_claude_stamp_beside_capped_other_models_names_that_pool():
+    s = snap(claude_max=True, cursor_api_pct=100)
+    s["as_of"] = dict(s["as_of"])
+    s["as_of"]["claude"] = NOW - 11 * 60
+    assert su.pool_status("cursor_other", s, NOW)[0] == "capped"
+    st, why = su.pool_status("fable", s, NOW)
+    assert (st, why) == ("unknown", "reading 11m old"), (st, why)
+    assert su.pool_status("claude_5h", s, NOW) == (st, why)
+    skip = _fable_skip(su.route_review(s, NOW, "xai"))
+    assert skip["code"] == su._review_unknown_code(why) == "stale", skip
+    assert skip["reason"] == "Fable reading 11m old, resets in 3.0d: ask Ryan", skip
+
+
+@test
+def mixed_lineup_does_not_ask_when_spent_fable_is_capped():
+    spent = _absent_fable(cursor=100, codex=100, cursor_auto_pct=100, muse_week=100, muse_5h=100)
+    row = su.route_lineup(spent, NOW, kind="mixed")
+    assert row["mode"] != "ask", row
+    skip = _fable_skip(row)
+    assert skip["code"] == "capped", row.get("skipped")
+    assert su._mixed_blocks(skip) is False, skip
+    stale = _absent_fable(cursor=40, codex=100, cursor_auto_pct=100, muse_week=100, muse_5h=100)
+    stale["as_of"] = dict(stale["as_of"])
+    stale["as_of"]["cursor"] = NOW - 11 * 60
+    asked = su.route_lineup(stale, NOW, kind="mixed")
+    assert asked["mode"] == "ask", asked
+    stale_skip = _fable_skip(asked)
+    assert stale_skip["code"] == "stale", stale_skip
+    assert su._mixed_blocks(stale_skip) is True, stale_skip
 
 
 @test
