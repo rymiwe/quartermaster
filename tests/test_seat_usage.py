@@ -2685,6 +2685,37 @@ def absent_fable_slice_drops_the_usage_row_and_labels_other_models():
 
 
 @test
+def claude_week_unknown_beside_capped_fable_is_unknown():
+    s = snap(claude_max=True, fable=100)
+    s.pop("claude_week", None)
+    skip = _fable_skip(su.route_review(s, NOW, "xai"))
+    assert skip["code"] == "unknown", skip
+    assert skip["reason"] == (
+        "claude weekly all reading unknown: fix the failed reading, then ask Ryan"
+    ), skip
+
+
+@test
+def claude_5h_unknown_beside_capped_other_models_is_unknown():
+    # A real 5h window treats a missing percent as open. This call uses the
+    # weekly shape so the reading is unknown, then puts the window back.
+    facts = su.POOLS["claude_5h"]["facts"]
+    saved = facts["window"]
+    facts["window"] = "7d"
+    try:
+        s = snap(claude_max=True, fable=10, cursor_api_pct=100)
+        s.pop("claude_5h", None)
+        assert su.pool_status("claude_5h", s, NOW) == ("unknown", "no used %"), su.pool_status("claude_5h", s, NOW)
+        skip = _fable_skip(su.route_review(s, NOW, "xai"))
+        assert skip["code"] == "unknown", skip
+        assert skip["reason"] == (
+            "claude 5h reading unknown: fix the failed reading, then ask Ryan"
+        ), skip
+    finally:
+        facts["window"] = saved
+
+
+@test
 def mixed_lineup_does_not_ask_when_spent_fable_is_capped():
     spent = _absent_fable(cursor=100, codex=100, cursor_auto_pct=100, muse_week=100, muse_5h=100)
     row = su.route_lineup(spent, NOW, kind="mixed")
